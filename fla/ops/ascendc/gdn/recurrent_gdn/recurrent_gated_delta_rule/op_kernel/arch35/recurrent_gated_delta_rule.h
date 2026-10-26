@@ -53,7 +53,7 @@ struct RGDRInitParams {
     GM_ADDR finalState;
 };
 
-template <typename stateType, typename outType, bool hasGama, bool hasGamaK>
+template <typename stateType, typename outType, bool hasGama, bool hasGamaK, bool saveState>
 __simd_vf__ inline void ComputeRecurrentGatedDeltaRuleVF(
     __ubuf__ float *state, __ubuf__ float *key, __ubuf__ float *query, __ubuf__ float *value,
     __ubuf__ float *gamaK, __ubuf__ stateType *stateOut, __ubuf__ outType *attnOut,
@@ -118,46 +118,30 @@ __simd_vf__ inline void ComputeRecurrentGatedDeltaRuleVF(
         Mul(dot1, state1, key1, fullFp32Mask);
         Add(dot0, dot0, dot1, fullFp32Mask);
         ReduceSum(dotSum, dot0, fullFp32Mask);
-        DataCopy<float, StoreDist::DIST_FIRST_ELEMENT_B32>(attnTmp + row, dotSum, fullFp32Mask);
-        if constexpr (std::is_same<stateType, float32_t>()) {
-            DataCopy(state + rowOffset, state0, fullFp32Mask);
-            DataCopy(state + rowOffset + FP32_PER_REG, state1, fullFp32Mask);
-        } else {
-            DataCopy<float, StoreDist::DIST_INTLV_B32>(state + rowOffset, state0, state1, fullFp32Mask);
-        }
-    }
-
-    LocalMemBar<MemType::VEC_STORE, MemType::VEC_LOAD>();
-    for (uint16_t row = 0; row < rows; ++row) {
-        const uint32_t rowOffset = static_cast<uint32_t>(row) * kLength;
 
         RegTensor<float> attn;
         RegTensor<float> delta;
+        RegTensor<float> dotBroadcast;
+        // ReduceSum only guarantees lane 0; broadcast it without a UB round trip.
+        Duplicate(dotBroadcast, dotSum, fullFp32Mask);
         DataCopy<float, LoadDist::DIST_BRC_B32>(attn, value + row);
-        RegTensor<float> dotSum;
-        DataCopy<float, LoadDist::DIST_BRC_B32>(dotSum, attnTmp + row);
-        Sub(attn, attn, dotSum, fullFp32Mask);
+        Sub(attn, attn, dotBroadcast, fullFp32Mask);
         Muls(delta, attn, beta, fullFp32Mask);
 
-        RegTensor<float> state0;
-        RegTensor<float> state1;
-        if constexpr (std::is_same<stateType, float32_t>()) {
-            DataCopy(state0, state + rowOffset);
-            DataCopy(state1, state + rowOffset + FP32_PER_REG);
-        } else {
-            DataCopy<float, LoadDist::DIST_DINTLV_B32>(state0, state1, state + rowOffset);
-        }
         RegTensor<float> update0;
         RegTensor<float> update1;
         Mul(update0, delta, key0, fullFp32Mask);
         Mul(update1, delta, key1, fullFp32Mask);
         Add(state0, state0, update0, fullFp32Mask);
         Add(state1, state1, update1, fullFp32Mask);
-        if constexpr (std::is_same<stateType, float32_t>()) {
-            DataCopy(state + rowOffset, state0, fullFp32Mask);
-            DataCopy(state + rowOffset + FP32_PER_REG, state1, fullFp32Mask);
-        } else {
-            DataCopy<float, StoreDist::DIST_INTLV_B32>(state + rowOffset, state0, state1, fullFp32Mask);
+        if constexpr (saveState) {
+            // Multi-token recurrence consumes this FP32 scratch, including for BF16 stateOut.
+            if constexpr (std::is_same<stateType, float32_t>()) {
+                DataCopy(state + rowOffset, state0, fullFp32Mask);
+                DataCopy(state + rowOffset + FP32_PER_REG, state1, fullFp32Mask);
+            } else {
+                DataCopy<float, StoreDist::DIST_INTLV_B32>(state + rowOffset, state0, state1, fullFp32Mask);
+            }
         }
 
         RegTensor<float> out0;
@@ -434,6 +418,7 @@ private:
         }
     }
 
+    template <bool saveState>
     __aicore__ inline void Compute(uint32_t curSingleV, uint64_t curQKOffset, uint64_t curVOffset)
     {
         LocalTensor<stateType> stateOutLocal = stateOutQueue_.AllocTensor<stateType>();
@@ -451,23 +436,23 @@ private:
         __ubuf__ float *attnTmpAddr = reinterpret_cast<__ubuf__ float *>(attnInUb.GetPhyAddr());
         if (hasGama_) {
             if (hasGamaK_) {
-                ComputeRecurrentGatedDeltaRuleVF<stateType, outType, true, true>(
+                ComputeRecurrentGatedDeltaRuleVF<stateType, outType, true, true, saveState>(
                     stateAddr, keyAddr, queryAddr, valueAddr, gamaKAddr, stateOutAddr, attnOutAddr,
                     attnTmpAddr, static_cast<uint16_t>(curSingleV), static_cast<uint16_t>(alignK_),
                     gama_, beta_);
             } else {
-                ComputeRecurrentGatedDeltaRuleVF<stateType, outType, true, false>(
+                ComputeRecurrentGatedDeltaRuleVF<stateType, outType, true, false, saveState>(
                     stateAddr, keyAddr, queryAddr, valueAddr, gamaKAddr, stateOutAddr, attnOutAddr,
                     attnTmpAddr, static_cast<uint16_t>(curSingleV), static_cast<uint16_t>(alignK_),
                     gama_, beta_);
             }
         } else if (hasGamaK_) {
-            ComputeRecurrentGatedDeltaRuleVF<stateType, outType, false, true>(
+            ComputeRecurrentGatedDeltaRuleVF<stateType, outType, false, true, saveState>(
                 stateAddr, keyAddr, queryAddr, valueAddr, gamaKAddr, stateOutAddr, attnOutAddr,
                 attnTmpAddr, static_cast<uint16_t>(curSingleV), static_cast<uint16_t>(alignK_),
                 gama_, beta_);
         } else {
-            ComputeRecurrentGatedDeltaRuleVF<stateType, outType, false, false>(
+            ComputeRecurrentGatedDeltaRuleVF<stateType, outType, false, false, saveState>(
                 stateAddr, keyAddr, queryAddr, valueAddr, gamaKAddr, stateOutAddr, attnOutAddr,
                 attnTmpAddr, static_cast<uint16_t>(curSingleV), static_cast<uint16_t>(alignK_),
                 gama_, beta_);
@@ -553,7 +538,13 @@ private:
                     stateStride1_ * head_i + stateStride2_ * v_i;
                 gama_ = hasGama_ ? gamaInUb.GetValue(gbOffset) : 1;
                 beta_ = betaInUb.GetValue(gbOffset);
-                Compute(curSingleV, curQKOffset, curVOffset);
+                // Use the actual device-side sequence length, including prefix/varlen cases.
+                // A single-token sequence has no consumer of the updated FP32 scratch.
+                if (seq1 - seq0 == 1) {
+                    Compute<false>(curSingleV, curQKOffset, curVOffset);
+                } else {
+                    Compute<true>(curSingleV, curQKOffset, curVOffset);
+                }
                 if (attnOutBufferNum_ == BUFFER_NUM) {
                     CopyOutAttn(attnOffset, curSingleV);
                 } else {
