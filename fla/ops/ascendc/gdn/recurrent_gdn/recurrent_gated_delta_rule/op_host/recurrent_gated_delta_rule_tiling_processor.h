@@ -16,6 +16,7 @@
 #define RECURRENT_GATED_DELTA_RULE_TILING_PROCESSOR_H
 
 #include "../op_kernel/recurrent_gated_delta_rule_struct.h"
+#include "recurrent_gated_delta_rule_a5_ub.h"
 #include "err/ops_err.h"
 #include "log/log.h"
 #include "register/op_impl_registry.h"
@@ -61,6 +62,7 @@ struct RecurrentGatedDeltaRuleTilingContext {
     ge::DataType stateDtype = ge::DT_BF16;
     uint64_t aivNum = 0;
     uint64_t ubSize = 0;
+    bool isA5 = false;
 };
 
 class RecurrentGatedDeltaRuleTilingProcessor {
@@ -91,6 +93,29 @@ public:
 
     ge::graphStatus ProcessUb(RecurrentGatedDeltaRuleTilingData &tiling) const
     {
+        if (ctx_.isA5) {
+            const uint32_t stateBytes = ctx_.stateDtype == ge::DT_FLOAT ? 4U : 2U;
+            const auto profile = RecurrentGatedDeltaRule::SelectA5UbProfile(tiling, stateBytes, ctx_.ubSize);
+            if (!profile.valid) {
+                OP_LOGE(ctx_.nodeName, "A5 UB cannot fit the minimum recurrent state slice");
+                return ge::GRAPH_FAILED;
+            }
+            tiling.ubCalSize = static_cast<uint32_t>(ctx_.ubSize);
+            tiling.vStep = profile.vStep;
+            tiling.stateOutBufferNum = profile.stateOutBufferNum;
+            tiling.attnOutBufferNum = profile.attnOutBufferNum;
+            // Allocate exactly the scratch consumed by InitLocalBuffers, leaving
+            // the reserved margin outside TPipe's tensor allocations.
+            tiling.ubRestBytes = static_cast<uint32_t>(profile.tmpBytes);
+            OP_LOGD(ctx_.nodeName,
+                    "A5 UB profile: stateOutBufferNum=[%u], attnOutBufferNum=[%u], vStep=[%u], "
+                    "repeatTime=[%u], queueBytes=[%llu], tmpBytes=[%llu], totalBytes=[%llu], ubBytes=[%llu]",
+                    profile.stateOutBufferNum, profile.attnOutBufferNum, profile.vStep, profile.repeatTime,
+                    static_cast<unsigned long long>(profile.queueBytes),
+                    static_cast<unsigned long long>(profile.tmpBytes),
+                    static_cast<unsigned long long>(profile.totalBytes), static_cast<unsigned long long>(ctx_.ubSize));
+            return ge::GRAPH_SUCCESS;
+        }
         struct RuleItem {
             const char *name;
             ge::graphStatus (RecurrentGatedDeltaRuleTilingProcessor::*fn)(RecurrentGatedDeltaRuleTilingData &,

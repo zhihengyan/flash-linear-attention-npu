@@ -83,3 +83,35 @@ python3 tests/atk/recurrent_gated_delta_rule/gen_recurrent_gated_delta_rule.py -
 GEN_CASES_DTYPE_NUMBERS=200 \
 bash tests/atk/run_test_cpu.sh -op=recurrent_gated_delta_rule -scope=gen_cases
 ```
+
+## A5 实验 B 的 profile 覆盖计划
+
+实验分支 `codex/gdn-a5-ub-buffer-profile` 保留 main 的两遍 VF，只修改 A5 UB 预算和
+输出缓冲 profile。T=1 时只选 (stateOut,attnOut)=(1,1)，T>1 保留三种候选；
+实际 vStep 和深度还取决于设备查询的 UB 容量。T=B 不作为单 token 条件。
+
+TilingKey 模板仍只按 state dtype 选择；下表使用生成表达式，实际编码值以设备记录为准。
+
+| TilingKey 表达式 | 选择条件 | T=1 精度 case（g/gk/both） | T>1 精度代表 case | 当前 mss case | 适用 SoC / 实际选择证据 |
+| --- | --- | --- | --- | --- | --- |
+| `GET_TPL_TILING_KEY(RGDR_TPL_BF16)` | BF16 state | 0 / 174 / 95 | 2 / 3 / 4 | 0，仅 g-only 最小例 | A2/A3/A5；本轮只有静态条件核对，实际选择待验证 |
+| `GET_TPL_TILING_KEY(RGDR_TPL_FP32)` | FP32 state | 1 / 83 / 132 | 15 / 61 / 9 | 尚缺 | A2/A3/A5；同上 |
+
+内网验收需记录 TilingKey、vStep、stateOutBufferNum、attnOutBufferNum、UB 查询值与
+预算日志，补齐 mss 的 dtype/profile/slot 复用覆盖；现有 mss 文件不能作为覆盖完成的证据。
+对照 main 测相同 perf case，正式性能判定使用 msprof op_summary 的 Task Duration(us)。
+原始 ATK 三份 JSON、本算子的值域、CPU 标杆和混合容差在本实验中不修改。
+
+主机预算契约测试位于
+[`a5_ub_profile_test.cpp`](../../../fla/ops/ascendc/gdn/recurrent_gdn/recurrent_gated_delta_rule/op_host/tests/a5_ub_profile_test.cpp)，
+可在有 C++17 编译器的环境独立运行，不依赖 CANN 或 NPU：
+
+```bash
+c++ -std=c++17 -O2 -Wall -Wextra -Werror \
+  fla/ops/ascendc/gdn/recurrent_gdn/recurrent_gated_delta_rule/op_host/tests/a5_ub_profile_test.cpp \
+  -o /tmp/rgdr_a5_ub_profile_test
+/tmp/rgdr_a5_ub_profile_test
+```
+
+该测试用独立对象地址账本检查全部 Nv、dtype、gate、T 分域和容量边界，不代替设备精度、
+内存与性能测试。Windows 编码环境未安装 C++ 编译器，本轮未执行此二进制测试。
