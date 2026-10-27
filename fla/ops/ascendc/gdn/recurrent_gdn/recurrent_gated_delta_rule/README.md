@@ -1,4 +1,7 @@
 # RecurrentGatedDeltaRule 算子说明
+
+A5 诊断计时分支：先读 [采集操作](docs/timer_run.md)、[原始流程与打点](docs/timer_flow.md)
+和[当前验证/独立审核状态](docs/timer_report.md)。诊断不改变公开算子签名或数学，需完整重建本分支。
 `RecurrentGatedDeltaRule` 是用于循环门控 Delta 规则（Recurrent Gated Delta Rule，RGDR）的自定义算子，主要应用于线性注意力机制的推理场景。该算子在每个时间步根据当前输入 $q_t, k_t, v_t$ 和上一隐藏状态 $S_{t-1}$，计算当前输出 $o_t$ 并更新隐藏状态 $S_t$。
 
 ---

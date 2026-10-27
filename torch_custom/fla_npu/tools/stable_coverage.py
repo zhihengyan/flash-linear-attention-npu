@@ -40,6 +40,12 @@ OPS_DIR = SETUP_DIR / "fla_npu" / "ops" / "ascendc"
 SRC_DIR = SETUP_DIR / "csrc" / "src"
 BASELINE = REPO_ROOT / "tests" / "stable_coverage_baseline.json"
 
+# Explicit private diagnostics are wired and ABI-checked but never re-exported
+# as public mathematical operators. Do not blanket-ignore underscore schemas.
+PRIVATE_DIAGNOSTICS = {
+    "_profile_recurrent_gated_delta_rule": "stable_recurrent_gated_delta_rule_profile.cpp",
+}
+
 
 def public_ops() -> list[str]:
     """The operator list the package publishes (``_ASCENDC_OPS``)."""
@@ -455,6 +461,12 @@ def evaluate() -> dict:
                     f"_stable._ENUM {list(package_table[argument])}")
 
     for name in sorted(set(adapter_info) - set(published)):
+        if name in PRIVATE_DIAGNOSTICS:
+            entry = adapter_info[name]
+            source = PRIVATE_DIAGNOSTICS[name]
+            if entry.get("schema") != source or entry.get("run") != source or not entry.get("impl"):
+                blockers.append(f"{name}: private diagnostic wiring is incomplete")
+            continue
         blockers.append(f"{name}: adapter exists but is not published")
 
     # Having no ctypes fallback is the default shape for a new operator, so the

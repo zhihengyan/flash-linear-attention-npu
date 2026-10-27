@@ -19,6 +19,7 @@
 #include "lib/matmul_intf.h"
 #include "kernel_utils/vector/regbase.hpp"
 #include "../recurrent_gated_delta_rule_tiling_data.h"
+#include "../recurrent_gated_delta_rule_timer.h"
 
 namespace RecurrentGatedDeltaRule {
 
@@ -206,9 +207,23 @@ __simd_vf__ inline void ComputeRecurrentGatedDeltaRuleVF(
     }
 }
 
-template <typename inType, typename outType, typename stateType>
+// These calls are compiled out of the ordinary RGDR<...,false> path.
+#define RGDR_TIMER_BEGIN(name, kind) \
+    [[maybe_unused]] int name = -1; \
+    if constexpr (enableTimer) { TIMER_BLOCK(name = timerCtx_->Begin(AscendTimer::kind)); }
+#define RGDR_TIMER_END(name, kind) \
+    if constexpr (enableTimer) { TIMER_BLOCK(timerCtx_->End(AscendTimer::kind, name)); }
+
+template <typename inType, typename outType, typename stateType, bool enableTimer = false>
 class RGDR {
 public:
+    __aicore__ inline void SetTimerContext(RgdrTimerContext *context)
+    {
+        if constexpr (enableTimer) {
+            timerCtx_ = context;
+        }
+    }
+
     __aicore__ inline RGDR(const RecurrentGatedDeltaRuleTilingData *tilingData)
     {
         B_ = tilingData->b;
@@ -311,7 +326,13 @@ public:
 
     __aicore__ inline void Process()
     {
+        if constexpr (enableTimer) {
+            TIMER_BLOCK(timerCtx_->stage.TikNoBarrier());
+        }
         ComputeAvgload();
+        if constexpr (enableTimer) {
+            TIMER_BLOCK(timerCtx_->stage.template TokNoBarrier<Overwrite>(AscendTimer::RGDR_AVGLOAD));
+        }
         int32_t seq1 = cuSeqlensGm_.GetValue(0);
         for (uint64_t batch_i = 0; batch_i < B_; batch_i++) {
             int32_t seqLen = cuSeqlensGm_.GetValue(batch_i+1);
@@ -343,9 +364,13 @@ public:
                         stateTokenIdx = seq0 + acceptedTokenNum - 1;
                     }
                     stateOffset = ssmStateIndicesGm_.GetValue(stateTokenIdx);
+                    RGDR_TIMER_BEGIN(batchGates, BATCH_GATES_ISSUE);
                     CopyInGamaBeta(seq0, seq1);
+                    RGDR_TIMER_END(batchGates, BATCH_GATES_ISSUE);
                 }
+                RGDR_TIMER_BEGIN(headTotal, HEAD_TOTAL_ISSUE);
                 ProcessHead(seq0, seq1, head_i, stateOffset);
+                RGDR_TIMER_END(headTotal, HEAD_TOTAL_ISSUE);
             }
         }
     }
@@ -375,8 +400,12 @@ private:
             WaitFlag<HardEvent::V_MTE2>(evevtIdVtoMte2);
             DataCopyPad(gamaKLocal, gamaKGm_[vOffset / realV_ * realK_], gkInParams, gkPadParams);
             gamaKInQueue_.EnQue<float>(gamaKLocal);
+            RGDR_TIMER_BEGIN(gkWait, GK_COPY_WAIT);
             gamaKInUb = gamaKInQueue_.DeQue<float>();
+            RGDR_TIMER_END(gkWait, GK_COPY_WAIT);
+            RGDR_TIMER_BEGIN(gkExp, GK_EXP_ISSUE);
             ExpMasked(gamaKInUb, gamaKInUb, alignK_ * seqLen);
+            RGDR_TIMER_END(gkExp, GK_EXP_ISSUE);
             AscendC::PipeBarrier<PIPE_V>();
         }
         DataCopyPad(qLocal, queryGm_[qkOffset], qkInParams, qkPadParams);
@@ -385,14 +414,24 @@ private:
         qInQueue_.EnQue<inType>(qLocal);
         kInQueue_.EnQue<inType>(kLocal);
         vInQueue_.EnQue<inType>(vLocal);
+        RGDR_TIMER_BEGIN(qWait, Q_COPY_WAIT);
         qLocal = qInQueue_.DeQue<inType>();
+        RGDR_TIMER_END(qWait, Q_COPY_WAIT);
+        RGDR_TIMER_BEGIN(kWait, K_COPY_WAIT);
         kLocal = kInQueue_.DeQue<inType>();
+        RGDR_TIMER_END(kWait, K_COPY_WAIT);
+        RGDR_TIMER_BEGIN(vWait, V_COPY_WAIT);
         vLocal = vInQueue_.DeQue<inType>();
+        RGDR_TIMER_END(vWait, V_COPY_WAIT);
+        RGDR_TIMER_BEGIN(qkvCast, QKV_CAST_ISSUE);
         Cast(qInUb, qLocal, AscendC::RoundMode::CAST_NONE, alignK_ * seqLen);
         Cast(kInUb, kLocal, AscendC::RoundMode::CAST_NONE, alignK_ * seqLen);
         Cast(vInUb, vLocal, AscendC::RoundMode::CAST_NONE, alignV_ * seqLen);
+        RGDR_TIMER_END(qkvCast, QKV_CAST_ISSUE);
         AscendC::PipeBarrier<PIPE_V>();
+        RGDR_TIMER_BEGIN(queryScale, QUERY_SCALE_ISSUE);
         Muls(qInUb, qInUb, scale_, seqLen * alignK_);
+        RGDR_TIMER_END(queryScale, QUERY_SCALE_ISSUE);
         qInQueue_.FreeTensor(qLocal);
         kInQueue_.FreeTensor(kLocal);
         vInQueue_.FreeTensor(vLocal);
@@ -400,23 +439,29 @@ private:
 
     __aicore__ inline void PrefetchState(uint64_t stateOffest, uint32_t curSingleV)
     {
+        RGDR_TIMER_BEGIN(prefetch, STATE_PREFETCH_ISSUE);
         LocalTensor<stateType> stateLocal = stateInQueue_.AllocTensor<stateType>();
         DataCopyExtParams stateInParams{static_cast<uint16_t>(curSingleV),
                                         static_cast<uint16_t>(realK_ * sizeof(stateType)), 0, 0, 0};
         DataCopyPadExtParams<stateType> padParams{true, 0, static_cast<uint8_t>(alignK_ - realK_), 0};
         DataCopyPad(stateLocal, initStateGm_[stateOffest], stateInParams, padParams);
         stateInQueue_.EnQue<stateType>(stateLocal);
+        RGDR_TIMER_END(prefetch, STATE_PREFETCH_ISSUE);
     }
 
     __aicore__ inline void LoadPrefetchedState(uint32_t curSingleV)
     {
+        RGDR_TIMER_BEGIN(stateWait, STATE_DEQUEUE_WAIT);
         LocalTensor<stateType> stateLocal = stateInQueue_.DeQue<stateType>();
+        RGDR_TIMER_END(stateWait, STATE_DEQUEUE_WAIT);
+        RGDR_TIMER_BEGIN(stateCast, STATE_CAST_COPY_ISSUE);
         if constexpr (std::is_same<stateType, float32_t>()) {
             DataCopy(stateInUb, stateLocal, alignK_ * curSingleV);
         } else {
             Cast(stateInUb, stateLocal, AscendC::RoundMode::CAST_NONE, alignK_ * curSingleV);
         }
         stateInQueue_.FreeTensor(stateLocal);
+        RGDR_TIMER_END(stateCast, STATE_CAST_COPY_ISSUE);
     }
 
     __aicore__ inline void ExpMasked(LocalTensor<float> &dstTensor, const LocalTensor<float> &srcTensor,
@@ -436,8 +481,10 @@ private:
 
     __aicore__ inline void Compute(uint32_t curSingleV, uint64_t curQKOffset, uint64_t curVOffset)
     {
+        RGDR_TIMER_BEGIN(outputAlloc, OUTPUT_ALLOC_WAIT);
         LocalTensor<stateType> stateOutLocal = stateOutQueue_.AllocTensor<stateType>();
         LocalTensor<outType> attnOutLocal = attnOutQueue_.AllocTensor<outType>();
+        RGDR_TIMER_END(outputAlloc, OUTPUT_ALLOC_WAIT);
         __ubuf__ float *stateAddr = reinterpret_cast<__ubuf__ float *>(stateInUb.GetPhyAddr());
         __ubuf__ float *keyAddr = reinterpret_cast<__ubuf__ float *>(kInUb[curQKOffset].GetPhyAddr());
         __ubuf__ float *queryAddr = reinterpret_cast<__ubuf__ float *>(qInUb[curQKOffset].GetPhyAddr());
@@ -449,6 +496,7 @@ private:
             reinterpret_cast<__ubuf__ stateType *>(stateOutLocal.GetPhyAddr());
         __ubuf__ outType *attnOutAddr = reinterpret_cast<__ubuf__ outType *>(attnOutLocal.GetPhyAddr());
         __ubuf__ float *attnTmpAddr = reinterpret_cast<__ubuf__ float *>(attnInUb.GetPhyAddr());
+        RGDR_TIMER_BEGIN(recurrentVf, RECURRENT_VF_ISSUE);
         if (hasGama_) {
             if (hasGamaK_) {
                 ComputeRecurrentGatedDeltaRuleVF<stateType, outType, true, true>(
@@ -472,25 +520,36 @@ private:
                 attnTmpAddr, static_cast<uint16_t>(curSingleV), static_cast<uint16_t>(alignK_),
                 gama_, beta_);
         }
+        RGDR_TIMER_END(recurrentVf, RECURRENT_VF_ISSUE);
+        RGDR_TIMER_BEGIN(outputEnqueue, OUTPUT_ENQUEUE);
         stateOutQueue_.EnQue<stateType>(stateOutLocal);
         attnOutQueue_.EnQue<outType>(attnOutLocal);
+        RGDR_TIMER_END(outputEnqueue, OUTPUT_ENQUEUE);
     }
 
     __aicore__ inline void CopyOutAttn(uint64_t attnOffset, uint32_t curSingleV)
     {
+        RGDR_TIMER_BEGIN(attnWait, ATTN_DEQUEUE_WAIT);
         LocalTensor<outType> attnLocal = attnOutQueue_.DeQue<outType>();
+        RGDR_TIMER_END(attnWait, ATTN_DEQUEUE_WAIT);
+        RGDR_TIMER_BEGIN(attnCopy, ATTN_COPY_ISSUE);
         DataCopyParams attnOutParams{1, static_cast<uint16_t>(curSingleV * sizeof(outType)), 0, 0};
         DataCopyPad(attnOutGm_[attnOffset], attnLocal, attnOutParams);
         attnOutQueue_.FreeTensor(attnLocal);
+        RGDR_TIMER_END(attnCopy, ATTN_COPY_ISSUE);
     }
 
     __aicore__ inline void CopyOutState(uint64_t stateOffset, uint32_t curSingleV)
     {
+        RGDR_TIMER_BEGIN(stateOutWait, STATE_OUT_DEQUEUE_WAIT);
         LocalTensor<stateType> stateOutLocal = stateOutQueue_.DeQue<stateType>();
+        RGDR_TIMER_END(stateOutWait, STATE_OUT_DEQUEUE_WAIT);
+        RGDR_TIMER_BEGIN(stateOutCopy, STATE_OUT_COPY_ISSUE);
         DataCopyParams stateOutParams{static_cast<uint16_t>(curSingleV),
                                       static_cast<uint16_t>(realK_ * sizeof(stateType)), 0, 0};
         DataCopyPad(finalStateGm_[stateOffset], stateOutLocal, stateOutParams);
         stateOutQueue_.FreeTensor(stateOutLocal);
+        RGDR_TIMER_END(stateOutCopy, STATE_OUT_COPY_ISSUE);
     }
 
     __aicore__ inline void CopyInGamaBeta(int32_t seq0, int32_t seq1)
@@ -501,16 +560,24 @@ private:
         DataCopyPadParams padParams;
         DataCopyPad(betaLocal, betaGm_[seq0 * NV_], betaInParams, padParams);
         betaInQueue_.EnQue<inType>(betaLocal);
+        RGDR_TIMER_BEGIN(betaWait, BETA_DEQUEUE_WAIT);
         betaLocal = betaInQueue_.DeQue<inType>();
+        RGDR_TIMER_END(betaWait, BETA_DEQUEUE_WAIT);
+        RGDR_TIMER_BEGIN(betaCast, BETA_CAST_ISSUE);
         Cast(betaInUb, betaLocal, AscendC::RoundMode::CAST_NONE, seqLen * NV_);
+        RGDR_TIMER_END(betaCast, BETA_CAST_ISSUE);
         betaInQueue_.FreeTensor(betaLocal);
         if (hasGama_) {
             LocalTensor<float> gamaLocal = gamaInQueue_.AllocTensor<float>();
             DataCopyParams gamaInParams{1, static_cast<uint16_t>(seqLen * NV_ * sizeof(float)), 0, 0};
             DataCopyPad(gamaLocal, gamaGm_[seq0 * NV_], gamaInParams, padParams);
             gamaInQueue_.EnQue<float>(gamaLocal);
+            RGDR_TIMER_BEGIN(gWait, G_DEQUEUE_WAIT);
             gamaLocal = gamaInQueue_.DeQue<float>();
+            RGDR_TIMER_END(gWait, G_DEQUEUE_WAIT);
+            RGDR_TIMER_BEGIN(gExp, G_EXP_ISSUE);
             ExpMasked(gamaInUb, gamaLocal, seqLen * NV_);
+            RGDR_TIMER_END(gExp, G_EXP_ISSUE);
             gamaInQueue_.FreeTensor(gamaLocal);
         }
     }
@@ -519,7 +586,9 @@ private:
     {
         uint64_t vOffset = (seq0 * NV_ + head_i) * realV_;
         uint64_t qkOffset = (seq0 * NK_ + head_i / (NV_ / NK_)) * realK_;
+        RGDR_TIMER_BEGIN(headQkv, HEAD_QKV_ISSUE);
         CopyInQKV(vOffset, qkOffset, seq1 - seq0);
+        RGDR_TIMER_END(headQkv, HEAD_QKV_ISSUE);
         if (realV_ == 0) {
             if (hasGamaK_) {
                 gamaKInQueue_.FreeTensor(gamaKInUb);
@@ -531,6 +600,7 @@ private:
         uint64_t nextStateOffset = stateStride0_ * stateOffset + stateStride1_ * head_i;
         PrefetchState(nextStateOffset, nextSingleV);
         for (uint64_t v_i = 0; v_i < realV_; v_i += vStep_) {
+            RGDR_TIMER_BEGIN(sliceTotal, SLICE_TOTAL_ISSUE);
             uint32_t curSingleV = v_i + vStep_ > realV_ ? realV_ - v_i : vStep_;
             LoadPrefetchedState(curSingleV);
             nextVOffset = v_i + vStep_;
@@ -544,6 +614,8 @@ private:
             bool hasPendingAttn = false;
             bool hasPendingState = false;
             for (uint64_t seq_i = seq0; seq_i < seq1; seq_i++) {
+                RGDR_TIMER_BEGIN(tokenTotal, TOKEN_TOTAL_ISSUE);
+                RGDR_TIMER_BEGIN(tokenParams, TOKEN_PARAMS);
                 uint64_t gbOffset = head_i + (seq_i - seq0) * NV_;
                 uint64_t curQKOffset = (seq_i - seq0) * alignK_;
                 uint64_t curVOffset = (seq_i - seq0) * alignV_ + v_i;
@@ -553,6 +625,7 @@ private:
                     stateStride1_ * head_i + stateStride2_ * v_i;
                 gama_ = hasGama_ ? gamaInUb.GetValue(gbOffset) : 1;
                 beta_ = betaInUb.GetValue(gbOffset);
+                RGDR_TIMER_END(tokenParams, TOKEN_PARAMS);
                 Compute(curSingleV, curQKOffset, curVOffset);
                 if (attnOutBufferNum_ == BUFFER_NUM) {
                     CopyOutAttn(attnOffset, curSingleV);
@@ -572,6 +645,7 @@ private:
                     pendingStateOffset = curStateOutOffset;
                     hasPendingState = true;
                 }
+                RGDR_TIMER_END(tokenTotal, TOKEN_TOTAL_ISSUE);
             }
             if (hasPendingAttn) {
                 CopyOutAttn(pendingAttnOffset, curSingleV);
@@ -579,6 +653,7 @@ private:
             if (hasPendingState) {
                 CopyOutState(pendingStateOffset, curSingleV);
             }
+            RGDR_TIMER_END(sliceTotal, SLICE_TOTAL_ISSUE);
         }
         if (hasGamaK_) {
             gamaKInQueue_.FreeTensor(gamaKInUb);
@@ -597,6 +672,7 @@ private:
     }
 
 private:
+    RgdrTimerContext *timerCtx_ = nullptr;
     GlobalTensor<inType> queryGm_;
     GlobalTensor<inType> keyGm_;
     GlobalTensor<inType> valueGm_;
@@ -654,5 +730,7 @@ private:
     uint32_t stateStride1_;
     uint32_t stateStride2_;
 };
+#undef RGDR_TIMER_BEGIN
+#undef RGDR_TIMER_END
 } // namespace RecurrentGatedDeltaRule
 #endif

@@ -13,6 +13,8 @@
  */
 #include <dlfcn.h>
 #include "aclnn_recurrent_gated_delta_rule.h"
+#include "aclnn_recurrent_gated_delta_rule_profile.h"
+#include "../../op_kernel/AscendTimerV2.hpp"
 #include "recurrent_gated_delta_rule.h"
 
 #include "securec.h"
@@ -136,13 +138,13 @@ static aclnnStatus PreProcess(RecurrentGatedDeltaRuleParams &params)
 }
 } // namespace
 
-aclnnStatus aclnnRecurrentGatedDeltaRuleGetWorkspaceSize(const aclTensor *query, const aclTensor *key,
+static aclnnStatus BuildRecurrentGatedDeltaRuleWorkspace(const aclTensor *query, const aclTensor *key,
                                                          const aclTensor *value, const aclTensor *beta,
                                                          aclTensor *stateRef, const aclTensor *actualSeqLengths,
                                                          const aclTensor *ssmStateIndices, const aclTensor *g,
                                                          const aclTensor *gk, const aclTensor *numAcceptedTokens,
                                                          float scaleValue, aclTensor *out, uint64_t *workspaceSize,
-                                                         aclOpExecutor **executor)
+                                                         aclOpExecutor **executor, const aclTensor *timer)
 {
     L2_DFX_PHASE_1(aclnnRecurrentGatedDeltaRule,
                    DFX_IN(query, key, value, beta, stateRef, actualSeqLengths, ssmStateIndices, g, gk,
@@ -188,7 +190,7 @@ aclnnStatus aclnnRecurrentGatedDeltaRuleGetWorkspaceSize(const aclTensor *query,
     // 调用l0接口
     auto outRet =
         l0op::RecurrentGatedDeltaRule(query_, key_, value_, beta_, stateRef, actualSeqLengths_, ssmStateIndices_, g, gk,
-                                      numAcceptedTokens, scaleValue, uniqueExecutor.get());
+                                      numAcceptedTokens, scaleValue, uniqueExecutor.get(), timer);
     if (outRet == nullptr) {
         return ACLNN_ERR_INNER_NULLPTR;
     }
@@ -202,6 +204,41 @@ aclnnStatus aclnnRecurrentGatedDeltaRuleGetWorkspaceSize(const aclTensor *query,
     *workspaceSize = uniqueExecutor->GetWorkspaceSize();
     uniqueExecutor.ReleaseTo(executor);
     return ACLNN_SUCCESS;
+}
+
+aclnnStatus aclnnRecurrentGatedDeltaRuleGetWorkspaceSize(
+    const aclTensor *query, const aclTensor *key, const aclTensor *value, const aclTensor *beta, aclTensor *stateRef,
+    const aclTensor *actualSeqLengths, const aclTensor *ssmStateIndices, const aclTensor *g, const aclTensor *gk,
+    const aclTensor *numAcceptedTokens, float scaleValue, aclTensor *out, uint64_t *workspaceSize,
+    aclOpExecutor **executor)
+{
+    return BuildRecurrentGatedDeltaRuleWorkspace(query, key, value, beta, stateRef, actualSeqLengths,
+        ssmStateIndices, g, gk, numAcceptedTokens, scaleValue, out, workspaceSize, executor, nullptr);
+}
+
+uint64_t aclnnRecurrentGatedDeltaRuleTimerBufferSize()
+{
+    return AscendTimer::TOTAL_BUFFER_SIZE;
+}
+
+aclnnStatus aclnnRecurrentGatedDeltaRuleProfileGetWorkspaceSize(
+    const aclTensor *query, const aclTensor *key, const aclTensor *value, const aclTensor *beta, aclTensor *stateRef,
+    const aclTensor *actualSeqLengths, const aclTensor *ssmStateIndices, const aclTensor *g, const aclTensor *gk,
+    const aclTensor *numAcceptedTokens, aclTensor *timer, float scaleValue, aclTensor *out,
+    uint64_t *workspaceSize, aclOpExecutor **executor)
+{
+    CHECK_RET(timer != nullptr && workspaceSize != nullptr && executor != nullptr, ACLNN_ERR_PARAM_INVALID);
+    CHECK_RET(timer->GetDataType() == op::DataType::DT_INT64 && timer->GetViewShape().GetDimNum() == 1 &&
+              timer->GetViewShape().GetDim(0) >= AscendTimer::TOTAL_BUFFER_SIZE && IsContiguous(timer),
+              ACLNN_ERR_PARAM_INVALID);
+    return BuildRecurrentGatedDeltaRuleWorkspace(query, key, value, beta, stateRef, actualSeqLengths,
+        ssmStateIndices, g, gk, numAcceptedTokens, scaleValue, out, workspaceSize, executor, timer);
+}
+
+aclnnStatus aclnnRecurrentGatedDeltaRuleProfile(void *workspace, uint64_t workspaceSize,
+                                               aclOpExecutor *executor, aclrtStream stream)
+{
+    return CommonOpExecutorRun(workspace, workspaceSize, executor, stream);
 }
 
 aclnnStatus aclnnRecurrentGatedDeltaRule(void *workspace, uint64_t workspaceSize, aclOpExecutor *executor,

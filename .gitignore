@@ -69,6 +69,7 @@ OPPROF_*
 extra-info
 
 # test artifacts
+/profiling_results/
 torch_custom/fla_npu/test/test_output/
 torch_custom/fla_npu/test/data/
 

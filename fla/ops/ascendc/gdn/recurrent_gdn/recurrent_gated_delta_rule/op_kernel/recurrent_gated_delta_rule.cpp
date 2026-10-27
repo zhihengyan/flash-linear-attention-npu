@@ -44,12 +44,35 @@ struct RGDRDTypeTraits<RGDR_TPL_FP32> {
 template <int D_T_STATE>
 __global__ __aicore__ void
 recurrent_gated_delta_rule(GM_ADDR query, GM_ADDR key, GM_ADDR value, GM_ADDR beta, GM_ADDR state, GM_ADDR cuSeqlens,
-                           GM_ADDR ssmStateIndices, GM_ADDR g, GM_ADDR gk, GM_ADDR numAcceptedTokens, GM_ADDR out,
+                           GM_ADDR ssmStateIndices, GM_ADDR g, GM_ADDR gk, GM_ADDR numAcceptedTokens, GM_ADDR timerAddr, GM_ADDR out,
                            GM_ADDR stateOut, GM_ADDR workspaceGM, GM_ADDR tilingGM)
 {
     REGISTER_TILING_DEFAULT(RecurrentGatedDeltaRuleTilingData);
     GET_TILING_DATA(tilingData, tilingGM);
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
+#if defined(__CCE_AICORE__) && __CCE_AICORE__ == 310 && ENABLE_TIMER
+    if (timerAddr != nullptr) {
+        RgdrTimerContext timing;
+        timing.Init(timerAddr);
+        TIMER_BLOCK(timing.all.TikNoBarrier());
+        TIMER_BLOCK(timing.stage.TikNoBarrier());
+        TPipe pipe;
+        using StateType = typename RGDRDTypeTraits<D_T_STATE>::type;
+        RGDR<bfloat16_t, bfloat16_t, StateType, true> op(&tilingData);
+        op.SetTimerContext(&timing);
+        RGDRInitParams initParams{query, key, value, g, gk, beta, state, cuSeqlens,
+                                  ssmStateIndices, numAcceptedTokens, out, stateOut};
+        op.Init(initParams, &pipe);
+        TIMER_BLOCK(timing.stage.template TokNoBarrier<Overwrite>(AscendTimer::RGDR_INIT));
+        TIMER_BLOCK(timing.process.TikNoBarrier());
+        op.Process();
+        TIMER_BLOCK(timing.process.template TokNoBarrier<Overwrite>(AscendTimer::RGDR_PROCESS_ISSUE));
+        // The only diagnostic drain; phase issue windows retain the original pipeline.
+        TIMER_BLOCK(timing.all.template Tok<Overwrite>(AscendTimer::KERNEL_TIMING_IDX));
+        TIMER_BLOCK(timing.Publish(tilingData, sizeof(StateType)));
+        return;
+    }
+#endif
     TPipe pipe;
     using StateType = typename RGDRDTypeTraits<D_T_STATE>::type;
     RGDR<bfloat16_t, bfloat16_t, StateType> op(&tilingData);

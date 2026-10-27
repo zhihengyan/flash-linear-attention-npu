@@ -16,9 +16,17 @@ if (BUILD_OPEN_PROJECT)
 endif()
 
 if (BUILD_OPS_RTY_KERNEL) # 回黄kernel
+    set(RGDR_TIMER_SWITCH "1")
+    if(DEFINED ENV{FLA_RGDR_ENABLE_TIMER})
+        set(RGDR_TIMER_SWITCH "$ENV{FLA_RGDR_ENABLE_TIMER}")
+    endif()
+    if(NOT RGDR_TIMER_SWITCH MATCHES "^[01]$")
+        message(FATAL_ERROR "FLA_RGDR_ENABLE_TIMER must be 0 or 1")
+    endif()
     add_ops_compile_options(
         OP_NAME RecurrentGatedDeltaRule
-        OPTIONS --cce-auto-sync=on
+        OPTIONS -DENABLE_TIMER=${RGDR_TIMER_SWITCH}
+                --cce-auto-sync=on
                 -Wno-deprecated-declarations
                 -Werror
     )

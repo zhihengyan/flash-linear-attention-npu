@@ -1,5 +1,11 @@
 # RecurrentGatedDeltaRule ATK 工程
 
+A5 分阶段采集的唯一主要入口为 `scripts/profile_performance.py`；完整安装、原 ATK 用例复用、
+raw/CSV/可选 Perfetto 与窗口解释见
+[timer_run.md](../../../fla/ops/ascendc/gdn/recurrent_gdn/recurrent_gated_delta_rule/docs/timer_run.md)。
+当前设备和独立审核状态见
+[timer_report.md](../../../fla/ops/ascendc/gdn/recurrent_gdn/recurrent_gated_delta_rule/docs/timer_report.md)。
+
 本目录提供 `recurrent_gated_delta_rule` 的 ATK 单算子工程，包含 `executor_recurrent_gated_delta_rule.py`、`gen_recurrent_gated_delta_rule.py`、`recurrent_gated_delta_rule.yaml`、`atk_recurrent_gated_delta_rule.json`。测试通过稳定入口 `fla_npu.ops.ascendc.recurrent_gated_delta_rule` 调用算子。
 
 ## 输入约束

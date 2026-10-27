@@ -19,6 +19,7 @@
 #include "err/ops_err.h"
 #include "log/log.h"
 #include "tiling/platform/platform_ascendc.h"
+#include "../op_kernel/AscendTimerV2.hpp"
 
 #include <cmath>
 
@@ -36,6 +37,7 @@ const size_t SSM_STATE_INDICES_INDEX = 6;
 const size_t G_INDEX = 7;
 const size_t GK_INDEX = 8;
 const size_t ACC_TO_INDEX = 9;
+const size_t TIMER_INDEX = 10;
 
 void RecurrentGatedDeltaRuleTiling::InitCompileInfo()
 {
@@ -300,6 +302,17 @@ ge::graphStatus RecurrentGatedDeltaRuleTiling::GetStateStrides()
 
 ge::graphStatus RecurrentGatedDeltaRuleTiling::GetOptionalInput()
 {
+    if (context_->GetOptionalInputDesc(TIMER_INDEX) != nullptr) {
+        const auto platform = platform_ascendc::PlatformAscendC(context_->GetPlatformInfo());
+        const auto timerShape = context_->GetOptionalInputShape(TIMER_INDEX);
+        OP_CHECK_IF(platform.GetSocVersion() != platform_ascendc::SocVersion::ASCEND950 ||
+                        compileInfo_.aivNum > AscendTimer::N_CORE_COUNT || timerShape == nullptr ||
+                        context_->GetOptionalInputDesc(TIMER_INDEX)->GetDataType() != ge::DT_INT64 ||
+                        timerShape->GetOriginShape().GetDimNum() != 1 ||
+                        timerShape->GetOriginShape().GetDim(0) < AscendTimer::TOTAL_BUFFER_SIZE,
+                    OP_LOGE(context_->GetNodeName(), "invalid A5 timer layout or core capacity"),
+                    return ge::GRAPH_FAILED);
+    }
     if (context_->GetOptionalInputDesc(G_INDEX) == nullptr) {
         tilingData_.hasGama = 0;
     } else {
