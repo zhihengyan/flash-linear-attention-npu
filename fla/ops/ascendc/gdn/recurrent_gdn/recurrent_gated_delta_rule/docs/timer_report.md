@@ -1,6 +1,7 @@
 # A5 recurrent GDN 计时接入报告
 
-当前状态（2026-10-27）：源码接入、静态检查与独立审核完成；CANN 编译及 A5 实测待内网完成。
+当前状态（2026-10-28）：已根据用户提供的 CANN 9.1.0 日志定位并修正 host L2 DFX 编译错误；
+源码回归检查通过，实际 CANN 复编和 A5 实测仍待内网完成。静态检查不构成 CANN 编译通过证据。
 分支 `codex/gdn-a5-stage-timer`，基线 main `c9e2f1db`。本轮只有 profiling，无优化改动。
 
 ## 接入范围
@@ -14,7 +15,7 @@
 
 ## 本地检查
 
-- `python -B tests/atk/recurrent_gated_delta_rule/scripts/test_timer_layout.py`：10 项 CPU 测试通过。
+- `python -B tests/atk/recurrent_gated_delta_rule/scripts/test_timer_layout.py -v`：11 项 CPU 测试通过。
 - 检查枚举/命名对应、27 对动态 Begin/End、raw 全零/错容量/缺固定点/缺动态配对/缺核/截断、
   默认 case 实际工作缺失、私有 adapter wiring、目标 `.o` 空集合/哈希不一致和 trace 时钟门禁。
 - `python -B torch_custom/fla_npu/tools/stable_coverage.py --strict`：通过；全部公开入口保持完整，
@@ -89,6 +90,33 @@
 目标 Profile 对拍通过。DCCI 实际可见性、编译资源、torch/NPU state 副本与计时开销仍待设备验证。
 
 ## 设备结果与后续
+
+用户提供的构建日志片段显示：`recurrent_gated_delta_rule_ascend950_1` 和
+`recurrent_gated_delta_rule_ascend950_0` 均输出 `Built target`，顶层随后报告
+`gmake: *** [Makefile:156: all] Error 2`；整个 `build.sh --soc=ascend950 --pkg --vendor_name=fla_npu`
+退出 2，用时 1998.8 秒。该片段没有给出失败的子目标、编译器诊断或链接错误，最初未能确认根因。
+
+2026-10-28 用户提供单算子完整诊断，失败对象为
+`ophost_transformer_opapi_obj` 的 `op_api/aclnn_recurrent_gated_delta_rule.cpp.o`：
+`static assertion failed: Invalid DFX:aclnnRecurrentGatedDeltaRuleGetWorkspaceSize`。
+根因是本分支为复用普通/Profile 路径，把原 `L2_DFX_PHASE_1(aclnnRecurrentGatedDeltaRule, ...)`
+连同 executor 构造代码移入了 `BuildRecurrentGatedDeltaRuleWorkspace`，违反 DFX 对所在 API 函数名的约束。
+这属于本次 host 重构引入的错误；先前的源码/独立审核未覆盖这一 CANN 编译约束。
+
+修复将原 phase 1 恢复到 `aclnnRecurrentGatedDeltaRuleGetWorkspaceSize`，公共 helper 不持有 L2 DFX；
+Profile GetWorkspaceSize/执行入口各使用 `aclnnRecurrentGatedDeltaRuleProfile` 的 phase 1/2。
+Profile 的输入记录包含 timer，输出记录包含被写入的 stateRef/timer/out。kernel、tiling、数学和公开 ABI 未改。
+新增 `test_dfx_matches_enclosing_api`，逐个核对宏与所在函数名以及普通/Profile 的两阶段配对；
+旧提交源码作为负向样本会准确触发 helper 的 `Invalid DFX`，修复源码 11 项检查通过。
+尚未获得修复后的 CANN 构建输出，不把该回归检查描述为真实编译通过。
+
+本次增量独立复核：原审核者 `rgdr_timer_audit` 只读确认普通 API 的 DFX 内容与 main 一致、
+helper 无 L2 DFX、Profile 两阶段各自匹配入口名和 timer 输入/输出；独立重跑 11 项检查及旧源码
+负向样本均符合预期。该审核仍不构成 CANN 编译证据。
+
+此前操作说明错误地要求清空 `FLA_NPU_OPS`，导致无必要的全仓 kernel 构建；现已改为仓库支持的
+`FLA_NPU_OPS=recurrent_gated_delta_rule` 单算子 wheel。另补充保留现场、串行续编的定位命令。
+该构建范围修正只缩小编译范围；真正的编译错误修复是上述 DFX 归位。
 
 暂无本分支设备 raw/CSV/profiling，不生成阶段占比或瓶颈结论。
 按 [timer_run.md](timer_run.md) 在内网以完整重建的同一套 wheel/OPP 采集。

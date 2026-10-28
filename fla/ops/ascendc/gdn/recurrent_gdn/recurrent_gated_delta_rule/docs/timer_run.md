@@ -37,12 +37,45 @@ Windows 路径不能直接当作容器内路径。采集脚本会记录实际包
 
 ## 2. 首次完整重建并安装
 
-本轮新增了私有 stable adapter 与内部 optional timer，首次需要完整 wheel，不能只覆盖 kernel。
-清空遗留算子筛选变量，以免错误复用旧 proto/adapter。构建不修改 VF 数学或 tiling 策略。
+本轮新增了私有 stable adapter 与内部 optional timer，首次需要重建 wheel，不能只覆盖 kernel。
+按仓库开发者指南使用算子筛选，重建目标算子的 host/proto/kernel 和 wheel 中的 stable adapter。
+无需清空 `FLA_NPU_OPS` 后编译全仓算子。构建不修改 VF 数学或 tiling 策略。
 
 ```bash
-FLA_RGDR_ENABLE_TIMER=1 FLA_NPU_SOC=ascend950 FLA_NPU_OPS= python scripts/build_wheel.py
+FLA_RGDR_ENABLE_TIMER=1 FLA_NPU_SOC=ascend950 FLA_NPU_OPS=recurrent_gated_delta_rule python scripts/build_wheel.py
 ```
+
+### 已有构建失败时先保留现场
+
+`gmake: *** [Makefile:156: all] Error 2` 只说明依赖目标失败，没有给出目标名或编译器诊断。
+并行构建中其它目标仍可能随后输出 `Built target`。先保留本次完整日志
+`dist/fla-npu-build.log`（指定 `--wheel-dir` 时在相应目录），不要再次启动 wheel 构建覆盖现场。
+
+若完整日志仍只有顶层失败状态，在同一个已激活 CANN 的 shell、仓库根目录下，使用现有 CMake
+构建目录串行续编并合并 stdout/stderr。该命令不运行 `build.sh` 的清理步骤，已有且仍有效的目标可复用。
+这是定位失败目标的命令，不会完成 wheel 的后续打包或安装；若失败重现，将生成明确的目标/命令日志。
+
+```bash
+test -f build/CMakeCache.txt || { echo 'missing existing CMake build tree'; exit 1; }
+set -o pipefail
+FLA_RGDR_ENABLE_TIMER=1 LD_LIBRARY_PATH="$PWD/build${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+  cmake --build build --target package --parallel 1 --verbose \
+  2>&1 | tee rgdr-build-resume.log
+```
+
+定位并修复失败后，再执行上面的单算子 wheel 命令。不能把局部 kernel `Built target` 或静态检查
+当作完整 wheel 构建通过。
+
+2026-10-28 已定位并在源码修正 `Invalid DFX:aclnnRecurrentGatedDeltaRuleGetWorkspaceSize`：
+原 L2 DFX 宏误放在公共 helper，现已回到对应 API。若内网保留了失败现场，可以先仅复编日志中
+失败的 host 对象目标验证这条错误，不必先重编全部 kernel：
+
+```bash
+FLA_RGDR_ENABLE_TIMER=1 LD_LIBRARY_PATH="$PWD/build${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+  cmake --build build --target ophost_transformer_opapi_obj --parallel 1 --verbose
+```
+
+此目标通过只代表 host 对象编译完成，之后仍需完成 package/wheel 构建与安装。
 
 使用构建末尾打印的**准确 wheel 和 run 包**，设置它们的绝对路径；不要按 commit 文件名排序选旧包：
 

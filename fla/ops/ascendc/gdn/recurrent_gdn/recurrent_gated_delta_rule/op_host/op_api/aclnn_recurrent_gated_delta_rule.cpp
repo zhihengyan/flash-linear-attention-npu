@@ -146,11 +146,6 @@ static aclnnStatus BuildRecurrentGatedDeltaRuleWorkspace(const aclTensor *query,
                                                          float scaleValue, aclTensor *out, uint64_t *workspaceSize,
                                                          aclOpExecutor **executor, const aclTensor *timer)
 {
-    L2_DFX_PHASE_1(aclnnRecurrentGatedDeltaRule,
-                   DFX_IN(query, key, value, beta, stateRef, actualSeqLengths, ssmStateIndices, g, gk,
-                          numAcceptedTokens, scaleValue),
-                   DFX_OUT(stateRef, out));
-
     auto uniqueExecutor = CREATE_EXECUTOR();
     CHECK_RET(uniqueExecutor.get() != nullptr, ACLNN_ERR_INNER_CREATE_EXECUTOR);
 
@@ -212,6 +207,11 @@ aclnnStatus aclnnRecurrentGatedDeltaRuleGetWorkspaceSize(
     const aclTensor *numAcceptedTokens, float scaleValue, aclTensor *out, uint64_t *workspaceSize,
     aclOpExecutor **executor)
 {
+    // CANN DFX checks the enclosing API name; keep it outside the shared helper.
+    L2_DFX_PHASE_1(aclnnRecurrentGatedDeltaRule,
+                   DFX_IN(query, key, value, beta, stateRef, actualSeqLengths, ssmStateIndices, g, gk,
+                          numAcceptedTokens, scaleValue),
+                   DFX_OUT(stateRef, out));
     return BuildRecurrentGatedDeltaRuleWorkspace(query, key, value, beta, stateRef, actualSeqLengths,
         ssmStateIndices, g, gk, numAcceptedTokens, scaleValue, out, workspaceSize, executor, nullptr);
 }
@@ -227,6 +227,10 @@ aclnnStatus aclnnRecurrentGatedDeltaRuleProfileGetWorkspaceSize(
     const aclTensor *numAcceptedTokens, aclTensor *timer, float scaleValue, aclTensor *out,
     uint64_t *workspaceSize, aclOpExecutor **executor)
 {
+    L2_DFX_PHASE_1(aclnnRecurrentGatedDeltaRuleProfile,
+                   DFX_IN(query, key, value, beta, stateRef, actualSeqLengths, ssmStateIndices, g, gk,
+                          numAcceptedTokens, timer, scaleValue),
+                   DFX_OUT(stateRef, timer, out));
     CHECK_RET(timer != nullptr && workspaceSize != nullptr && executor != nullptr, ACLNN_ERR_PARAM_INVALID);
     CHECK_RET(timer->GetDataType() == op::DataType::DT_INT64 && timer->GetViewShape().GetDimNum() == 1 &&
               timer->GetViewShape().GetDim(0) >= AscendTimer::TOTAL_BUFFER_SIZE && IsContiguous(timer),
@@ -238,6 +242,7 @@ aclnnStatus aclnnRecurrentGatedDeltaRuleProfileGetWorkspaceSize(
 aclnnStatus aclnnRecurrentGatedDeltaRuleProfile(void *workspace, uint64_t workspaceSize,
                                                aclOpExecutor *executor, aclrtStream stream)
 {
+    L2_DFX_PHASE_2(aclnnRecurrentGatedDeltaRuleProfile);
     return CommonOpExecutorRun(workspace, workspaceSize, executor, stream);
 }
 

@@ -10,6 +10,9 @@
 vStep、head 调度、workspace 或输出 ViewCopy。A/B 两轮优化不带入。
 用户授权仅编码和静态检查，设备采集在内网完成；不编造新的性能/精度结论。
 
+Host 的公共 workspace 构造 helper 只复用校验、executor 和下发逻辑，不放置 L2 DFX 宏。
+普通与 Profile 入口各自持有与函数名一致的 `L2_DFX_PHASE_1/2`，避免 CANN 的入口名静态断言失败。
+
 ## 2. Stage 0：Vector，原 recurrent VF 与诊断旁路
 
 数据路径继续是 FP32 gate → state·key reduction → delta → rank-one → state·query reduction

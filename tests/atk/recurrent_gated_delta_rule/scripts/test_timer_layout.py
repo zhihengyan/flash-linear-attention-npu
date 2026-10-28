@@ -35,6 +35,23 @@ def valid_raw():
 
 
 class TimerLayoutTest(unittest.TestCase):
+    def test_dfx_matches_enclosing_api(self):
+        # CANN rejects L2 DFX in helpers whose name differs from the API name.
+        source = (KERNEL.parent / "op_host/op_api/aclnn_recurrent_gated_delta_rule.cpp").read_text(encoding="utf-8")
+        declarations = list(re.finditer(r"\baclnnStatus\s+(\w+)\s*\([^)]*\)\s*\{", source))
+        observed = set()
+        for index, function in enumerate(declarations):
+            end = declarations[index + 1].start() if index + 1 < len(declarations) else len(source)
+            body = source[function.end():end]
+            for macro in re.finditer(r"\bL2_DFX_PHASE_([12])\s*\(\s*(\w+)\s*[,)]", body):
+                phase, api = macro.groups()
+                expected = api + ("GetWorkspaceSize" if phase == "1" else "")
+                self.assertEqual(function.group(1), expected, "Invalid DFX in " + function.group(1))
+                observed.add((api, phase))
+        self.assertEqual(observed, {(api, phase)
+                                   for api in ("aclnnRecurrentGatedDeltaRule", "aclnnRecurrentGatedDeltaRuleProfile")
+                                   for phase in ("1", "2")})
+
     def test_cpp_enum_and_constants(self):
         common = (KERNEL / "AscendTimerV2.hpp").read_text(encoding="utf-8")
         for enum, sentinel, expected in (
