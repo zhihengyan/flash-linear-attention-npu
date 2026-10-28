@@ -60,6 +60,38 @@ ATK DUT 统一通过 `fla_npu.ops.ascendc.recurrent_gated_delta_rule` 执行。`
 
 正向 JSON 只包含 `Dk=Dv=128` 的合法 shape。任何不等于 128 的维度属于非法输入，由 `fla_npu` wrapper 和 op_host tiling 共同拦截；对应拦截由 op_host UT 覆盖。
 
+## A5 单 work 实验的模板覆盖
+
+本分支仅对 A5、BF16 state、B=T=Nk=Nv=1、K=V=vStep=128、blockDim=1、
+stateStride2=128、g-only、无 accepted-token 输入选择 `SINGLE_WORK=1`。
+其它合法输入选择 general；A2/A3 始终选择 general。模板详设见
+[design.md](../../../fla/ops/ascendc/gdn/recurrent_gdn/recurrent_gated_delta_rule/docs/design.md)。
+
+| 模板参数 `(D_T_STATE,SINGLE_WORK)` | 精度 case | perf case | MSS / determinism case | 设备选择证据 |
+| --- | ---: | ---: | ---: | --- |
+| `(BF16,1)`，A5 single | 0 | 0 | 0 | 内网待采集 |
+| `(FP32,0)`，general | 1 | — | 1 | 内网待采集 |
+| `(BF16,0)`，general | 2 | — | 2 | 内网待采集 |
+
+`_mss.json` 保留原 case 0，人工选取原精度 case 1/2 补齐 general 的两个模板，
+不改变原 200 条精度用例、perf case 0、CPU 标杆或容差。
+数值 TilingKey 应以当前 CANN 生成结果为准，不能直接沿用 main 的历史数值。
+host DEBUG 日志新增 `stateDtypeKey / singleWork / tilingKey`，与实际 kernel 选择及
+blockDim 对照；不能只根据 case 的 shape 认定命中。
+
+无需 NPU 的本地回归入口如下；没有 C++ 编译器时会明确跳过 C++ 控制语义测试，
+其余源码对照不能代替 CANN 编译、模板选择、NPU 精度或同步检查：
+
+```bash
+python -B tests/atk/recurrent_gated_delta_rule/scripts/test_single_work_fastpath.py -v
+```
+
+该脚本核对原 VF/缓冲/搬运/同步函数和公开接口与 main 基线一致；有 C++17 编译器时，
+还会执行生产代码中的选择谓词和单 work 控制函数，检查空工作、不合法 prefix/length、
+非零 state index 和 padded block stride 的地址及调用顺序。
+内网构建、安装、产物校验和 A5 验证步骤见
+[开发记录](../../../fla/ops/ascendc/gdn/recurrent_gdn/recurrent_gated_delta_rule/docs/validation.md)。
+
 ## 执行方式
 
 ```bash
