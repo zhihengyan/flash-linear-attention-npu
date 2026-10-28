@@ -12,6 +12,7 @@
  * \brief
  */
 #include "recurrent_gated_delta_rule_tiling.h"
+#include "recurrent_gated_delta_rule_single_work.h"
 
 #include "tiling_base/tiling_templates_registry.h"
 #include "register/op_def_registry.h"
@@ -120,7 +121,14 @@ ge::graphStatus RecurrentGatedDeltaRuleTiling::DoLibApiTiling()
 {
     const auto stateDtype = context_->GetInputDesc(STATE_INDEX)->GetDataType();
     const uint64_t stateDtypeKey = stateDtype == ge::DT_FLOAT ? RGDR_TPL_FP32 : RGDR_TPL_BF16;
-    tilingKey_ = GET_TPL_TILING_KEY(stateDtypeKey);
+    auto platformInfo = context_->GetPlatformInfo();
+    const bool isA5 = platformInfo != nullptr &&
+        platform_ascendc::PlatformAscendC(platformInfo).GetSocVersion() == platform_ascendc::SocVersion::ASCEND950;
+    const bool singleWork = CanUseA5SingleWork(tilingData_, isA5, stateDtype == ge::DT_BF16);
+    tilingKey_ = GET_TPL_TILING_KEY(stateDtypeKey, singleWork);
+    OP_LOGD(context_->GetNodeName(), "stateDtypeKey=[%llu], singleWork=[%u], tilingKey=[%llu]",
+            static_cast<unsigned long long>(stateDtypeKey), static_cast<uint32_t>(singleWork),
+            static_cast<unsigned long long>(tilingKey_));
     return ge::GRAPH_SUCCESS;
 };
 

@@ -1,6 +1,9 @@
 # RecurrentGatedDeltaRule 算子说明
 `RecurrentGatedDeltaRule` 是用于循环门控 Delta 规则（Recurrent Gated Delta Rule，RGDR）的自定义算子，主要应用于线性注意力机制的推理场景。该算子在每个时间步根据当前输入 $q_t, k_t, v_t$ 和上一隐藏状态 $S_{t-1}$，计算当前输出 $o_t$ 并更新隐藏状态 $S_t$。
 
+A5 单 work 实验的接口边界、实现设计和待验证记录分别见 [api.md](docs/api.md)、
+[design.md](docs/design.md) 和 [validation.md](docs/validation.md)。
+
 ---
 
 ## 1. 算子功能
