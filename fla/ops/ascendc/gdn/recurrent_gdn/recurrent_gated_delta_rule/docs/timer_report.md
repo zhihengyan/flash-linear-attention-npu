@@ -1,7 +1,7 @@
 # A5 recurrent GDN 计时接入报告
 
-当前状态（2026-10-28）：已根据用户提供的 CANN 9.1.0 日志定位并修正 host L2 DFX 编译错误；
-源码回归检查通过，实际 CANN 复编和 A5 实测仍待内网完成。静态检查不构成 CANN 编译通过证据。
+当前状态（2026-10-28）：host L2 DFX 编译错误已修正并推送；内网采集日志又暴露 ATK 单用例范围
+为空，已修正采集脚本并通过 CPU 回归，ATK 精度/性能需内网重跑。尚无可归档的完整设备验收结果。
 分支 `codex/gdn-a5-stage-timer`，基线 main `c9e2f1db`。本轮只有 profiling，无优化改动。
 
 ## 接入范围
@@ -15,7 +15,7 @@
 
 ## 本地检查
 
-- `python -B tests/atk/recurrent_gated_delta_rule/scripts/test_timer_layout.py -v`：11 项 CPU 测试通过。
+- `python -B tests/atk/recurrent_gated_delta_rule/scripts/test_timer_layout.py -v`：13 项 CPU 测试通过。
 - 检查枚举/命名对应、27 对动态 Begin/End、raw 全零/错容量/缺固定点/缺动态配对/缺核/截断、
   默认 case 实际工作缺失、私有 adapter wiring、目标 `.o` 空集合/哈希不一致和 trace 时钟门禁。
 - `python -B torch_custom/fla_npu/tools/stable_coverage.py --strict`：通过；全部公开入口保持完整，
@@ -118,7 +118,31 @@ helper 无 L2 DFX、Profile 两阶段各自匹配入口名和 timer 输入/输�
 `FLA_NPU_OPS=recurrent_gated_delta_rule` 单算子 wheel。另补充保留现场、串行续编的定位命令。
 该构建范围修正只缩小编译范围；真正的编译错误修复是上述 DFX 归位。
 
-暂无本分支设备 raw/CSV/profiling，不生成阶段占比或瓶颈结论。
+### ATK 空范围与缺失系统 profile
+
+用户提供本轮 `20261028T065328_446392Z` 的 ATK 精度/性能日志。精度报
+`case_config_name = self.case_configs[0]["name"]` 的 `IndexError`；性能报 `df_statistic`
+尚未赋值的 `UnboundLocalError`。两者均记录 `Total Task: 0, success 0, failed 0` 和 `atk task failed!`。
+不是已经成功执行 ATK 后单纯漏解析 CSV；该轮未执行任何 ATK 用例，不能认定精度/性能通过。
+
+根因是采集入口将 `ACCURACY_START/END` 与 `PERFORMANCE_START/END` 分别设为相同的 case 索引 0。
+ATK 使用右端不包含的范围，`[0,0)` 为空。其内部捕获异常后仍可能返回 0，公共报告检查在找不到
+报告时也会跳过，使旧入口继续独立 worker 并最后在 `summarize_system_profile` 才发现缺少系统计时证据。
+先前依据子进程退出码推断 ATK 正常执行的结论撤回。
+
+修复仅限本算子的 Python 采集入口：按原 JSON 列表位置选择 `[index,index+1)`；精度与性能分别
+检查生成的 `atk.log`，要求 `Total Task:1, success1, failed0`，精度另要求 `acc_pass_result:Pass`。
+缺日志/缺任务统计、空范围、任务异常和精度未通过均立即拒绝，不修改公共 ATK runner 或精度标准。
+新增 CPU 集成测试验证真实入口传给 ATK 的切片恰好一条，覆盖 case ID 与 JSON 位置不相等的情况；
+旧提交源码作为负向对照准确失败于空范围。另覆盖失败、0 条、缺报告和精度失败的拒绝行为。
+13 项 CPU 检查通过；内网实际 ATK 重跑未执行。此前误传 wheel 的参数检查更改保持回退。
+
+增量独立复核确认了半开区间和阶段执行顺序，另发现同一日志混合 Pass/Failed 时只匹配 Pass 会误放行。
+已改为要求日志内每个 `acc_pass_result` 均为 Pass，并补充混合顺序、None 和缺失结果的负向覆盖。
+再次独立复核通过，13 项 CPU 检查重跑通过；真实 ATK/NPU 复测仍待内网完成。
+
+独立 worker 若已经正常返回，其普通/诊断对比和 timer 检查只构成该独立调用的证据，不能替代
+ATK CPU 标杆精度或系统 profile。本地尚未收到该轮 raw/parsed CSV/capture.json，不生成阶段占比或瓶颈结论。
 按 [timer_run.md](timer_run.md) 在内网以完整重建的同一套 wheel/OPP 采集。
 首先阅读未携带 timer 的 `system_tasks.json` 和同输入比较结果，再解释诊断 issue/等待窗口。
 若 ViewCopy 实际额外 task 明显，再评估输出路径；若主 kernel 占主导，结合 VF/等待数据再设计优化。

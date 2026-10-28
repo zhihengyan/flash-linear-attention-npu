@@ -118,6 +118,16 @@ python tests/atk/recurrent_gated_delta_rule/scripts/profile_performance.py \
 5. 同步后先保存 raw 与 outputs，再验证布局/核数/配对/截断、生成 CSV、metadata 和汇总。
 6. 汇总原系统 profile 的 op_summary Task Duration，帮助区分主 kernel、ViewCopy 或其它 task。
 
+ATK 的范围是左闭右开；默认 case 0 应使用 `START=0, END=1`。入口按 JSON 列表位置匹配原用例，
+每个 ATK 阶段结束后读取其 `atk.log`，要求实际执行 1 条、成功 1 条、失败 0 条，
+精度阶段另要求日志内每个 `acc_pass_result` 均为 `Pass`。缺日志/缺任务统计、0 条用例或 `atk task failed!` 均停止，
+不再只依据 ATK 子进程的退出码继续采集。
+
+2026-10-28 的旧脚本将 start/end 都设为 0，导致精度和性能均 `Total Task: 0`，最终在系统汇总报
+`no RGDR op_summary Task Duration evidence`。该轮 ATK 没有执行用例，不能记为精度/性能通过。
+修复只涉及本采集脚本，已有 wheel/OPP 无需重编；更新脚本后重新执行上述主入口，保存到新输出目录。
+旧目录中的独立 worker timer 数据可以保留，但不能代替缺失的 CPU 标杆精度和原 ATK 性能结果。
+
 Profile 仅单 launch；原 perf 若改成 repeat_calls>1，本入口明确拒绝，需先设计多 launch 采集。
 普通/诊断调用各有 60 秒 watchdog（保守地包含 host 提交与 synchronize，不能称为已确认 kernel
 入场的计时）；超时子进程退出，主进程保存失败状态与日志。检查 npu-smi 确认资源释放后再重试。

@@ -5,6 +5,7 @@ import importlib.util
 import json
 from pathlib import Path
 import re
+import sys
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -35,6 +36,76 @@ def valid_raw():
 
 
 class TimerLayoutTest(unittest.TestCase):
+    def test_single_case_atk_ranges_select_list_positions(self):
+        parent = ROOT / "profiling_results"
+        parent.mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=parent) as temp:
+            directory = Path(temp).resolve()
+            directory.relative_to(parent.resolve())
+            source = json.loads((collector.OP_DIR / "atk_recurrent_gated_delta_rule.json").read_text(encoding="utf-8"))
+            accuracy = [dict(source[1], id=1000), dict(source[0], id=900)]
+            performance = [dict(source[0], id=700)]
+            for suffix, cases in (("", accuracy), ("_perf", performance)):
+                (directory / f"atk_recurrent_gated_delta_rule{suffix}.json").write_text(json.dumps(cases), encoding="utf-8")
+            run = directory / "test.run"
+            run.touch()
+            output = directory / "capture"
+            observed = []
+
+            def fake_run(command, log, env=None, timeout=None):
+                if command[0] == "bash":
+                    stage = "accuracy" if "-scope=accuracy" in command else "performance"
+                    prefix = stage.upper()
+                    cases = accuracy if stage == "accuracy" else performance
+                    selected = cases[int(env[prefix + "_START"]):int(env[prefix + "_END"])]
+                    self.assertEqual(len(selected), 1, "ATK must receive a nonempty single-case range")
+                    self.assertEqual(selected[0]["id"], 900 if stage == "accuracy" else 700)
+                    observed.append(stage)
+                    nested = output / "atk_output" / ("accuracy" if stage == "accuracy" else "perf") / "task/log/atk.log"
+                    nested.parent.mkdir(parents=True)
+                    nested.write_text("Total Task: 1, success 1, failed 0\nacc_pass_result:Pass\n", encoding="utf-8")
+                return ("[OK] loaded libcust_opapi.so matches the freshly built one.\n"
+                        "[OK] all 2 kernel .o files match the freshly built OPP.")
+
+            with patch.object(sys, "argv", ["profile_performance.py", "--case-id", "700",
+                                             "--run-package", str(run), "--output", str(output)]), \
+                    patch.object(collector, "OP_DIR", directory), \
+                    patch.object(collector, "check_python_environment"), \
+                    patch.object(collector, "prepare_opp", return_value=(directory, directory / "opp/op_api/lib/libcust_opapi.so")), \
+                    patch.object(collector, "verify_target_kernel_objects", return_value={}), \
+                    patch.object(collector, "run_logged", side_effect=fake_run), \
+                    patch.object(collector, "summarize_system_profile", return_value=[]), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                collector.main()
+            self.assertEqual(observed, ["accuracy", "performance"])
+
+    def test_atk_stage_rejects_failed_empty_or_missing_reports(self):
+        parent = ROOT / "profiling_results"
+        parent.mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=parent) as temp:
+            directory = Path(temp).resolve()
+            directory.relative_to(parent.resolve())
+            with self.assertRaisesRegex(RuntimeError, "no task-count evidence"):
+                collector.verify_atk_stage(directory, "accuracy")
+            log = directory / "task/log/atk.log"
+            log.parent.mkdir(parents=True)
+            for content in ("atk task failed!\nTotal Task: 0, success 0, failed 0",
+                            "Total Task: 0, success 0, failed 0",
+                            "Total Task: 1, success 0, failed 1",
+                            "Total Task: 2, success 2, failed 0",
+                            "no summary was generated"):
+                log.write_text(content, encoding="utf-8")
+                for stage in ("accuracy", "performance"):
+                    with self.subTest(stage=stage, content=content), self.assertRaises(RuntimeError):
+                        collector.verify_atk_stage(directory, stage)
+            for flags in ("", "Failed", "None", "Pass\nacc_pass_result:Failed", "Failed\nacc_pass_result:Pass"):
+                log.write_text("Total Task: 1, success 1, failed 0\nacc_pass_result:" + flags, encoding="utf-8")
+                with self.subTest(flags=flags), self.assertRaisesRegex(RuntimeError, "requires acc_pass_result"):
+                    collector.verify_atk_stage(directory, "accuracy")
+            self.assertEqual(collector.verify_atk_stage(directory, "performance"), [str(log)])
+            log.write_text("Total Task: 1, success 1, failed 0\nacc_pass_result: Pass", encoding="utf-8")
+            self.assertEqual(collector.verify_atk_stage(directory, "accuracy"), [str(log)])
+
     def test_dfx_matches_enclosing_api(self):
         # CANN rejects L2 DFX in helpers whose name differs from the API name.
         source = (KERNEL.parent / "op_host/op_api/aclnn_recurrent_gated_delta_rule.cpp").read_text(encoding="utf-8")

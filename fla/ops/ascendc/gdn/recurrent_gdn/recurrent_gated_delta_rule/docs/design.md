@@ -13,6 +13,9 @@ vStep、head 调度、workspace 或输出 ViewCopy。A/B 两轮优化不带入�
 Host 的公共 workspace 构造 helper 只复用校验、executor 和下发逻辑，不放置 L2 DFX 宏。
 普通与 Profile 入口各自持有与函数名一致的 `L2_DFX_PHASE_1/2`，避免 CANN 的入口名静态断言失败。
 
+采集入口按原 JSON 的列表位置给 ATK 传入单用例范围 `[index, index+1)`，不把 case ID 当作位置，
+也不设置相同的 start/end。每阶段检查实际 ATK 日志的任务数和结果；子进程退出 0 不构成通过证据。
+
 ## 2. Stage 0：Vector，原 recurrent VF 与诊断旁路
 
 数据路径继续是 FP32 gate → state·key reduction → delta → rank-one → state·query reduction

@@ -10,6 +10,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import re
 import signal
 import subprocess
 import sys
@@ -64,6 +65,30 @@ def run_logged(command, log, env=None, timeout=None):
     if completed.returncode:
         raise RuntimeError(f"command failed ({completed.returncode}); see {log}")
     return log.read_text(encoding="utf-8", errors="replace")
+
+
+def verify_atk_stage(directory, stage):
+    # ATK may log a caught exception and still exit 0. Check the actual task report.
+    evidence = []
+    for log in sorted(directory.rglob("atk.log")):
+        content = log.read_text(encoding="utf-8", errors="replace")
+        if "atk task failed!" in content or "All cases is running failed." in content:
+            raise RuntimeError(f"ATK {stage} task failed; see {log}")
+        reports = re.findall(r"Total Task:\s*(\d+),\s*success\s+(\d+),\s*failed\s+(\d+)", content)
+        if not reports:
+            continue
+        total, success, failed = map(int, reports[-1])
+        if (total, success, failed) != (1, 1, 0):
+            raise RuntimeError(f"ATK {stage} must execute exactly one successful case; "
+                               f"got total={total}, success={success}, failed={failed}; see {log}")
+        if stage == "accuracy":
+            results = re.findall(r"\bacc_pass_result:\s*(\S+)", content)
+            if not results or any(result != "Pass" for result in results):
+                raise RuntimeError(f"ATK accuracy requires acc_pass_result:Pass for every reported result; see {log}")
+        evidence.append(str(log))
+    if not evidence:
+        raise RuntimeError(f"ATK {stage} has no task-count evidence; inspect {directory}")
+    return evidence
 
 
 def verify_target_kernel_objects(runtime_root, built_root):
@@ -313,10 +338,12 @@ def main():
                 raise RuntimeError("artifact check did not prove current kernel .o was installed")
             case = load_spec(OP_DIR / "atk_recurrent_gated_delta_rule_perf.json", args.case_id)
             accuracy = json.loads((OP_DIR / "atk_recurrent_gated_delta_rule.json").read_text(encoding="utf-8"))
-            matches = [c["id"] for c in accuracy if json.loads(next(x["range_values"] for x in c["inputs"]
+            matches = [index for index, c in enumerate(accuracy) if json.loads(next(x["range_values"] for x in c["inputs"]
                        if x["name"] == "case_spec")) == case]
             if not matches:
                 raise RuntimeError("perf case has no identical original accuracy case; do not invent a new tolerance")
+            performance = json.loads((OP_DIR / "atk_recurrent_gated_delta_rule_perf.json").read_text(encoding="utf-8"))
+            perf_index = next(index for index, c in enumerate(performance) if c["id"] == args.case_id)
             env = os.environ.copy()
             # Parent is already in the activated CANN environment, with its installed
             # package's OPP prepared. Do not let a stale optional env script replace it.
@@ -324,12 +351,17 @@ def main():
             env["FLA_NPU_ENV"] = ""
             env["FLA_NPU_OPP_ENV"] = ""
             env["ATK_OUTPUT_ROOT"] = str(output / "atk_output")
-            env["ACCURACY_START"] = env["ACCURACY_END"] = str(matches[0])
-            env["PERFORMANCE_START"] = env["PERFORMANCE_END"] = str(args.case_id)
+            # ATK slices JSON list positions with an exclusive end, not case IDs.
+            env["ACCURACY_START"] = str(matches[0])
+            env["ACCURACY_END"] = str(matches[0] + 1)
+            env["PERFORMANCE_START"] = str(perf_index)
+            env["PERFORMANCE_END"] = str(perf_index + 1)
             base = ["bash", "tests/atk/run_test_cpu.sh", "-op=recurrent_gated_delta_rule",
                     f"-npu_device_id={args.device}", "-soc=ascend950"]
             run_logged(base + ["-scope=accuracy"], output / "atk_accuracy.log", env)
+            verify_atk_stage(output / "atk_output/accuracy", "accuracy")
             run_logged(base + ["-scope=performance"], output / "atk_performance.log", env)
+            verify_atk_stage(output / "atk_output/perf", "performance")
             worker = [sys.executable, str(Path(__file__).resolve()), "--worker", "--output", str(output),
                       "--device", str(args.device), "--case-id", str(args.case_id)]
             if args.cycles_per_us is not None:

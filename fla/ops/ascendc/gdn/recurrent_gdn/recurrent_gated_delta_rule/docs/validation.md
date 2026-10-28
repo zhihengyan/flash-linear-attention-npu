@@ -10,9 +10,9 @@
 | timer 独立 GM、槽位与核所有权 | AscendTimerV2.hpp、AscendTimerV2_device.hpp、recurrent_gated_delta_rule_timer.h | 128B 行隔离、linear AIV、配对/容量 CPU 校验，独立审核通过 |
 | 既有同步与诊断 drain | arch35 原 DeQue/PIPE_V/V_MTE2/LocalMemBar；入口总 Tok | 原同步保留、无分阶段新 barrier，仅诊断末尾一次 drain；设备扰动待测 |
 | host/私有 adapter 接入 | Profile C 头、L2/L0/def/kernel、stable profile adapter | 参数对拍、39 adapter schema parity、strict coverage 通过；已按内网 CANN 9.1.0 报错修正 helper 内误放的 L2 DFX，源码回归检查通过，实际复编待内网 |
-| 原输入/精度标准/输出状态 | 原 perf/accuracy spec、原 executor，profile_performance.py | spec 相同静态检查、同输入两份 state 布局复制；真实 NPU 比较待内网 |
+| 原输入/精度标准/输出状态 | 原 perf/accuracy spec、原 executor，profile_performance.py | 内网 ATK 日志暴露空范围（Total Task:0），不能视为精度通过；已修正为 JSON 位置的单用例半开区间并检查实际阶段结果，内网重跑待完成 |
 | 原性能调用与额外 task | 原 ATK performance_device / op_summary 汇总 | 采集代码就绪，实际主核/ViewCopy Task Duration 尚无数据 |
-| 采集完整性与失败行为 | scripts/test_timer_layout.py、target .o/真实调用次数校验 | 11 项 CPU 检查（含 DFX 入口名约束）、负向样本拒绝；不冒充设备验证 |
+| 采集完整性与失败行为 | scripts/test_timer_layout.py、target .o/真实调用次数校验 | 13 项 CPU 检查（含 DFX 入口、ATK 单用例范围、空/失败/缺报告拒绝），旧脚本负向验证命中空范围；不冒充设备验证 |
 | 版本、安装和环境 | timer_run.md、artifact_check/source_hash/环境校验 | 操作与检查入口齐备，内网容器/CANN/产物路径由实际环境传入 |
 
 采用 CHUNK_DEPENDENT/V1 开发参考（来源 commit a14961e9dfe8c8264768d67fb447101873da4ecf）
