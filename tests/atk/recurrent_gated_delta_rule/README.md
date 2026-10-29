@@ -69,7 +69,7 @@ stateStride2=128、g-only、无 accepted-token 输入选择 `SINGLE_WORK=1`。
 
 | 模板参数 `(D_T_STATE,SINGLE_WORK)` | 精度 case | perf case | MSS / determinism case | 设备选择证据 |
 | --- | ---: | ---: | ---: | --- |
-| `(BF16,1)`，A5 single | 0 | 0 | 0 | 父版本 c36e18ce 的 case 0 成功；本轮 scratch 实验待测 |
+| `(BF16,1)`，A5 single | 0 | 0 | 0 | scratch 历史 200 条精度通过；本轮仅性能探索，设备精度未验证 |
 | `(FP32,0)`，general | 1 | — | 1 | 内网待采集 |
 | `(BF16,0)`，general | 2 | — | 2 | 内网待采集 |
 
@@ -86,29 +86,29 @@ blockDim 对照；不能只根据 case 的 shape 认定命中。
 合并约 4.48 μs，相对历史 main 4.87 μs 约改善 8.0%；同轮 main 的 kernel 统计待补。
 修复前的性能结果不能作为本版本的收益结论。
 
-### 当前实验：尾部 FP32 scratch 免写回
+### 当前实验：输入启动阶段融合
 
-分支 `codex/gdn-a5-tail-scratch-elision` 从 c36e18ce 创建，只让 SINGLE_WORK=1 的 VF 使用
-`writeUpdatedScratch=false`，省去第二遍更新后的 64 KiB UB 写回。第一遍 gated state、
-两遍循环、V_S、GM state/out 和缓冲配置保留；general 的多 token 递推仍写 updated scratch。
-该开关不改变 host/key、公开接口或测试输入，精度/性能/MSS JSON 均与父版本一致，case 188 不改动。
-本轮性能直接与 c36e18ce 的相同 perf case 0 交错比较，不将父版本的通过记录当作本实验结果。
+分支 `codex/gdn-a5-input-startup-fusion` 直接从 scratch `fec1e18b` 创建，
+不叠加上一轮 state Cast 融合。beta/g/Q/K/V 打包到现有 qInQueue 的一个 832 B record，
+共享一次 ready 交接并由一个准备 VF 完成扩展、exp(g) 和 q scale；state 保留独立队列，
+在等待小输入之前发射搬入，争取重叠。五个小输入仍分别从原 GM 地址搬运，不能合并为连续 GM 读取。
+主递推 VF、state Cast、V_S、输出、host/key、缓冲分配和全部测试输入保持 scratch 基线。
 
-无需 NPU 的本地回归入口如下；没有 C++ 编译器时会明确跳过 C++ 控制语义测试，
-其余源码对照不能代替 CANN 编译、模板选择、NPU 精度或同步检查：
+scratch 的历史 200 条精度通过记录不代表本轮通过。本轮按用户要求仅探索性能，设备精度未验证。
+当前本地源码检查 10 项通过，1 项因缺少 C++ 编译器跳过；本机无 CANN/NPU，尚未编译或测量收益。
+与 scratch 同条件交错比较 perf case 0 的 RGDR Task Duration，并另记端到端；不能直接承诺 5% 收益。
 
 ```bash
 python -B tests/atk/recurrent_gated_delta_rule/scripts/test_single_work_fastpath.py -v
 ```
 
-该脚本核对原缓冲/搬运/同步函数和公开接口与 main 基线一致，并将 VF 的 scratch guard 作源码展开：
-true 应与 c36e18ce 原 VF 一致，false 应仅删去第二遍尾部 Store；四个 gate dispatch 均由
-`!singleWork` 控制，ProcessSingleWork 与父版本一致。该检查不是 CANN 编译或设备数值验证。
-有 C++17 编译器时，
-还会执行生产代码中的选择谓词和单 work 控制函数，检查空工作、不合法 prefix/length、
-非零 state index 和 padded block stride 的地址及调用顺序。专用路径的新增 V_S 检查
-覆盖 Set/Wait 配对、标量读取前完成 Wait，以及空工作不发射事件；录制 API 顺序不等于验证硬件同步。
-内网构建、安装、产物校验和 A5 验证步骤见
+该脚本核对输入资产、接口、模板选择、general、主 VF 和原 helper，检查 packed 地址的字节/元素换算、
+32 B 对齐、容量和 DMA padding 边界，以及 EnQue→state 预取→DeQue→VF→Free 的顺序。
+同时检查 BF16 ZERO/ONE 与交错写回、q scale、首 lane 标量 mask、原 V_S 和 scratch guard。
+这些是源码契约检查，不执行 AscendC 或模拟设备数值。有 C++17 编译器时，附加的控制录制检查
+生产 ProcessSingleWork 的空工作、prefix/length、state index/stride 和调用顺序；新输入 helper 使用
+录制 stub，不能用该结果证明实际 DMA/VF 或硬件同步正确。
+内网单算子构建、安装、产物一致性校验和性能步骤见
 [开发记录](../../../fla/ops/ascendc/gdn/recurrent_gdn/recurrent_gated_delta_rule/docs/validation.md)。
 
 ## 执行方式

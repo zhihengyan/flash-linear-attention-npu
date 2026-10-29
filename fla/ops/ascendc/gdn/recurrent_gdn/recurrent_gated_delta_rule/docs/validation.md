@@ -1,11 +1,58 @@
-# A5 单 work 与尾部 scratch 实验开发记录
+# A5 输入启动阶段融合实验开发记录
 
-本轮直接基线 `c36e18ce`（`codex/gdn-a5-single-work-fastpath`），
+## 当前实验：合并小输入交接、准备 VF 与提前 state 搬入
+
+本轮从 scratch fec1e18b 创建 `codex/gdn-a5-input-startup-fusion`。用户要求优先理论收益最大的
+方向；在当前支持范围和分核约束内，选择覆盖整个输入启动阶段的候选，优先于仅移动 PrefetchState。
+候选比较、资源、生命周期、数学和同步已先写入 design.md；每轮唯一主要变量为输入启动策略。
+该策略的打包/ready/VF 是同一条替换路线，结果不能单独归因到某个组成部分。
+不继承 state Cast 融合、门控读取或 V_S 删除；不修改 JSON/YAML、generator、executor、CPU 标杆、
+值域、容差、公开 ABI 或 host/key；case 188 不处理。原主 VF、Compute、state Cast 和输出不改。
+
+用户明确本轮设备精度不必要，当前按性能探索交付，不把精度作为此次实验前置，也不宣称精度已验证。
+本机仅编码和静态检查，无 CANN/NPU/torch/C++ 编译器，不请求内网 SSH，不执行正式设备验收。
+流程沿 03→04→05；采用 CHUNK_DEPENDENT V1、来源 a14961e9dfe8c8264768d67fb447101873da4ecf
+的状态/ready-free 闭环审核方法，不移植 Cube、跨核 flag 或窗口数。
+
+| 模型 case | 轮次 / 状态 | 触发证据或预计关键路径 | 结构决策或候选与唯一主要变量 | 精度结果 | 性能前后值 | 瓶颈变化 | 依据或结论 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| A5 perf 0，BF16 state，g-only，B=T=Nk=Nv=1、K=V=128 | fec1e18b 基线 | 五个小输入组与 state 的分段准备 | 已保留 scratch 路径 | 历史用户报告 200 条精度全过 | 最近四轮 Task Duration 4.49/4.49/4.43/4.46 us，汇总 4.4675 us；端到端 18.3365 us | 无可靠分项时间 | 本轮直接对照 |
+| 同上 | 输入启动策略 / 待实测 | 多组队列交接及输入阶段串行准备；理论覆盖范围大于单独预取 | 小输入合包、一次准备 VF、state 在首次 DeQue 前发射，保留两个 ready 组 | 本轮按用户要求不做设备精度 | 待与 scratch 同条件交错对照 | 源码队列组 6→2、准备 API 合入 VF，实际 event/重叠待测 | 未承诺达到相对 main 5% |
+
+上一轮 state Cast 融合用户回传三轮 kernel 均值 4.36/4.43/4.39 us，汇总约 4.3933 us；
+相对 scratch 少约 0.0742 us（1.66%），端到端几乎不变。精度未提供且用户认为本轮不必要。
+该结果不是稳定端到端收益，本轮保持独立，不累加其数字。原符号文本仅能识别函数和模板，
+指令均为 `<not available>`，不能据此确认实际 UB 流量、寄存器压力或所有 VF 自动融合情况。
+
+静态计划：检查 packed 832 B 布局、每次 DMA 原地址/字节数、32 B 对齐和读 padding 边界；
+EnQue(packed)→PrefetchState→DeQue(packed)→准备 VF→Free，state 在原 LoadPrefetchedState 中等待；
+检查 g/beta 首 lane mask、BF16 ZERO/ONE、q scale 的位置、原 FP32 输出落点和原 V_S；
+核对 main/general/helper/host/key/输入资产与基线。源码契约和可选 C++ 控制录制只检查
+声明的布局/调用顺序，不模拟 AscendC、Exp 指令、硬件 ready 或真实重叠。
+
+本地结果（2026-10-29）：`python -B tests/atk/recurrent_gated_delta_rule/scripts/test_single_work_fastpath.py -v`
+共 11 项，10 通过，1 项因无 C++ 编译器跳过。新增检查覆盖 packed 对齐/容量/非重叠及 padding、
+GM 原偏移及字节数、ready/free 顺序、BF16 lane 和 scale、标量 mask；主 VF/Compute 与 fec1e18b
+逐函数对照。可选 C++ 录制的新输入 helper 为 stub，仅覆盖 ProcessSingleWork 地址和调用控制。
+另检查 Python AST、Markdown 本地链接、git diff --check；7 份 ATK 输入/标杆资产与 scratch 一致。
+内存内故障注入 10/10 被检查拒绝，覆盖 padding 重叠、GM 偏移/单位、ready、预取/Free 顺序、lane、scale、
+scalar mask 和 V_S 缺失。故障注入没有修改落盘生产文件。
+这些结果不能记为 CANN 编译或 NPU 精度/性能通过。
+
+内网沿用原单算子构建、安装、.o 一致性校验和 perf case 0；本轮不要求追加精度运行。
+按原预热、频率环境、每轮 20 样本和统计，与 fec1e18b 交错比较目标 RGDR Task Duration，并另记
+端到端。若可获得流水证据，核对 state MTE2 与小输入 VF 是否实际重叠、准备 VF 是否裁剪和 spill。
+“提前发射”只表明源码允许重叠，不能直接当作实测；若无稳定收益，恢复 scratch 并记录真实结果。
+最终相对 main 的目标需同轮 main 复测；不能将历史差值全部算成新策略收益。
+
+## 以下为已保留 scratch 及更早版本的历史记录
+
+scratch 当轮直接基线 `c36e18ce`（`codex/gdn-a5-single-work-fastpath`），
 实验分支 `codex/gdn-a5-tail-scratch-elision`；历史 main 为 `c9e2f1db`。
 用户授权仅编码和本地静态检查；A5/CANN 在内网，本地无 CANN、torch 或 C++ 编译器，不请求重新提供 SSH。
 本文件保留到内网验收完成，不能把源码检查记为 NPU 精度或性能通过。
 
-## 当前实验：仅省去单任务尾部 FP32 scratch 写回
+## 历史实验：仅省去单任务尾部 FP32 scratch 写回
 
 用户明确授权以当前正确版本新建分支进行方向 1 编码。本轮只通过 VF 内部编译期参数
 `writeUpdatedScratch` 控制第二遍 updated state 的 UB 写回；Compute 传 `!singleWork`。

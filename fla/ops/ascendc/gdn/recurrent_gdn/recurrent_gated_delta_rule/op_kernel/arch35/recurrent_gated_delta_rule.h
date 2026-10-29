@@ -31,9 +31,18 @@ constexpr uint64_t MAX_MTP = 8;
 constexpr uint64_t BF16_NUM_PER_BLOCK = 16;
 constexpr uint64_t FP32_NUM_PER_BLOCK = 8;
 constexpr uint16_t V_LENGTH = VECTOR_REG_WIDTH / sizeof(float);
+// Byte offsets inside the existing q input queue slot; each DMA starts at 32 B alignment.
+constexpr uint32_t SINGLE_WORK_Q_OFFSET = 0;
+constexpr uint32_t SINGLE_WORK_K_OFFSET = 256;
+constexpr uint32_t SINGLE_WORK_V_OFFSET = 512;
+constexpr uint32_t SINGLE_WORK_BETA_OFFSET = 768;
+constexpr uint32_t SINGLE_WORK_GAMA_OFFSET = 800;
+constexpr uint32_t SINGLE_WORK_PACKED_BYTES = 832;
 
 constexpr CastTrait castTraitB16ToB32 = {
     RegLayout::ZERO, SatMode::UNKNOWN, MaskMergeMode::ZEROING, RoundMode::UNKNOWN};
+constexpr CastTrait castTraitB16ToB32One = {
+    RegLayout::ONE, SatMode::UNKNOWN, MaskMergeMode::ZEROING, RoundMode::UNKNOWN};
 constexpr static CastTrait castTraitFp32ToB16ZeroRint = {
     RegLayout::ZERO, SatMode::NO_SAT, MaskMergeMode::MERGING, RoundMode::CAST_RINT};
 constexpr static CastTrait castTraitFp32ToB16OneRint = {
@@ -52,6 +61,46 @@ struct RGDRInitParams {
     GM_ADDR attnOut;
     GM_ADDR finalState;
 };
+
+__simd_vf__ inline void PrepareSingleWorkInputsVF(
+    __ubuf__ uint8_t *packedInput, __ubuf__ float *query, __ubuf__ float *key,
+    __ubuf__ float *value, __ubuf__ float *gama, __ubuf__ float *beta, float scale)
+{
+    __ubuf__ bfloat16_t *packedB16 = reinterpret_cast<__ubuf__ bfloat16_t *>(packedInput);
+    __ubuf__ float *packedFp32 = reinterpret_cast<__ubuf__ float *>(packedInput);
+    MaskReg fullFp32Mask = CreateMask<float, MaskPattern::ALL>();
+    uint32_t scalarCount = 1;
+    MaskReg scalarMask = UpdateMask<float>(scalarCount);
+    RegTensor<bfloat16_t> input;
+    RegTensor<float> tmp0;
+    RegTensor<float> tmp1;
+
+    DataCopy<bfloat16_t, LoadDist::DIST_BRC_B16>(
+        input, packedB16 + SINGLE_WORK_BETA_OFFSET / sizeof(bfloat16_t));
+    Cast<float, bfloat16_t, castTraitB16ToB32>(tmp0, input, scalarMask);
+    DataCopy<float, StoreDist::DIST_FIRST_ELEMENT_B32>(beta, tmp0, scalarMask);
+    DataCopy<float, LoadDist::DIST_BRC_B32>(tmp0, packedFp32 + SINGLE_WORK_GAMA_OFFSET / sizeof(float));
+    Exp<float>(tmp0, tmp0, scalarMask);
+    DataCopy<float, StoreDist::DIST_FIRST_ELEMENT_B32>(gama, tmp0, scalarMask);
+
+    // Keep q in registers until its scale is applied, preserving the Cast -> Muls order.
+    RegTensor<float> query0;
+    RegTensor<float> query1;
+    DataCopy(input, packedB16 + SINGLE_WORK_Q_OFFSET / sizeof(bfloat16_t));
+    Cast<float, bfloat16_t, castTraitB16ToB32>(query0, input, fullFp32Mask);
+    Cast<float, bfloat16_t, castTraitB16ToB32One>(query1, input, fullFp32Mask);
+    DataCopy(input, packedB16 + SINGLE_WORK_K_OFFSET / sizeof(bfloat16_t));
+    Cast<float, bfloat16_t, castTraitB16ToB32>(tmp0, input, fullFp32Mask);
+    Cast<float, bfloat16_t, castTraitB16ToB32One>(tmp1, input, fullFp32Mask);
+    DataCopy<float, StoreDist::DIST_INTLV_B32>(key, tmp0, tmp1, fullFp32Mask);
+    DataCopy(input, packedB16 + SINGLE_WORK_V_OFFSET / sizeof(bfloat16_t));
+    Cast<float, bfloat16_t, castTraitB16ToB32>(tmp0, input, fullFp32Mask);
+    Cast<float, bfloat16_t, castTraitB16ToB32One>(tmp1, input, fullFp32Mask);
+    DataCopy<float, StoreDist::DIST_INTLV_B32>(value, tmp0, tmp1, fullFp32Mask);
+    Muls(query0, query0, scale, fullFp32Mask);
+    Muls(query1, query1, scale, fullFp32Mask);
+    DataCopy<float, StoreDist::DIST_INTLV_B32>(query, query0, query1, fullFp32Mask);
+}
 
 template <typename stateType, typename outType, bool hasGama, bool hasGamaK, bool writeUpdatedScratch = true>
 __simd_vf__ inline void ComputeRecurrentGatedDeltaRuleVF(
@@ -383,9 +432,7 @@ private:
         // come from this same device index. Keep the original block stride.
         const uint64_t stateIndex = ssmStateIndicesGm_.GetValue(0);
         const uint64_t stateOffset = stateStride0_ * stateIndex;
-        CopyInGamaBeta(0, 1);
-        CopyInQKV(0, 0, 1);
-        PrefetchState(stateOffset, 128);
+        CopyInSingleWorkInputs(stateOffset);
         LoadPrefetchedState(128);
         // Complete the preceding Vector producers before reading their UB scalars.
         TEventID vToS = GetTPipePtr()->FetchEventID(HardEvent::V_S);
@@ -397,6 +444,38 @@ private:
         // Same order as the one-token general path, including its pending flush.
         CopyOutAttn(0, 128);
         CopyOutState(stateOffset, 128);
+    }
+
+    __aicore__ inline void CopyInSingleWorkInputs(uint64_t stateOffset)
+    {
+        static_assert(std::is_same<inType, bfloat16_t>::value, "packed inputs require BF16 Q/K/V/beta");
+        static_assert(SINGLE_WORK_PACKED_BYTES <= MAX_MTP * 128 * sizeof(inType),
+                      "packed inputs must fit the original q queue slot");
+        LocalTensor<uint8_t> inputLocal = qInQueue_.AllocTensor<uint8_t>();
+        LocalTensor<inType> packedB16 = inputLocal.ReinterpretCast<inType>();
+        LocalTensor<float> packedFp32 = inputLocal.ReinterpretCast<float>();
+        DataCopyExtParams vectorParams{1, 128 * sizeof(inType), 0, 0, 0};
+        DataCopyExtParams betaParams{1, sizeof(inType), 0, 0, 0};
+        DataCopyExtParams gamaParams{1, sizeof(float), 0, 0, 0};
+        DataCopyPadExtParams<inType> b16Pad{false, 0, 0, 0};
+        DataCopyPadExtParams<float> fp32Pad{false, 0, 0, 0};
+        DataCopyPad(packedB16[SINGLE_WORK_BETA_OFFSET / sizeof(inType)], betaGm_[0], betaParams, b16Pad);
+        DataCopyPad(packedFp32[SINGLE_WORK_GAMA_OFFSET / sizeof(float)], gamaGm_[0], gamaParams, fp32Pad);
+        DataCopyPad(packedB16[SINGLE_WORK_Q_OFFSET / sizeof(inType)], queryGm_[0], vectorParams, b16Pad);
+        DataCopyPad(packedB16[SINGLE_WORK_K_OFFSET / sizeof(inType)], keyGm_[0], vectorParams, b16Pad);
+        DataCopyPad(packedB16[SINGLE_WORK_V_OFFSET / sizeof(inType)], valueGm_[0], vectorParams, b16Pad);
+        qInQueue_.EnQue<uint8_t>(inputLocal);
+        // Publish small-input readiness separately; state DMA can run during their VF.
+        PrefetchState(stateOffset, 128);
+        inputLocal = qInQueue_.DeQue<uint8_t>();
+        PrepareSingleWorkInputsVF(
+            reinterpret_cast<__ubuf__ uint8_t *>(inputLocal.GetPhyAddr()),
+            reinterpret_cast<__ubuf__ float *>(qInUb.GetPhyAddr()),
+            reinterpret_cast<__ubuf__ float *>(kInUb.GetPhyAddr()),
+            reinterpret_cast<__ubuf__ float *>(vInUb.GetPhyAddr()),
+            reinterpret_cast<__ubuf__ float *>(gamaInUb.GetPhyAddr()),
+            reinterpret_cast<__ubuf__ float *>(betaInUb.GetPhyAddr()), scale_);
+        qInQueue_.FreeTensor(inputLocal);
     }
 
     __aicore__ inline void CopyInQKV(uint64_t vOffset, uint64_t qkOffset, int32_t seqLen)

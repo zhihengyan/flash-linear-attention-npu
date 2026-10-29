@@ -13,6 +13,7 @@ ROOT = Path(__file__).resolve().parents[4]
 OP = ROOT / "fla/ops/ascendc/gdn/recurrent_gdn/recurrent_gated_delta_rule"
 BASE = "c9e2f1db"
 SCRATCH_BASE = "c36e18ce"
+STARTUP_BASE = "fec1e18b"
 KERNEL = OP / "op_kernel/arch35/recurrent_gated_delta_rule.h"
 
 
@@ -108,6 +109,10 @@ struct Harness {
     void CopyInGamaBeta(int a, int b) { assert(a == 0 && b == 1); calls.push_back(1); }
     void CopyInQKV(int a, int b, int c) { assert(a == 0 && b == 0 && c == 1); calls.push_back(2); }
     void PrefetchState(uint64_t offset, int v) { assert(v == 128); inputOffset = offset; calls.push_back(3); }
+    // Stub only: packed DMA/VF lifetimes are covered by source contracts below.
+    void CopyInSingleWorkInputs(uint64_t offset) {
+        CopyInGamaBeta(0, 1); CopyInQKV(0, 0, 1); PrefetchState(offset, 128);
+    }
     void LoadPrefetchedState(int v) { assert(v == 128); calls.push_back(4); }
     void Compute(int v, int q, int k) { assert(v == 128 && q == 0 && k == 0); calls.push_back(5); }
     void CopyOutAttn(int off, int v) { assert(off == 0 && v == 128); calls.push_back(6); }
@@ -224,7 +229,10 @@ class SingleWorkContractTest(unittest.TestCase):
         self.assertCountEqual(choices, [("true", "true"), ("true", "false"),
                                        ("false", "true"), ("false", "false")])
         self.assertEqual(compute.replace(", !singleWork>", ">"), body(parent, "Compute"))
-        self.assertEqual(body(current, "ProcessSingleWork"), body(parent, "ProcessSingleWork"))
+        restored = body(current, "ProcessSingleWork").replace(
+            "CopyInSingleWorkInputs(stateOffset);",
+            "CopyInGamaBeta(0, 1); CopyInQKV(0, 0, 1); PrefetchState(stateOffset, 128);")
+        self.assertEqual(normalize_cpp(restored), normalize_cpp(body(parent, "ProcessSingleWork")))
         for relative in ("op_host/recurrent_gated_delta_rule_single_work.h",
                          "op_host/recurrent_gated_delta_rule_tiling.cpp",
                          "op_kernel/recurrent_gated_delta_rule_struct.h",
@@ -232,6 +240,79 @@ class SingleWorkContractTest(unittest.TestCase):
             path = OP / relative
             with self.subTest(path=relative):
                 self.assertEqual(path.read_text(encoding="utf-8"), baseline(path, SCRATCH_BASE))
+
+    def test_packed_inputs_fit_and_preserve_original_gm_ranges(self):
+        source = KERNEL.read_text(encoding="utf-8")
+        offsets = {name: int(value) for name, value in re.findall(
+            r"constexpr uint32_t SINGLE_WORK_(\w+) = (\d+);", source)}
+        self.assertEqual(offsets["PACKED_BYTES"], 832)
+        # Include possible 32-byte DMA padding; scalars may not overlap neighbours.
+        regions = [(offsets[name + "_OFFSET"], size) for name, size in
+                   (("Q", 256), ("K", 256), ("V", 256), ("BETA", 32), ("GAMA", 32))]
+        for start, size in regions:
+            self.assertEqual(start % 32, 0)
+            self.assertLessEqual(start + size, offsets["PACKED_BYTES"])
+        for left, right in zip(sorted(regions), sorted(regions)[1:]):
+            self.assertLessEqual(sum(left), right[0])
+        self.assertLessEqual(offsets["PACKED_BYTES"], 8 * 128 * 2)
+        helper = normalize_cpp(body(source, "CopyInSingleWorkInputs"))
+        self.assertIn("SINGLE_WORK_PACKED_BYTES<=MAX_MTP*128*sizeof(inType)", helper)
+        self.assertIn("std::is_same<inType,bfloat16_t>::value", helper)
+        self.assertIn("DataCopyExtParamsvectorParams{1,128*sizeof(inType),0,0,0}", helper)
+        self.assertIn("DataCopyExtParamsbetaParams{1,sizeof(inType),0,0,0}", helper)
+        self.assertIn("DataCopyExtParamsgamaParams{1,sizeof(float),0,0,0}", helper)
+        copies = re.findall(r"DataCopyPad\((\w+)\[(.*?)\],(\w+)\[(.*?)\],(\w+),\w+\)", helper)
+        expected = [("packedB16", "SINGLE_WORK_" + name + "_OFFSET/sizeof(inType)", gm, "0", "vectorParams")
+                    for name, gm in (("Q", "queryGm_"), ("K", "keyGm_"), ("V", "valueGm_"))]
+        expected += [("packedB16", "SINGLE_WORK_BETA_OFFSET/sizeof(inType)", "betaGm_", "0", "betaParams"),
+                     ("packedFp32", "SINGLE_WORK_GAMA_OFFSET/sizeof(float)", "gamaGm_", "0", "gamaParams")]
+        self.assertCountEqual(copies, expected)
+        self.assertIn("packedB16=inputLocal.ReinterpretCast<inType>()", helper)
+        self.assertIn("packedFp32=inputLocal.ReinterpretCast<float>()", helper)
+
+    def test_startup_ready_free_order_and_recurrence_unchanged(self):
+        source, old = KERNEL.read_text(encoding="utf-8"), baseline(KERNEL, STARTUP_BASE)
+        for name in ("ComputeRecurrentGatedDeltaRuleVF", "Compute"):
+            self.assertEqual(body(source, name), body(old, name))
+        helper = body(source, "CopyInSingleWorkInputs")
+        steps = ("qInQueue_.AllocTensor<uint8_t>()", "DataCopyPad(",
+                 "qInQueue_.EnQue<uint8_t>(inputLocal)", "PrefetchState(stateOffset, 128)",
+                 "qInQueue_.DeQue<uint8_t>()", "PrepareSingleWorkInputsVF(", "qInQueue_.FreeTensor(inputLocal)")
+        positions = [helper.index(step) for step in steps]
+        self.assertEqual(positions, sorted(positions))
+        self.assertLess(helper.rindex("DataCopyPad("), helper.index("qInQueue_.EnQue"))
+        for operation in ("AllocTensor", "EnQue", "DeQue", "FreeTensor", "PrepareSingleWorkInputsVF", "PrefetchState"):
+            self.assertEqual(helper.count(operation), 1)
+        self.assertNotRegex(helper, r"\b(LoadPrefetchedState|SetFlag|WaitFlag|PipeBarrier)\b")
+        process = body(source, "ProcessSingleWork")
+        self.assertLess(process.index("CopyInSingleWorkInputs(stateOffset)"), process.index("LoadPrefetchedState(128)"))
+
+    def test_preparation_lane_layout_scaling_and_scalar_mask(self):
+        source = KERNEL.read_text(encoding="utf-8")
+        vf = normalize_cpp(body(source, "PrepareSingleWorkInputsVF"))
+        self.assertIn("uint32_tscalarCount=1;MaskRegscalarMask=UpdateMask<float>(scalarCount)", vf)
+        self.assertIn("LoadDist::DIST_BRC_B16>(input,packedB16+SINGLE_WORK_BETA_OFFSET/sizeof(bfloat16_t))", vf)
+        self.assertIn("LoadDist::DIST_BRC_B32>(tmp0,packedFp32+SINGLE_WORK_GAMA_OFFSET/sizeof(float))", vf)
+        self.assertIn("Exp<float>(tmp0,tmp0,scalarMask)", vf)
+        for tensor in ("beta", "gama"):
+            self.assertIn("StoreDist::DIST_FIRST_ELEMENT_B32>(" + tensor + ",tmp0,scalarMask)", vf)
+        self.assertIn("castTraitB16ToB32One={RegLayout::ONE,SatMode::UNKNOWN,MaskMergeMode::ZEROING,RoundMode::UNKNOWN}",
+                      normalize_cpp(source))
+        for offset, first, second, dest in (("Q", "query0", "query1", "query"),
+                                             ("K", "tmp0", "tmp1", "key"), ("V", "tmp0", "tmp1", "value")):
+            load = "DataCopy(input,packedB16+SINGLE_WORK_" + offset + "_OFFSET/sizeof(bfloat16_t))"
+            start = vf.index(load)
+            zero = "Cast<float,bfloat16_t,castTraitB16ToB32>(" + first + ",input,fullFp32Mask)"
+            one = "Cast<float,bfloat16_t,castTraitB16ToB32One>(" + second + ",input,fullFp32Mask)"
+            store = "DataCopy<float,StoreDist::DIST_INTLV_B32>(" + dest + "," + first + "," + second + ",fullFp32Mask)"
+            self.assertLess(start, vf.index(zero, start))
+            self.assertLess(vf.index(zero, start), vf.index(one, start))
+            self.assertLess(vf.index(one, start), vf.index(store, start))
+        for reg in ("query0", "query1"):
+            multiply = "Muls(" + reg + "," + reg + ",scale,fullFp32Mask)"
+            self.assertLess(vf.index("Cast<float,bfloat16_t,castTraitB16ToB32One>(query1"), vf.index(multiply))
+            self.assertLess(vf.index(multiply), vf.index("StoreDist::DIST_INTLV_B32>(query,"))
+        self.assertNotRegex(vf, r"\b(Fma|FusedMulAdd|LocalMemBar|SetFlag|WaitFlag)\b")
 
     def test_tiling_layout_and_public_interfaces_unchanged(self):
         path = OP / "op_kernel/recurrent_gated_delta_rule_struct.h"

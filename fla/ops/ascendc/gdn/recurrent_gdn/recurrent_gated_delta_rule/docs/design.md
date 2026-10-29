@@ -1,121 +1,137 @@
-# RecurrentGatedDeltaRule：A5 单 work 与尾部 scratch 实验
+# RecurrentGatedDeltaRule：A5 输入启动阶段融合实验
 
-方案设计规则版本：`V2`。本轮基线为已保留的 `c36e18ce`（`codex/gdn-a5-single-work-fastpath`），
-实验分支为 `codex/gdn-a5-tail-scratch-elision`。历史 main 基线为 `c9e2f1db`。
-接口见 [api.md](api.md)，开发记录和待验证项见 [validation.md](validation.md)。
+方案设计规则版本：`V2`。基线为 `fec1e18b`（scratch），实验分支为
+`codex/gdn-a5-input-startup-fusion`。接口见 [api.md](api.md)，证据及验证见 [validation.md](validation.md)。
 
 ## 1. 目标
 
-仅优化用户固定的 A5 decode case：B=T=Nk=Nv=1、K=V=128、BF16 state、g-only。
-用户交错复测的历史 main 主 kernel 均值为 4.87 μs；已保留的 c36e18ce 两轮均值为
-4.51/4.45 μs，等样本合并约 4.48 μs。该版本包含已使 case 0 恢复精度的显式 V_S。
-本轮只省去单任务 VF 第二遍的尾部 FP32 scratch 写回，不融合行循环，不改变标量读取、
-同步位置、UB 配置、输出深度或 timer。实验 A 同时改变行融合和 scratch，不能分离该子项收益。
+用户固定模型 case：A5、B=T=Nk=Nv=1、K=V=128、BF16 state、g-only、无 accepted-token。
+原 perf case 0、输入分布、seed、dtype 和统计方法保持。目标 kernel 是实际命中的
+RecurrentGatedDeltaRule BF16 single-work 实例；按 op_summary 的 Task Duration(us) 判断 kernel 收益，
+其它 task 不合入。端到端另列；原预热和每轮 20 样本沿用，实际次数、版本、频率状态由内网日志归档。
 
-已保留路径完成了单 work 控制精简。本轮假设是：单 token 的最终 FP32 scratch 不再被消费，
-省去其 Store 流量与发射成本可能缩短关键路径。
-性能口径固定为原 ATK `op_summary` 中 `OP Type=RecurrentGatedDeltaRule` 的 `Task Duration(us)`，
-其它 Neg/有限性检查 task 不混入算子时间。沿用原输入、预热、每轮 20 样本及统计方式，
-以 c36e18ce/本轮分支交错复测，main 只作为历史参考。
-目标是在跨轮波动下仍能降低 RGDR 均值/中位数，且精度、其它路径不退化；未实测前不宣称收益。
-当前没有 UB Store 的实际吞吐、重叠和关键路径数据，不能按 64 KiB 推导固定的 μs 收益。
+scratch 最近四轮主 kernel 均值为 4.49/4.49/4.43/4.46 us，等权汇总 4.4675 us；端到端为
+18.3365 us。state Cast 融合三轮均值 4.36/4.43/4.39 us，约 4.3933 us，端到端未见稳定改善。
+本轮从 scratch 独立创建，不叠加该 Cast 融合、系数读取或 V_S 删除代码。
+用户明确本轮是性能探索，设备精度不作为当前性能实验的前置；原精度规则仍保留，未经测试不宣称通过。
 
-可达性：算法、两遍 VF、GM state 字节数和资源占用不变，理论上每个目标 work 少写
-128×128×4=65536 B 的 UB 数据。收益取决于 Store 是否位于关键路径，不假设 HBM 带宽瓶颈。
-这是一轮小范围可归因实验；若 Task Duration 没有稳定下降，则不继续堆叠该方案。
+### 候选优先级和收益上限
 
-## 2. Stage 0：Vector，保持原递推，特化单 work 控制
+| 候选 | 可作用的成本及代价 | 本轮选择 |
+| --- | --- | --- |
+| 小输入合包、一次准备 VF、state 提前搬入 | 合并 beta/g/Q/K/V 的 ready/free 组，并争取使 state DMA 与小张量 VF 重叠；覆盖整个输入启动路径，代价为显式打包地址及寄存器存活 | 第一优先级，实现一个整体输入启动策略 |
+| 仅前移 PrefetchState | 只争取重叠，仍保留五个小输入队列和原准备调用 | 作用范围小于选定策略 |
+| 全部输入合为一个 ready 组 | 少一个组，但小张量 VF 也要等完整 state DMA，失去独立重叠窗口 | 保留为参数化后备，暂不实现 |
+| 继续 Cast 融合或单独 V_S 调整 | 已回传无稳定端到端收益，不能直接累加理论字节数 | 本轮不叠加 |
+| 同一 head 增加核数 | 需改变当前按 HV 的映射及地址/分核设计，当前 Nwork=1 | 不在现有映射下直接采用 |
 
-### 任务、模板与合法性
+这里的“第一优先级”指当前支持范围内、已有结果尚未否定且覆盖最多输入启动成本的可落地候选，
+不是已测得全局最大收益。一个主变量是 SINGLE_WORK 的输入启动路线替换；该路线包含配套的
+打包、ready 边界和准备 VF，净收益不能单独归因到其中一个组成部分。
 
-主 Stage 仍由一个 AIV 执行整个 value head，不引入 Cube、跨核归约或跨核 flag。
-模板参数增加 `SINGLE_WORK`，列出 BF16/general、FP32/general、BF16/single 三个合法组合。
-host 仅在 A5、BF16、B=T=Nk=Nv=1、K=V=vStep=128、blockDim=1、stateStride2=128、hasG=1、hasGK=0、
-hasAccepted=0 时设置 SINGLE_WORK；其余选择 general。tiling struct 不增加字段。
-A2/A3 仍使用原类和 general 参数，快速拉起的 TORCH_MODE struct 布局也保持。
+令 Msmall/Mstate 为小输入/state DMA 时间，Psmall 为融合后的小张量准备时间，H 为队列及发射成本。
+新路线预计启动关键路径近似为 Msmall + max(Mstate,Psmall) + 原 state Cast + H_two_groups。
+相对完全串行路线，重叠上限为 min(Mstate,Psmall)，另可能减少四组队列交接和准备 VF 启动。
+基线已经存在的重叠、编译器自动融合和 SDK 内部同步会削弱这些收益，源码请求数不等于实际指令数。
+没有可靠的分项时间下界，不能承诺收益超过波动；用户已授权以单独实验验证这一优先候选。
+历史 main 端到端约 18.83 us，累计 5% 约需到 17.8885 us，即相对 scratch 再省约 0.448 us；
+该历史换算不证明本轮可达成，也不替代同轮 main 对照。
 
-special 实例将相关 shape/gate 成员初始化为这些已证明的常量，使原有小函数可以常量传播；
-general 实例的成员初始化、调度和原 VF 不变。
+## 2. Stage 完整详设
 
-VF 新增内部编译期参数 `writeUpdatedScratch=true`；Compute 将 `!singleWork` 传给它。
-因此仅已有 SINGLE_WORK=1 实例使用 false，其余 BF16/FP32、单/多 token 通用实例均使用 true。
-它不进入公开 kernel 模板、host TilingKey 或 tiling struct，不扩大原专用路径范围。
+### 符号、工作域和 Stage 结果
 
-### 设备侧控制与地址
+沿用原 HV 分核及 host 选择谓词：A5、BF16、B=T=Nk=Nv=1、K=V=vStep=128、blockDim=1、
+stateStride2=128、g-only、无 accepted-token。Nbase=1、HV=1、CG=1、Nwork=1、blockDim=1，
+单 AIV 执行一个有效工作和一个 wave，无 head 尾块或跨核归约。其它模板、平台及调度保持 general。
+P 为原 qInQueue slot 0 基址，I 为原 stateInQueue slot 0 基址，T 为原 tmpBuff 基址。
+基址由未改的 InitLocalBuffers/TPipe 分配；以下半开区间均以字节为单位。所有队列相互独立。
 
-1. 读取 `cuSeqlens[0]` 与 `cuSeqlens[1]`。在 T=1 下，仅 prefix=0、length=1 能产生有效工作；
-   合法空工作 prefix=1、length=0 直接返回，不能根据 T=B 就绕过这一步。
-2. 读取一次 `ssmStateIndices[0]`，复用作初始 state 与最终 state 的 block index。
-   地址为 `stateStride0 * index`，head=0、V片起点=0；不假定 block index 为零或 block stride 连续。
-3. 原 `CopyInGamaBeta(0,1)` → `CopyInQKV(0,0,1)` → `PrefetchState(stateOffset,128)` →
-   `LoadPrefetchedState(128)` → 一对显式 `V_S` Set/Wait；等待前置 Vector 操作完成后，
-   读取原 UB 中的 g/beta，调用原 `Compute(128,0,0)`。
-4. 原 `CopyOutAttn(0,128)` → `CopyOutState(stateOffset,128)`。单 token、单分片下，原 host 可选的
-   `(state,attn)` 深度 `(1,1)/(1,2)/(2,2)` 均按此顺序写回；特化只移除 pending 状态变量和循环控制，
-   不改变队列深度。
+| Stage | 执行单元 | 功能 | 主要空间 |
+| --- | --- | --- | --- |
+| 0 | Vector，一个显式准备 VF | beta 扩展、exp(g)、Q/K/V 扩展和 q scale；可与已发射 state MTE2 并行 | P、T 中原 q/k/v/beta/g 区域 |
+| 1 | Vector，原 state Cast API | BF16 state 转为 FP32 scratch | I、T 中原 state 区域 |
+| 2 | Vector，原两遍递推 VF | gate、dot、delta、更新、输出转换 | 原 FP32 scratch、attention tmp、输出队列 |
 
-相较 main，移除 ComputeAvgload、IsCurrentBlock、batch/head/V/token 四层单次循环及通用偏移计算。
-GM 元数据 GetValue 从 5 次降为 3 次：长度不再为平均负载重复读取，state index 不再为输出重复读取。
-这只是逻辑请求数，不等价于实际减少同样次数的 HBM 访问。
+保留 Stage 0/1 分离以保留 state DMA 与小输入计算重叠窗口；Stage 1/2 分离沿用 scratch 基线，
+不混入已试过的 Cast 融合。Stage 2 内两遍循环、两处 LocalMemBar、尾部 scratch 免写回和全部数学不变。
 
-### 数值、数据和资源
+### 输入地址、搬运和 Stage 0
 
-保持原两遍 VF、归约树、gate Exp、q scale、Cast 舍入和全部 GM 输出。
-数学仍为 FP32 gate/state-dot → delta → rank-one 更新 → state-query projection → BF16 state/out。
-R21：未做代数重排、FMA 替换或输入值域变化，不引入新的数值风险。
+qInQueue 原容量为 MAX_MTP*128*sizeof(BF16)=2048 B，本轮复用它容纳一个 832 B 小输入 record：
 
-FP32 state scratch 的生命周期如下，地址仍为 tmpBuff 相对区间 `[12800,78336)`：
+| UB 半开区间 | 内容 / dtype / 大小 | 生产与消费 |
+| --- | --- | --- |
+| [P+0,P+256) | q，128 BF16，256 B | Q DMA -> 准备 VF load |
+| [P+256,P+512) | k，128 BF16，256 B | K DMA -> 准备 VF load |
+| [P+512,P+768) | v，128 BF16，256 B | V DMA -> 准备 VF load |
+| [P+768,P+800) | beta，首 2 B 有效，其余 padding | beta DMA -> VF BRC_B16，仅读 2 B |
+| [P+800,P+832) | g，首 4 B 有效，其余 padding | g DMA -> VF BRC_B32，仅读 4 B |
+| [P+832,P+2048) | 未使用，不含有效数据 | 本 work 不读写 |
+| [I,I+32768) | 原 BF16 state 128x128 | 原 PrefetchState DMA -> Stage 1 Cast |
 
-| 操作 | c36e18ce | 本轮 SINGLE_WORK=1 | 最后消费者 |
-| --- | ---: | ---: | --- |
-| 输入 BF16 state Cast 后写 FP32 | 64 KiB | 64 KiB | VF 第一遍加载 |
-| VF 第一遍写 gated state | 64 KiB | 64 KiB | VF 第二遍加载，必须保留 |
-| VF 第二遍写 updated state | 64 KiB | 0 | 单 token 后无消费者，删去此项 |
-| BF16 state GM 输出 | 32 KiB | 32 KiB | 调用方，原输出不变 |
+所有小输入起点 32 B 对齐，q/k/v 各读 256 B，标量不读取 padding。五个 DMA 仍分别读取各自的
+原 GM tensor，输入地址都为原偏移 0，不能将独立 GM tensor 当作连续空间。packed beta/g 的
+typed LocalTensor 偏移分别按 BF16/FP32 元素数换算，不按字节误作元素数。
 
-第二遍的 attention 投影和 stateOut 转换直接消费更新后的 FP32 寄存器，不回读 updated scratch。
-目标路径只有一个 token、一个 V 分片，之后只写出 GM 并退出；scratch 保持 gated state 不影响输出。
-general 路径的下一个 token 会读取 updated scratch，所以 `writeUpdatedScratch=true` 必须保持原行为。
-两个 LocalMemBar 仍保留，分别保护第一遍 scratch 与 attention 临时结果的后续读取。
+先分配 P 并发射 beta、g、q、k、v 五个 MTE2 Copy，再 EnQue(P) 发布小输入 ready；
+然后调用原 PrefetchState(stateStride0*index,128)，发射 I 的 DMA/EnQue。
+最后 DeQue(P) 并发射 Stage 0 准备 VF，返回后 Free(P)。I 的搬入必须早于 DeQue(P)，
+且 I 不属于 P 的 ready 事件，否则无法形成预期重叠。MTE2 内的五次搬运仍串行，不能宣称五路 DMA 并发。
 
-L1/L0/算法 GM workspace 均为 0；保留原 16 MiB 系统 workspace。UB 使用原 InitLocalBuffers：
+Stage 0 一次 VF 内完成 beta 的 BF16->FP32、g 的 FP32 Exp，以及 q/k/v 的 BF16->FP32。
+Q/K/V 每次 load 128 个 BF16，以 Cast ZERO/ONE 扩展为偶/奇 K 的 64-lane FP32；k/v 交错 Store
+到原 FP32 区域。q 保留寄存器，完成原 q*scale 两个 Muls 后交错 Store，避免额外 q UB 往返。
+beta 和 g 使用首 lane mask、FIRST_ELEMENT_B32，仅写原输出区域的一个 FP32 值。
+输入 Cast、Exp 和 q scale 的每个结果内部运算顺序不变；只重排独立数据的准备与保存。
+不新增 FMA、Exp 算法选项或控制寄存器模式。有限 BF16 到 FP32 数学上精确扩展；q*scale 的
+溢出范围和 g Exp 的下溢/溢出风险沿用原接口。原 CANN 9.1 符号已显示 g 使用 Reg Exp ZEROING，
+本轮使用相同 Reg Exp 入口，但设备精度、subnormal 和最终生成指令没有在本机验证。
 
-| 对象 | 目标 case 的逻辑字节数 | 生命周期 |
-| --- | ---: | --- |
-| q/k/v 输入队列 | 各 2048 | MTE2 → Cast → Free |
-| state 输入队列 | 32768 | MTE2 → Cast → Free |
-| g / beta 输入队列 | 32 / 16 | MTE2 → Exp/Cast → Free |
-| state 输出队列，两 slot | 65536 | VF → MTE3 → Free |
-| attention 输出队列，两 slot | 512 | VF → MTE3 → Free |
-| tmpBuff 中实际命名 scratch | 78464 | 下述原地址保持 |
+### Stage 1/2 的数据和资源
 
-以上未加入 TPipe 对齐/管理开销，可用 UB 继续由原 platform 查询和 tiling 预算决定。
-tmpBuff 相对字节区间保持：attn `[0,512)`、v `[512,4608)`、q `[4608,8704)`、k `[8704,12800)`、
-FP32 state `[12800,78336)`、beta `[78336,78400)`、g `[78400,78464)`。
-所有 TQue 物理 slot 地址由原 TPipe 分配，不新增别名、存储份数或缓冲回绕。
+| UB 半开区间 | dtype / 逻辑大小 | 本轮生命周期 |
+| --- | --- | --- |
+| [T+0,T+512) | attention tmp，FP32，512 B | Stage 2 两遍 dot/output scratch |
+| [T+512,T+4608) | v FP32 预留 4096 B，目标有效 512 B | Stage 0 Store -> Stage 2 load |
+| [T+4608,T+8704) | q FP32 预留 4096 B，目标有效 512 B | Stage 0 scaled Store -> Stage 2 load |
+| [T+8704,T+12800) | k FP32 预留 4096 B，目标有效 512 B | Stage 0 Store -> Stage 2 load |
+| [T+12800,T+78336) | state FP32，65536 B | Stage 1 Cast -> Stage 2 第一遍读写 -> 第二遍读取 |
+| [T+78336,T+78400) | beta FP32，64 B，首 4 B 有效 | Stage 0 Store -> 原 V_S/Scalar GetValue |
+| [T+78400,T+78464) | exp(g) FP32，64 B，首 4 B 有效 | Stage 0 Store -> 原 V_S/Scalar GetValue |
 
-每次有效工作逻辑读取 BF16 state 32 KiB、写回 32 KiB，Q/K/V 共 768 B、g/beta 共 6 B，均不变。
-新路径复用的 index 位于 scalar 局部变量，不占 UB，不改变任何输入/输出地址所有权。
+未使用的 q/k/v/g/beta 原输入队列仍照原 InitBuffer 预留，不改变容量、地址、UB profile 或事件池配置。
+stateOut/attnOut 的原独立队列、原 1/2 slot 深度和每槽 32768/256 B 保持，VF 写入后由原 MTE3 消费。
+Stage 1 原 LoadPrefetchedState DeQue(I)、Cast、Free(I) 完全不改；Stage 2 主 VF、Compute、输出 helper 不改。
+L1/L0/算法 GM workspace 为 0，原 16 MiB 系统 workspace 保留。新增 UB 为 0，P 的有效 record
+832 B 小于原 2048 B；总预留峰值和最大连续空间需求均不增加。新 VF 寄存器峰值/spill 待 CANN 确认。
 
-### 同步与退出
+GM 逻辑读量仍为 state 32768 B、QKV 768 B、beta/g 6 B、原三个 INT32 metadata；输出仍为
+state 32768 B、out 256 B。不减少 GM 数据量，本轮减少的是交接、准备启动和可能的关键路径等待。
 
-保留各 Copy/Compute 函数中的原 Alloc/EnQue/DeQue/Free、PIPE_V 和 VF LocalMemBar。
-输入 ready 和输出 ready 继续由原队列事件保证。专用路径在读取 `gamaInUb/betaInUb` 之前，
-通过 TPipe 动态取得一个 `HardEvent::V_S` event ID，先 SetFlag 再 WaitFlag，形成一次完成依赖。
-生产方是此前发射的 gate Exp、beta Cast、Q/K/V Cast/scale 和 state Cast，消费方是标量读取及
-后续 Compute；每次有效调用只执行一对 Set/Wait，不持有未消费的通知，不引入跨核同步或 PIPE_ALL。
-输出仍以原 CopyOut 函数释放，TPipe 的退出生命周期不变。空工作在读取/写入 state、分配输出前返回。
-空工作也在取得该 event ID 之前返回，因此不会出现缺少 Set 的 Wait。
+### 同步和退出
 
-2026-10-29 用户回传：无显式同步时 case 0 的 out/stateRef 全部非有限；强制 general 后通过；
-恢复专用路径并增加上述 V_S 后通过。这支持前置 Vector 完成时序相关问题；由于该事件覆盖所有
-前置 Vector 操作，尚不能单独归因于 gate/beta 中的某一个读取，也未证明编译器漏插同步的具体原因。
-修复前的性能数据不能作为本版本的验收结果，必须在精度回归后重新测量。
+| 资源 / slot | ready/free 闭环 | 单个有效 work |
+| --- | --- | --- |
+| P，原 qInQueue slot 0 | Alloc -> 五次 Copy -> EnQue -> DeQue -> 准备 VF -> Free | 各一次 |
+| I，原 stateInQueue slot 0 | 原 Prefetch Alloc/Copy/EnQue -> 原 Load DeQue/Cast/Free | 各一次 |
+| 原显式 V_S | state Cast 后 Fetch -> Set -> Wait -> Scalar g/beta | 一对，不删除 |
+| 主 VF gated scratch、attention tmp | 原 Store -> 两处各自 LocalMemBar -> 原后续 Load | 完全保留 |
+| 输出队列 | 原 Compute EnQue -> CopyOut DeQue/MTE3/Free | 完全保留 |
 
-### 设计复核
+统一伪代码：检查 prefix/length -> 读一次 index -> Alloc(P) -> Copy(beta,g,q,k,v)
+-> EnQue(P) -> 原 PrefetchState(I) -> DeQue(P) -> Stage 0 VF -> Free(P)
+-> Stage 1 原 LoadPrefetchedState(I) -> 原 V_S Fetch/Set/Wait -> 原 Scalar g/beta
+-> Stage 2 原 Compute -> 原 CopyOutAttn -> 原 CopyOutState -> 原 TPipe 退出。
+P/I 均只有一个本 work，没有槽位回绕、下一次 Alloc 或跨核通知；空工作在全部搬入、队列和事件前退出。
+不能 Free(P) 后再调用准备 VF，也不能用 V_S 替代任一 MTE2 ready。
+队列组从 beta/g/q/k/v/state 六组变为 packed/state 两组是源码层面计数，不等于实际 event 指令减少四对。
 
-R01/R20：本例仅一个 AIV/work，未改变原 head 所有权；其它工作全部回退。
-R03/R08/R11/R17：沿用原 UB/queue/workspace 和地址，无新增容量或复用风险。
-R10/R16：沿用同 token 元数据复用和 GM state 搬入/写回；仅去掉已无消费者的第二遍 UB 写回。
-R21：VF 数学、顺序和转换不变。本机无内网设备；case 0 的设备结果采用用户回传，
-已保留版本的成功结果不替代本轮验证，本实验完整精度、其它路径及性能均待设备验证。
+同步依据见 [核内同步说明](https://asc.gitcode.com/api/SIMD-API/basic_api/sync_control/intra_core_sync/intra_core_sync_overview.html)，
+融合收益/代价见 [VF 特性说明](https://asc.gitcode.com/api/SIMD-API/c_api/reg_compute/key_features.html)，
+g 的默认 Reg Exp 见 [Exp](https://www.hiascend.com/document/detail/en/CANNCommunityEdition/910/API/ascendcopapi/docs/en/api/SIMD-API/basic_api/reg_vector_compute/basic_arithmetic/Exp-17.md)。
+文档用于选择方向与 API，不能替代目标环境编译、实际流水重叠或设备结果。
+
+R01/R20：映射和工作数不变；R03/R08/R11/R17：沿用独立原分配，P 子区间无重叠且生命周期闭环；
+R10/R16：GM 请求数/字节不变，q scale 在寄存器复用；R12/R19：各计算阶段保留明确 VF 边界，
+小输入和 state ready 分离用于重叠假设；R21：FP32 运算及原精度标准保留，本轮按用户要求不执行设备精度。

@@ -15,5 +15,9 @@ state block stride 和 tensor view offset 继续沿原调用链处理。
 
 其它 dtype、gate、accepted-token、shape、分片和 SoC 使用原通用路径。没有新增 profiling 输入或符号。
 
-本轮尾部 scratch 实验沿用上述选择条件，仅省去专用 VF 内无后续消费者的 updated FP32 UB 写回。
+已保留的尾部 scratch 实验沿用上述选择条件，仅省去专用 VF 内无后续消费者的 updated FP32 UB 写回。
 公开 stateRef 的 GM 写回仍执行；通用路径继续保存逐 token 递推所需的 FP32 scratch。
+
+本轮仅替换已有 SINGLE_WORK=1 的输入启动路线：小输入复用原 qInQueue 的一个 slot 打包，
+state 保留独立队列并提前发射搬入，小输入由一个 VF 准备到原 FP32 区域。
+公开参数、ABI、host/key 和输入契约均不变，主递推、state Cast、Scalar g/beta 与 V_S 保持基线。
