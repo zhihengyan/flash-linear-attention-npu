@@ -15,5 +15,9 @@ state block stride 和 tensor view offset 继续沿原调用链处理。
 
 其它 dtype、gate、accepted-token、shape、分片和 SoC 使用原通用路径。没有新增 profiling 输入或符号。
 
-本轮尾部 scratch 实验沿用上述选择条件，仅省去专用 VF 内无后续消费者的 updated FP32 UB 写回。
+已保留的尾部 scratch 实验沿用上述选择条件，仅省去专用 VF 内无后续消费者的 updated FP32 UB 写回。
 公开 stateRef 的 GM 写回仍执行；通用路径继续保存逐 token 递推所需的 FP32 scratch。
+
+本轮仅在已有 SINGLE_WORK=1 内融合初始 BF16 state 的输入转换。原 state 输入队列持有到
+主 VF 消费后释放；general 继续原整体 Cast。没有新增公开参数、key 或接口；g/beta 的
+标量读取、V_S、两遍计算和输出规则保持 fec1e18b 的行为。

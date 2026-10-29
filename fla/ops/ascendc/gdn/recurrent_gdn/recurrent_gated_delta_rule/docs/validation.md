@@ -1,4 +1,67 @@
-# A5 单 work 与尾部 scratch 实验开发记录
+# A5 初始 BF16 state Cast 融合实验开发记录
+
+## 当前实验与设计评审
+
+用户明确授权从 scratch 的 fec1e18b 新建 `codex/gdn-a5-state-cast-fusion`，完成编码、静态检查、
+提交并推送。沿仓内 `03 → 04 → 05`，先更新设计和本记录，再修改私有实现。公开接口、host/key、
+全部 JSON/YAML、executor、CPU 标杆、值域和容差不变；不处理 case 188，不引入 timer。
+本地无 CANN/NPU/torch 或 C++ 编译器，用户仅要求本地静态检查；不请求内网 SSH。
+
+采用 CHUNK_DEPENDENT V1（来源 a14961e9dfe8c8264768d67fb447101873da4ecf）的状态依赖和
+ready/free 审核方法；本算子保持单 AIV Vector 路径，不复用参考的 Cube、跨核 flag 或窗口数。
+Reg Cast 的工程写法参考 fec1e18b 中 common/kernel_utils/vector/regbase.hpp 的 ZERO/ONE 两次扩展，
+使用 BF16→FP32 的 UNKNOWN saturation/rounding、FP32 mask 和本算子的偶/奇 K 配对。
+原 two-pass VF、gated scratch、g/beta Scalar GetValue 与 V_S 保持，general 原数学保持。
+
+本轮唯一主要变量：SINGLE_WORK=1 的初始 BF16 state 不再先写 FP32 UB 再由主 VF 加载，
+而从 ready 的原 BF16 输入 slot 0 直接进入主 VF 每行的寄存器 Cast。stateLocal 从原输入位置
+DeQue，持有到 Compute 返回再 Free；InitBuffer、队列深度、FP32 scratch 区域和 GM 输出不变。
+范围、数值、layout、地址边界及同步详设见当前 design.md。新增私有 VF UB 指针不进入公开 ABI。
+
+| 模型 case | 轮次 / 状态 | 触发证据或预计关键路径 | 结构决策或候选与唯一主要变量 | 精度结果 | 性能前后值 | 瓶颈变化 | 依据或结论 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| A5 perf 0，B=T=Nk=Nv=1，K=V=128，BF16 state，g-only | fec1e18b 基线 | 独立 state Cast 及 FP32 中转的源码路径；已保留 tail scratch 优化 | 两遍 VF、V_S、Scalar 系数 | 用户回传 200 条精度全过 | 最近四轮 Task Duration 均值 4.49/4.49/4.43/4.46 μs，汇总 4.4675 μs；端到端 18.3365 μs | 实际中转字节数未被机器码确认 | 本轮直接对照 |
+| 同上 | 当前 / 待实测 | 省掉初始化 FP32 UB 写回和重读，可能增加主 VF Cast/寄存器成本 | 仅融合初始 state Cast，延长原输入 slot 持有至 VF 消费后 | 设备待测 | 沿用同环境、原输入/预热、20 样本和统计，与 fec1e18b 交错比较 | 源码理论少 64 KiB Store + 64 KiB Load；GM 不变 | 无可信时间收益下界，不承诺累计 5% |
+
+用户提供的取证文本显示源码 HEAD=fec1e18b，仅 .gitignore 和构建日志有本地改动；生成配置中
+85669048de2f4ae7785fd8d81b12f70b 对应 BF16 state，37ef20e52a126f008ab9edfe51ac2143 对应 FP32。
+BF16 `_266.o` 的符号明确为 tilingkey<10,true>，含独立 Cast VF（0x1500）和主 VF（0x1600）。
+但所有指令为 `<not available>`，不能确认该 Cast 的具体参数、实际流量或耗时；不把 symbol size
+当作运行时间。该证据只支持候选，用户接受通过单变量设备对照检验假设。
+
+门控读取及 V_S 删除两步实验已回传无可测收益：vf-sync 四轮 kernel 均值 4.4725 μs、端到端
+18.349 μs，对照 scratch 4.4675/18.3365 μs。差值远小于波动，结束该路线；本分支不继承这两步。
+第 3/4 轮 kernel 汇总相同，是否复用同一采样尚未确认，不据此推断独立样本或显著性。
+
+### 本地检查与内网验收计划
+
+本地约束：false 分支展开后 VF 与 fec1e18b 数学一致；true 只替换第一遍 state load 为 BF16
+load + ZERO/ONE Cast，第二遍仍读 gated FP32；验证 trait、mask、128 元素边界、输入指针和
+DeQue→V_S→Scalar 读取→Compute→Free→输出的顺序。通用 helper、host/key、ABI 和原测试输入保持。
+可选 C++ harness 仅记录生产控制体的调用/地址/slot 持有，不模拟设备时序或数值。
+
+内网按下文单算子 run 包构建/安装并核验 .o 后，先在 ATK_GM_INIT_MODE=on 下运行 accuracy
+case 0，再回归原完整 accuracy、MSS 和确定性。检查 slot 0 的 MTE2 ready 与 VF 最后读取后的
+释放、原 V_S 配对、有限性、非零 state index、padded block stride、空工作和连续调用；general
+BF16/FP32、gk、accepted、layout、多 token 仍按原矩阵回归。不更改 JSON、随机种子或容差。
+本轮精度未通过前不得测性能或将父版本成功记为本轮成功。
+
+通过后 fec1e18b/本轮交错比较，kernel 仅取 RecurrentGatedDeltaRule 的 Task Duration；端到端
+另列。若精度失败恢复 fec1e18b，若无稳定收益则放弃本候选。最终相对 main 的 5% 目标需要同轮
+main/scratch/本轮比较；历史 main 18.83 μs 推出的额外约 0.448 μs 需求不是实测收益。
+实际 CANN 9.1 编译、模板选择、额外未使用 VF 参数裁剪、寄存器 spill 与同步均留待内网确认。
+本轮本地检查共 10 项：9 项通过，1 项因本机没有 C++ 编译器跳过。false VF 与 fec1e18b
+数学一致，true 只替换第一遍加载；原 helper、general 数学、两处 LocalMemBar、V_S、scratch、
+公开接口和原输入资产的源码契约通过。数学模型覆盖全部 65280 个有限 BF16 编码及 128 行
+偶/奇配对；它不执行 AscendC API，不证明硬件 Cast、subnormal 处理或同步完成。
+可选 C++ harness 增加 slot 持有检查，但本轮没有编译执行，不将其记为通过。
+额外在内存中验证十种错误变体均被检查拒绝：odd lane 误用 ZERO、错误 Cast mask、漏 rowOffset、
+提前 Free、漏 Free、误传 FP32 scratch 地址、第二遍误读原始输入、漏第一处 VF 屏障、漏 V_S Wait、
+关闭专用融合。变体未写入工作区。Python AST、8 个本地 Markdown 链接和 `git diff --check` 通过。
+精度/perf/MSS JSON、YAML、generator、executor、CPU 标杆与 fec1e18b 一致；生产代码只改 arch35。
+本轮没有执行 CANN 编译或 A5 精度、MSS、确定性、性能；交付的是待设备验证的实验。
+
+## 已保留的 tail scratch 实验记录（以下为历史）
 
 本轮直接基线 `c36e18ce`（`codex/gdn-a5-single-work-fastpath`），
 实验分支 `codex/gdn-a5-tail-scratch-elision`；历史 main 为 `c9e2f1db`。
@@ -101,7 +164,7 @@ main/修复版的 RGDR Task Duration 交错统计。修复前约 8.4% 的 kernel
 会改变输入搬运与 Vector 的重叠，并可能失去对 state 准备的保护，仅是待验证候选，未改动实现。
 没有设备证据时不删除已使精度恢复的同步，也不将前移视为必然加速。
 
-## 实现追溯与静态检查边界
+## c36e18ce 基线实现追溯与静态检查边界（历史）
 
 | 设计项 | 实现位置 | 本地证据 / 剩余验证 |
 | --- | --- | --- |
@@ -137,6 +200,7 @@ PERFORMANCE_START=0 PERFORMANCE_END=1 \
 run 包路径按实际架构选择；安装后使用新 Python 进程。确认产物比对实际包含目标 `.o`，不接受跳过比对。
 范围是 `[start,end)`，默认 case 使用 0/1。精度必须有实际用例和通过证据，ATK 退出 0 不代替结果检查。
 性能只取 OP Type=RecurrentGatedDeltaRule 的 Task Duration，不混入 Neg/Cast/有限性检查。
-main/C 交错复测；需要模板命中证据和 Scalar/Vector/MTE 分项，不将 timer 分支 5.9341 μs 当作 main 基线。
+本轮 fec1e18b/Cast 融合版本交错复测，最终 main 同条件复测；需要模板命中证据和
+Scalar/Vector/MTE 分项，不将 timer 分支 5.9341 μs 当作 main 或本轮基线。
 每轮沿用此前 20 个 RGDR 样本；实际预热次数、ATK/CANN 版本和频率状态从内网配置/日志记录，
 本机没有这些配置，不为它们填入推测值。

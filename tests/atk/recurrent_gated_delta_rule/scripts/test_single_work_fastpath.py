@@ -1,11 +1,13 @@
 """Source contracts and optional C++ tests; no simulated NPU numerical claims."""
 import os
 import json
+import math
 from pathlib import Path
 import re
 import shlex
 import shutil
 import subprocess
+import struct
 import tempfile
 import unittest
 
@@ -13,6 +15,7 @@ ROOT = Path(__file__).resolve().parents[4]
 OP = ROOT / "fla/ops/ascendc/gdn/recurrent_gdn/recurrent_gated_delta_rule"
 BASE = "c9e2f1db"
 SCRATCH_BASE = "c36e18ce"
+FUSION_BASE = "fec1e18b"
 KERNEL = OP / "op_kernel/arch35/recurrent_gated_delta_rule.h"
 
 
@@ -54,16 +57,46 @@ def resolve_scratch_guard(source, keep):
     raise AssertionError("unclosed scratch-write guard")
 
 
+def resolve_constexpr(source, condition, keep):
+    """Expand an experiment's braced constexpr if/else for source comparison."""
+    def closing_brace(begin):
+        depth = 1
+        for end in range(begin + 1, len(source)):
+            depth += (source[end] == "{") - (source[end] == "}")
+            if depth == 0:
+                return end
+        raise AssertionError("unclosed constexpr branch")
+
+    marker = "if constexpr (" + condition + ")"
+    while marker in source:
+        start = source.index(marker)
+        begin = source.index("{", start)
+        end = closing_brace(begin)
+        selected = source[begin + 1:end] if keep else ""
+        after = end + 1
+        alternate = re.match(r"\s*else\s*\{", source[after:])
+        if alternate:
+            else_begin = after + alternate.end() - 1
+            else_end = closing_brace(else_begin)
+            if not keep:
+                selected = source[else_begin + 1:else_end]
+            after = else_end + 1
+        source = source[:start] + selected + source[after:]
+    return source
+
+
 def cpp_contract_source():
     # Execute the production device control body against recording operations.
     # This checks address/control semantics, not VF math or AscendC synchronization.
     process = body(KERNEL.read_text(encoding="utf-8"), "ProcessSingleWork")
     return r'''
 #define TORCH_MODE
+#define __ubuf__
 #include "recurrent_gated_delta_rule_single_work.h"
 #include <cassert>
 #include <cstdint>
 #include <iostream>
+#include <type_traits>
 #include <vector>
 using namespace RecurrentGatedDeltaRule;
 static_assert(sizeof(RecurrentGatedDeltaRuleTilingData) == 80);
@@ -86,12 +119,31 @@ struct Pipe {
         assert(event == HardEvent::V_S); calls->push_back(8); return 3;
     }
 };
+using stateType = uint16_t;
+template <typename T> struct LocalTensor {
+    T *data;
+    const bool *held;
+    T *GetPhyAddr() const { assert(*held); return data; }
+};
+struct StateQueue {
+    std::vector<int> *calls;
+    bool held = false;
+    stateType storage[128 * 128]{};
+    template <typename T> LocalTensor<T> DeQue() {
+        static_assert(std::is_same<T, stateType>::value);
+        assert(!held); held = true; calls->push_back(4); return {storage, &held};
+    }
+    template <typename T> void FreeTensor(LocalTensor<T> tensor) {
+        assert(held && tensor.data == storage); held = false; calls->push_back(11);
+    }
+};
 struct Harness {
     Input cuSeqlensGm_, ssmStateIndicesGm_;
     std::vector<int> calls;
     bool vectorReady = false, vectorPublished = false;
     Scalar gamaInUb{&vectorReady}, betaInUb{&vectorReady};
     Pipe pipe{&calls};
+    StateQueue stateInQueue_{&calls};
     uint64_t stateStride0_;
     float gama_ = 0, beta_ = 0;
     uint64_t inputOffset = 0, outputOffset = 0;
@@ -108,10 +160,16 @@ struct Harness {
     void CopyInGamaBeta(int a, int b) { assert(a == 0 && b == 1); calls.push_back(1); }
     void CopyInQKV(int a, int b, int c) { assert(a == 0 && b == 0 && c == 1); calls.push_back(2); }
     void PrefetchState(uint64_t offset, int v) { assert(v == 128); inputOffset = offset; calls.push_back(3); }
-    void LoadPrefetchedState(int v) { assert(v == 128); calls.push_back(4); }
-    void Compute(int v, int q, int k) { assert(v == 128 && q == 0 && k == 0); calls.push_back(5); }
-    void CopyOutAttn(int off, int v) { assert(off == 0 && v == 128); calls.push_back(6); }
-    void CopyOutState(uint64_t offset, int v) { assert(v == 128); outputOffset = offset; calls.push_back(7); }
+    void Compute(int v, int q, int k, stateType *initialState) {
+        assert(v == 128 && q == 0 && k == 0 && vectorReady);
+        assert(stateInQueue_.held && initialState == stateInQueue_.storage); calls.push_back(5);
+    }
+    void CopyOutAttn(int off, int v) {
+        assert(off == 0 && v == 128 && !stateInQueue_.held); calls.push_back(6);
+    }
+    void CopyOutState(uint64_t offset, int v) {
+        assert(v == 128 && !stateInQueue_.held); outputOffset = offset; calls.push_back(7);
+    }
     void ProcessSingleWork() {
 ''' + process + r'''
     }
@@ -156,7 +214,8 @@ int main() {
             bool active = length > 0 && length <= 8 && prefix >= 0 && prefix <= 1 && prefix + length <= 1;
             assert(h.cuSeqlensGm_.reads == 2);
             if (active) {
-                assert((h.calls == std::vector<int>{1,2,3,4,8,9,10,5,6,7}));
+                assert((h.calls == std::vector<int>{1,2,3,4,8,9,10,5,11,6,7}));
+                assert(!h.stateInQueue_.held);
                 assert(h.vectorReady && !h.vectorPublished);
                 assert(h.ssmStateIndicesGm_.reads == 1);
                 assert(h.inputOffset == stride * static_cast<uint64_t>(index));
@@ -164,7 +223,7 @@ int main() {
                 assert(h.gama_ == .25f && h.beta_ == .25f);
             } else {
                 assert(h.calls.empty() && h.ssmStateIndicesGm_.reads == 0);
-                assert(!h.vectorReady && !h.vectorPublished);
+                assert(!h.vectorReady && !h.vectorPublished && !h.stateInQueue_.held);
             }
         }
     }
@@ -200,8 +259,8 @@ class SingleWorkContractTest(unittest.TestCase):
 
     def test_only_second_pass_scratch_stores_are_optional(self):
         current, old = KERNEL.read_text(encoding="utf-8"), baseline(KERNEL, SCRATCH_BASE)
-        self.assertIn("bool writeUpdatedScratch = true>", current)
-        vf = body(current, "ComputeRecurrentGatedDeltaRuleVF")
+        self.assertIn("bool writeUpdatedScratch = true,", current)
+        vf = resolve_constexpr(body(current, "ComputeRecurrentGatedDeltaRuleVF"), "inputStateBf16", False)
         parent_vf = body(old, "ComputeRecurrentGatedDeltaRuleVF")
         # The full-write version must retain every original operation.
         self.assertEqual(normalize_cpp(resolve_scratch_guard(vf, True)), normalize_cpp(parent_vf))
@@ -218,13 +277,19 @@ class SingleWorkContractTest(unittest.TestCase):
 
     def test_scratch_policy_is_limited_to_existing_single_work_path(self):
         current, parent = KERNEL.read_text(encoding="utf-8"), baseline(KERNEL, SCRATCH_BASE)
-        compute = body(current, "Compute")
+        compute = resolve_constexpr(body(current, "Compute"), "singleWork", False)
         choices = re.findall(r"ComputeRecurrentGatedDeltaRuleVF<stateType, outType, "
                              r"(true|false), (true|false), !singleWork>", compute)
         self.assertCountEqual(choices, [("true", "true"), ("true", "false"),
                                        ("false", "true"), ("false", "false")])
-        self.assertEqual(compute.replace(", !singleWork>", ">"), body(parent, "Compute"))
-        self.assertEqual(body(current, "ProcessSingleWork"), body(parent, "ProcessSingleWork"))
+        self.assertEqual(normalize_cpp(compute.replace(", !singleWork>", ">").replace(
+            "gama_, beta_, nullptr", "gama_, beta_")), normalize_cpp(body(parent, "Compute")))
+        expected_control = body(parent, "ProcessSingleWork").replace(
+            "LoadPrefetchedState(128);", "LocalTensor<stateType> stateLocal = stateInQueue_.DeQue<stateType>();")
+        expected_control = expected_control.replace("Compute(128, 0, 0);",
+            "Compute(128, 0, 0, reinterpret_cast<__ubuf__ stateType *>(stateLocal.GetPhyAddr()));\n"
+            "stateInQueue_.FreeTensor(stateLocal);")
+        self.assertEqual(normalize_cpp(body(current, "ProcessSingleWork")), normalize_cpp(expected_control))
         for relative in ("op_host/recurrent_gated_delta_rule_single_work.h",
                          "op_host/recurrent_gated_delta_rule_tiling.cpp",
                          "op_kernel/recurrent_gated_delta_rule_struct.h",
@@ -245,6 +310,58 @@ class SingleWorkContractTest(unittest.TestCase):
             with self.subTest(path=relative):
                 self.assertEqual(path.read_text(encoding="utf-8"), baseline(path))
 
+    def test_initial_cast_fusion_preserves_vf_math_and_lane_pairing(self):
+        current, parent = KERNEL.read_text(encoding="utf-8"), baseline(KERNEL, FUSION_BASE)
+        self.assertIn("bool inputStateBf16 = false>", current)
+        for name, layout in (("castTraitB16ToB32", "ZERO"), ("castTraitB16ToB32One", "ONE")):
+            self.assertRegex(current, name + r" = \{\s*RegLayout::" + layout +
+                             r", SatMode::UNKNOWN, MaskMergeMode::ZEROING, RoundMode::UNKNOWN\}")
+        vf = body(current, "ComputeRecurrentGatedDeltaRuleVF")
+        original = body(parent, "ComputeRecurrentGatedDeltaRuleVF")
+        self.assertEqual(normalize_cpp(resolve_constexpr(vf, "inputStateBf16", False)), normalize_cpp(original))
+        old_load = '''if constexpr (std::is_same<stateType, float32_t>()) {
+            DataCopy(state0, state + rowOffset);
+            DataCopy(state1, state + rowOffset + FP32_PER_REG);
+        } else {
+            DataCopy<float, LoadDist::DIST_DINTLV_B32>(state0, state1, state + rowOffset);
+        }'''
+        self.assertEqual(original.count(old_load), 2)
+        new_load = '''static_assert(std::is_same<stateType, bfloat16_t>::value && hasGama && !hasGamaK &&
+                          !writeUpdatedScratch, "direct BF16 input is limited to single work");
+            RegTensor<stateType> initialStateReg;
+            DataCopy(initialStateReg, initialState + rowOffset);
+            Cast<float, stateType, castTraitB16ToB32>(state0, initialStateReg, fullFp32Mask);
+            Cast<float, stateType, castTraitB16ToB32One>(state1, initialStateReg, fullFp32Mask);'''
+        self.assertEqual(normalize_cpp(resolve_constexpr(vf, "inputStateBf16", True)),
+                         normalize_cpp(original.replace(old_load, new_load, 1)))
+        special = resolve_constexpr(body(current, "Compute"), "singleWork", True)
+        self.assertIn("true, false, !singleWork, true>", special)
+        self.assertIn("gama_, beta_, initialStateAddr", special)
+        self.assertIn("__ubuf__ stateType *initialStateAddr = nullptr", current)
+        self.assertIn("__ubuf__ stateType *initialState)", current)
+        self.assertNotIn("GetValue", special)
+
+    def test_finite_bf16_widening_and_even_odd_layout_model(self):
+        # Mathematical exactness/layout model only, not an AscendC Cast execution.
+        # Cover every finite BF16 encoding, including signed zero and subnormals.
+        for bits in range(1 << 16):
+            exponent, fraction = (bits >> 7) & 255, bits & 127
+            if exponent == 255:
+                continue
+            magnitude = (math.ldexp(float(fraction), -133) if exponent == 0 else
+                         math.ldexp(1.0 + fraction / 128, exponent - 127))
+            value = -magnitude if bits & 0x8000 else magnitude
+            self.assertEqual(struct.pack('<f', value), struct.pack('<I', bits << 16))
+        # RegLayout ZERO/ONE must preserve the original even/odd FP32 deinterleave.
+        for row in range(128):
+            raw = [((row * 128 + k) * 40503 + 7919) & 65535 for k in range(128)]
+            widened = [value << 16 for value in raw]
+            even = [raw[2 * lane] << 16 for lane in range(64)]
+            odd = [raw[2 * lane + 1] << 16 for lane in range(64)]
+            self.assertEqual(even, widened[::2])
+            self.assertEqual(odd, widened[1::2])
+        self.assertEqual((127 * 128 + 128) * 2, 32768)
+
     def test_template_selection_and_platform_wiring(self):
         source = (OP / "op_kernel/recurrent_gated_delta_rule_struct.h").read_text(encoding="utf-8")
         choices = re.findall(r"ASCENDC_TPL_DTYPE_SEL\(D_T_STATE,\s*(\w+)\),\s*"
@@ -263,14 +380,23 @@ class SingleWorkContractTest(unittest.TestCase):
         self.assertEqual(source.count("FetchEventID(HardEvent::V_S)"), 1)
         self.assertEqual(re.findall(r"SetFlag<HardEvent::V_S>\((\w+)\)", source), ["vToS"])
         self.assertEqual(re.findall(r"WaitFlag<HardEvent::V_S>\((\w+)\)", source), ["vToS"])
-        positions = [source.index(text) for text in (
-            "LoadPrefetchedState(128)", "FetchEventID(HardEvent::V_S)",
+        markers = (
+            "stateInQueue_.DeQue<stateType>()", "FetchEventID(HardEvent::V_S)",
             "SetFlag<HardEvent::V_S>(vToS)", "WaitFlag<HardEvent::V_S>(vToS)",
-            "gamaInUb.GetValue(0)", "betaInUb.GetValue(0)", "Compute(128, 0, 0)")]
+            "gamaInUb.GetValue(0)", "betaInUb.GetValue(0)", "Compute(128, 0, 0,",
+            "stateInQueue_.FreeTensor(stateLocal)", "CopyOutAttn(0", "CopyOutState(stateOffset")
+        for marker in markers:
+            self.assertIn(marker, source)
+        positions = [source.index(marker) for marker in markers]
         self.assertEqual(positions, sorted(positions))
         self.assertEqual(source.count("ssmStateIndicesGm_.GetValue"), 1)
         self.assertLess(source.index("if (prefix"), source.index("ssmStateIndicesGm_.GetValue"))
         self.assertLess(source.index("return;"), source.index("FetchEventID"))
+        self.assertLess(source.index("return;"), source.index("stateInQueue_.DeQue"))
+        self.assertNotIn("LoadPrefetchedState", source)
+        self.assertEqual(source.count("stateInQueue_.DeQue"), 1)
+        self.assertEqual(source.count("stateInQueue_.FreeTensor"), 1)
+        self.assertLess(source.index("stateInQueue_.FreeTensor"), source.index("CopyOutAttn(0"))
         self.assertLess(source.index("Compute(128"), source.index("CopyOutAttn(0"))
         self.assertLess(source.index("CopyOutAttn(0"), source.index("CopyOutState(stateOffset"))
 

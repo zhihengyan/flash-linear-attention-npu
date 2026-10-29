@@ -69,7 +69,7 @@ stateStride2=128、g-only、无 accepted-token 输入选择 `SINGLE_WORK=1`。
 
 | 模板参数 `(D_T_STATE,SINGLE_WORK)` | 精度 case | perf case | MSS / determinism case | 设备选择证据 |
 | --- | ---: | ---: | ---: | --- |
-| `(BF16,1)`，A5 single | 0 | 0 | 0 | 父版本 c36e18ce 的 case 0 成功；本轮 scratch 实验待测 |
+| `(BF16,1)`，A5 single | 0 | 0 | 0 | fec1e18b 用户回传 200 条精度全过；本轮 Cast 融合待测 |
 | `(FP32,0)`，general | 1 | — | 1 | 内网待采集 |
 | `(BF16,0)`，general | 2 | — | 2 | 内网待采集 |
 
@@ -86,13 +86,33 @@ blockDim 对照；不能只根据 case 的 shape 认定命中。
 合并约 4.48 μs，相对历史 main 4.87 μs 约改善 8.0%；同轮 main 的 kernel 统计待补。
 修复前的性能结果不能作为本版本的收益结论。
 
-### 当前实验：尾部 FP32 scratch 免写回
+### 已保留基线：尾部 FP32 scratch 免写回
 
 分支 `codex/gdn-a5-tail-scratch-elision` 从 c36e18ce 创建，只让 SINGLE_WORK=1 的 VF 使用
 `writeUpdatedScratch=false`，省去第二遍更新后的 64 KiB UB 写回。第一遍 gated state、
 两遍循环、V_S、GM state/out 和缓冲配置保留；general 的多 token 递推仍写 updated scratch。
 该开关不改变 host/key、公开接口或测试输入，精度/性能/MSS JSON 均与父版本一致，case 188 不改动。
-本轮性能直接与 c36e18ce 的相同 perf case 0 交错比较，不将父版本的通过记录当作本实验结果。
+fec1e18b 用户回传 200 条精度全过，最新四轮 RGDR Task Duration 均值为
+4.49/4.49/4.43/4.46 μs，汇总约 4.4675 μs；端到端均值 18.3365 μs。
+此前 main 两轮端到端均值 18.83 μs，只作历史参考。系数读取/V_S 删除路线未见稳定收益，
+本轮从 fec1e18b 单独创建，不继承那两步代码。
+
+### 当前实验：初始 BF16 state Cast 融合
+
+分支 `codex/gdn-a5-state-cast-fusion` 从 fec1e18b 创建。仅 SINGLE_WORK=1 将原 BF16
+stateInQueue 的 ready slot 保留到 Compute 返回，在主 VF 第一遍逐行加载并以 ZERO/ONE
+扩展成原偶/奇 K 布局。省去初始化 FP32 scratch 写回及对应重读，源码理论各 64 KiB；
+第一遍 gated scratch、第二遍读取、两处 VF LocalMemBar、尾部免写回、V_S、Scalar g/beta
+和 GM state/out 保持。输入 slot 在 VF 消费后 Free，不能提前释放。
+general 继续原 LoadPrefetchedState 和数学，UB/队列配置、host/key、公开接口均不变。
+全部 JSON/YAML、generator、executor、CPU 标杆、seed、值域和容差保持；case 188 不修复。
+
+内网源码和符号文本定位到 fec1e18b 的 BF16 参数版本 85669048…、single-work 模板 266，
+但 llvm-objdump 指令均为 `<not available>`；符号不能证明 128 KiB 往返实际保留或给出耗时。
+本轮通过单变量设备实验检验候选；本机没有 CANN/NPU，尚未执行编译或设备验证，不承诺累计 5%。
+先开启 GM 初始化验证 accuracy case 0，再运行原完整 accuracy、MSS 和确定性，核对模板命中、
+输入 slot 生命周期、out/stateRef 有限性以及 general 回退。通过后与 fec1e18b 交错比较，
+沿用原预热、每轮 20 个 RGDR 样本和统计；Task Duration 与端到端分别记录，最终 main 同轮复测。
 
 无需 NPU 的本地回归入口如下；没有 C++ 编译器时会明确跳过 C++ 控制语义测试，
 其余源码对照不能代替 CANN 编译、模板选择、NPU 精度或同步检查：
@@ -101,13 +121,18 @@ blockDim 对照；不能只根据 case 的 shape 认定命中。
 python -B tests/atk/recurrent_gated_delta_rule/scripts/test_single_work_fastpath.py -v
 ```
 
-该脚本核对原缓冲/搬运/同步函数和公开接口与 main 基线一致，并将 VF 的 scratch guard 作源码展开：
-true 应与 c36e18ce 原 VF 一致，false 应仅删去第二遍尾部 Store；四个 gate dispatch 均由
-`!singleWork` 控制，ProcessSingleWork 与父版本一致。该检查不是 CANN 编译或设备数值验证。
+本轮本地共 10 项检查：9 项通过、1 项因无 C++ 编译器跳过。
+该脚本核对原缓冲/搬运 helper 和公开接口与 main 基线一致；原 LoadPrefetchedState 保持原实现。
+VF 新分支 false 展开后与 fec1e18b 数学一致，true 仅替换第一遍 state load 为 BF16 load 和
+两次 Cast；scratch guard 仍检查通用递推和尾部免写回。general Compute 除未使用 nullptr 参数外
+与父版本相同，专用控制检查原 DeQue、V_S、Scalar 读取、VF 消费后 Free 及原输出顺序。
+另以数学模型检查全部 65280 个有限 BF16 编码的 FP32 精确表示和 128 行偶/奇配对；该模型不执行
+AscendC API，不能证明设备 Cast、subnormal 行为或同步正确性。
 有 C++17 编译器时，
 还会执行生产代码中的选择谓词和单 work 控制函数，检查空工作、不合法 prefix/length、
-非零 state index 和 padded block stride 的地址及调用顺序。专用路径的新增 V_S 检查
-覆盖 Set/Wait 配对、标量读取前完成 Wait，以及空工作不发射事件；录制 API 顺序不等于验证硬件同步。
+非零 state index 和 padded block stride 的地址及调用顺序，以及 state slot 从 DeQue 到 VF 使用
+结束的逻辑持有范围。V_S 检查继续覆盖 Set/Wait 配对、标量读取前完成 Wait、空工作无事件；
+录制 API 顺序和模拟 slot 所有权不等于验证硬件完成。
 内网构建、安装、产物校验和 A5 验证步骤见
 [开发记录](../../../fla/ops/ascendc/gdn/recurrent_gdn/recurrent_gated_delta_rule/docs/validation.md)。
 
