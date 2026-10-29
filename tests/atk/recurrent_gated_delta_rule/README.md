@@ -69,7 +69,7 @@ stateStride2=128、g-only、无 accepted-token 输入选择 `SINGLE_WORK=1`。
 
 | 模板参数 `(D_T_STATE,SINGLE_WORK)` | 精度 case | perf case | MSS / determinism case | 设备选择证据 |
 | --- | ---: | ---: | ---: | --- |
-| `(BF16,1)`，A5 single | 0 | 0 | 0 | 父版本 fec1e18b 用户回传 200 条精度全过；本轮 VF 读取待验证 |
+| `(BF16,1)`，A5 single | 0 | 0 | 0 | fec1e18b 用户回传 200 条精度全过；本轮同步调整待验证 |
 | `(FP32,0)`，general | 1 | — | 1 | 内网待采集 |
 | `(BF16,0)`，general | 2 | — | 2 | 内网待采集 |
 
@@ -99,7 +99,7 @@ single-work 18.500 μs、tail-scratch 18.335 μs；尾部免写回相对父版�
 相对 main 累计约改善 2.63%。此处沿前文记录端到端耗时，新分支 RGDR Task Duration、
 原始运行报告及 MSS/确定性仍待归档，详见开发记录。
 
-### 当前实验：VF 门控读取第一步
+### 第一步：VF 门控读取，保留 V_S
 
 分支 `codex/gdn-a5-vf-gate-load` 从 fec1e18b 创建，仅对 SINGLE_WORK=1 迁移系数消费：
 Exp/Cast 仍在原位置，原 V_S 的位置和 Set/Wait 保留；VF 从 gamaInUb/betaInUb 地址分别广播
@@ -107,9 +107,23 @@ Exp/Cast 仍在原位置，原 V_S 的位置和 Set/Wait 保留；VF 从 gamaInU
 以三个 FP32 Mul 替代原 Muls。general 继续传 float、执行原 Muls；两遍 VF、尾部免写回及 GM 输出保留。
 host/key/接口、所有 JSON、CPU 标杆、executor、容差及 case 188 均不改变。
 
-第二步同步收敛不包含在本轮。本轮须先开启 GM 初始化验证 case 0，再回归原精度矩阵和
-MSS/确定性，确认 scalar fallback 后，以 fec1e18b 交错比较端到端和 RGDR Task Duration。
-父版本 18.335 μs 是端到端参考，不是本轮 kernel 基线；本轮尚无设备结果。
+用户回传第一步 ca44ab5b 与修改前性能几乎不变，未提供具体新耗时、Task Duration 或精度范围。
+记录为未观测到单独收益，仅保留作第二步前提；继续以 fec1e18b 为已保留性能基线。
+fec1e18b 的 18.335 μs 是端到端参考，不能当作第一步或本轮的 kernel 基线。
+
+### 当前实验：第二步，删除无 Scalar 消费的显式 V_S
+
+分支 `codex/gdn-a5-vf-sync-elision` 从 ca44ab5b 新建，仅删除 ProcessSingleWork 的显式
+V_S Fetch/Set/Wait。第一步 VF 读 UB 的实现、各 Exp/Cast、队列同步、两处 VF LocalMemBar、
+两遍循环、尾部 scratch 免写回和 GM 输出保持不变；general/host/key/接口及所有测试输入均不改。
+原先 V_S 保护的 UB Scalar GetValue 已在第一步删除；输入准备结果现在均由 Vector VF 消费。
+依赖审计见设计与开发记录，不能仅以源码顺序当作 CANN 9.1 设备验证。
+
+内网先开启 GM 初始化跑 accuracy case 0，确认 out/stateRef 有限且满足原精度规则，再运行原完整
+accuracy 矩阵、MSS 和确定性。若重现 NaN/Inf 或同步错误，恢复 ca44ab5b 并保留日志。
+精度通过后与 ca44ab5b 交错比较 RGDR Task Duration/端到端耗时，隔离同步效果；
+再与 fec1e18b 比较两步累计结果。沿用相同输入、预热、每轮 20 个 RGDR 样本和统计方法。
+本轮无设备验证或性能结果；case 188 不作修复，JSON、标杆、executor、值域、seed 和容差均不改变。
 
 无需 NPU 的本地回归入口如下；没有 C++ 编译器时会明确跳过 C++ 控制语义测试，
 其余源码对照不能代替 CANN 编译、模板选择、NPU 精度或同步检查：
@@ -118,14 +132,17 @@ MSS/确定性，确认 scalar fallback 后，以 fec1e18b 交错比较端到端�
 python -B tests/atk/recurrent_gated_delta_rule/scripts/test_single_work_fastpath.py -v
 ```
 
+本轮本地共 10 项检查：9 项通过，1 项因无 C++ 编译器跳过；本机无 CANN/NPU，未执行设备验证。
+
 该脚本核对原缓冲/搬运函数和公开接口与 main 基线一致。将门控读取方式作源码展开后，
 scalar 模式应与 fec1e18b VF 一致，UB 模式应仅增加两次循环外广播并替换三个系数乘法；
-general Compute 与父版本一致，专用控制只删两次 Scalar GetValue，V_S 保留。
+general Compute 与父版本一致。整个 arch35 header 相对 ca44ab5b 只允许删除专用控制的三条
+V_S Fetch/Set/Wait 语句（注释忽略）；全部输入 helper、VF 数学、两处 LocalMemBar 和输出队列保持。
 scratch guard 的 true/false 展开继续检查通用递推与尾部免写回范围。该检查不是 CANN 编译或设备数值验证。
 有 C++17 编译器时，
 还会执行生产代码中的选择谓词和单 work 控制函数，检查空工作、不合法 prefix/length、
-非零 state index 和 padded block stride 的地址及调用顺序。专用路径的新增 V_S 检查
-覆盖 Set/Wait 配对、VF 发射前完成 Wait，以及空工作不发射事件；录制 API 顺序不等于验证硬件同步。
+非零 state index 和 padded block stride 的地址及调用顺序。专用路径检查全部准备调用在 Compute
+之前，空工作不搬入/发射 VF，且没有 Scalar UB 读取或额外事件；录制 API 顺序不等于验证硬件同步。
 内网构建、安装、产物校验和 A5 验证步骤见
 [开发记录](../../../fla/ops/ascendc/gdn/recurrent_gdn/recurrent_gated_delta_rule/docs/validation.md)。
 

@@ -412,10 +412,9 @@ private:
         CopyInQKV(0, 0, 1);
         PrefetchState(stateOffset, 128);
         LoadPrefetchedState(128);
-        // Keep the producer-completion dependency while migrating gate reads into VF.
-        TEventID vToS = GetTPipePtr()->FetchEventID(HardEvent::V_S);
-        SetFlag<HardEvent::V_S>(vToS);
-        WaitFlag<HardEvent::V_S>(vToS);
+        // A5 orders these Vector producers before the following VF. Only VF reads
+        // their UB results, so Main Scalar no longer needs a V_S completion wait.
+        // Keep the input queue synchronization and the VF's internal UB barriers.
         Compute(128, 0, 0);
         // Same order as the one-token general path, including its pending flush.
         CopyOutAttn(0, 128);

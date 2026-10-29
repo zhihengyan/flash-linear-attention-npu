@@ -14,6 +14,7 @@ OP = ROOT / "fla/ops/ascendc/gdn/recurrent_gdn/recurrent_gated_delta_rule"
 BASE = "c9e2f1db"
 SCRATCH_BASE = "c36e18ce"
 GATE_BASE = "fec1e18b"
+SYNC_BASE = "ca44ab5b"
 KERNEL = OP / "op_kernel/arch35/recurrent_gated_delta_rule.h"
 
 
@@ -112,37 +113,11 @@ struct Input {
     int32_t GetValue(unsigned i) { ++reads; return values.at(i); }
 };
 // Recording shims check issue order only; they do not model hardware completion.
-enum class HardEvent { V_S };
-using TEventID = unsigned;
-struct Scalar {
-    const bool *vectorReady;
-    float GetValue(unsigned i) { assert(i == 0 && *vectorReady); return .25f; }
-};
-struct Pipe {
-    std::vector<int> *calls;
-    TEventID FetchEventID(HardEvent event) {
-        assert(event == HardEvent::V_S); calls->push_back(8); return 3;
-    }
-};
 struct Harness {
     Input cuSeqlensGm_, ssmStateIndicesGm_;
     std::vector<int> calls;
-    bool vectorReady = false, vectorPublished = false;
-    Scalar gamaInUb{&vectorReady}, betaInUb{&vectorReady};
-    Pipe pipe{&calls};
     uint64_t stateStride0_;
-    float gama_ = 0, beta_ = 0;
     uint64_t inputOffset = 0, outputOffset = 0;
-    Pipe *GetTPipePtr() { return &pipe; }
-    template <HardEvent event> void SetFlag(TEventID id) {
-        static_assert(event == HardEvent::V_S);
-        assert(id == 3 && !vectorPublished); vectorPublished = true; calls.push_back(9);
-    }
-    template <HardEvent event> void WaitFlag(TEventID id) {
-        static_assert(event == HardEvent::V_S);
-        assert(id == 3 && vectorPublished); vectorPublished = false;
-        vectorReady = true; calls.push_back(10);
-    }
     void CopyInGamaBeta(int a, int b) { assert(a == 0 && b == 1); calls.push_back(1); }
     void CopyInQKV(int a, int b, int c) { assert(a == 0 && b == 0 && c == 1); calls.push_back(2); }
     void PrefetchState(uint64_t offset, int v) { assert(v == 128); inputOffset = offset; calls.push_back(3); }
@@ -194,16 +169,12 @@ int main() {
             bool active = length > 0 && length <= 8 && prefix >= 0 && prefix <= 1 && prefix + length <= 1;
             assert(h.cuSeqlensGm_.reads == 2);
             if (active) {
-                assert((h.calls == std::vector<int>{1,2,3,4,8,9,10,5,6,7}));
-                assert(h.vectorReady && !h.vectorPublished);
+                assert((h.calls == std::vector<int>{1,2,3,4,5,6,7}));
                 assert(h.ssmStateIndicesGm_.reads == 1);
                 assert(h.inputOffset == stride * static_cast<uint64_t>(index));
                 assert(h.outputOffset == h.inputOffset);
-                // The control path no longer reads the UB scalars; VF math is not simulated.
-                assert(h.gama_ == 0 && h.beta_ == 0);
             } else {
                 assert(h.calls.empty() && h.ssmStateIndicesGm_.reads == 0);
-                assert(!h.vectorReady && !h.vectorPublished);
             }
         }
     }
@@ -266,6 +237,10 @@ class SingleWorkContractTest(unittest.TestCase):
                          normalize_cpp(body(parent, "Compute")))
         control = body(parent, "ProcessSingleWork").replace("gama_ = gamaInUb.GetValue(0);", "")
         control = control.replace("beta_ = betaInUb.GetValue(0);", "")
+        for statement in ("TEventID vToS = GetTPipePtr()->FetchEventID(HardEvent::V_S);",
+                          "SetFlag<HardEvent::V_S>(vToS);", "WaitFlag<HardEvent::V_S>(vToS);"):
+            self.assertEqual(control.count(statement), 1)
+            control = control.replace(statement, "")
         self.assertEqual(normalize_cpp(body(current, "ProcessSingleWork")), normalize_cpp(control))
         for relative in ("op_host/recurrent_gated_delta_rule_single_work.h",
                          "op_host/recurrent_gated_delta_rule_tiling.cpp",
@@ -330,22 +305,34 @@ class SingleWorkContractTest(unittest.TestCase):
         self.assertIn("SocVersion::ASCEND950", host)
         self.assertIn("GET_TPL_TILING_KEY(stateDtypeKey, singleWork)", host)
 
-    def test_specialized_control_pairs_sync_before_vf(self):
+    def test_sync_elision_changes_only_single_work_control(self):
+        current, parent = KERNEL.read_text(encoding="utf-8"), baseline(KERNEL, SYNC_BASE)
+        original_control = body(parent, "ProcessSingleWork")
+        expected_control = original_control
+        for statement in ("TEventID vToS = GetTPipePtr()->FetchEventID(HardEvent::V_S);",
+                          "SetFlag<HardEvent::V_S>(vToS);", "WaitFlag<HardEvent::V_S>(vToS);"):
+            self.assertEqual(expected_control.count(statement), 1)
+            expected_control = expected_control.replace(statement, "")
+        # Only the former explicit V_S is removed. This locks down all producer,
+        # queue, VF, output and general-path code; it does not prove NPU timing.
+        expected = parent.replace(original_control, expected_control, 1)
+        self.assertEqual(normalize_cpp(current), normalize_cpp(expected))
+
+    def test_specialized_control_consumes_prepared_inputs_only_in_vf(self):
         source = body(KERNEL.read_text(encoding="utf-8"), "ProcessSingleWork")
         self.assertNotRegex(source, r"\b(for|while|PipeBarrier)\s*[<(]")
-        self.assertEqual(source.count("FetchEventID(HardEvent::V_S)"), 1)
-        self.assertEqual(re.findall(r"SetFlag<HardEvent::V_S>\((\w+)\)", source), ["vToS"])
-        self.assertEqual(re.findall(r"WaitFlag<HardEvent::V_S>\((\w+)\)", source), ["vToS"])
+        self.assertNotRegex(source, r"\b(FetchEventID|SetFlag|WaitFlag|LocalMemBar)\b")
         positions = [source.index(text) for text in (
-            "LoadPrefetchedState(128)", "FetchEventID(HardEvent::V_S)",
-            "SetFlag<HardEvent::V_S>(vToS)", "WaitFlag<HardEvent::V_S>(vToS)",
-            "Compute(128, 0, 0)")]
+            "CopyInGamaBeta(0, 1)", "CopyInQKV(0, 0, 1)",
+            "PrefetchState(stateOffset, 128)", "LoadPrefetchedState(128)", "Compute(128, 0, 0)")]
         self.assertEqual(positions, sorted(positions))
         self.assertNotIn("gamaInUb.GetValue", source)
         self.assertNotIn("betaInUb.GetValue", source)
+        self.assertEqual(re.findall(r"(\w+)\.GetValue\((\d)\)", source),
+                         [("cuSeqlensGm_", "0"), ("cuSeqlensGm_", "1"), ("ssmStateIndicesGm_", "0")])
         self.assertEqual(source.count("ssmStateIndicesGm_.GetValue"), 1)
         self.assertLess(source.index("if (prefix"), source.index("ssmStateIndicesGm_.GetValue"))
-        self.assertLess(source.index("return;"), source.index("FetchEventID"))
+        self.assertLess(source.index("return;"), source.index("CopyInGamaBeta"))
         self.assertLess(source.index("Compute(128"), source.index("CopyOutAttn(0"))
         self.assertLess(source.index("CopyOutAttn(0"), source.index("CopyOutState(stateOffset"))
 

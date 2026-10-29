@@ -1,7 +1,8 @@
-# RecurrentGatedDeltaRule：A5 VF 门控读取实验（第一步）
+# RecurrentGatedDeltaRule：A5 VF 门控读取与同步实验（第二步）
 
-方案设计规则版本：`V2`。本轮基线为已保留的 `fec1e18b`（`codex/gdn-a5-tail-scratch-elision`），
-实验分支为 `codex/gdn-a5-vf-gate-load`。历史 main 基线为 `c9e2f1db`。
+方案设计规则版本：`V2`。本轮直接基线为第一步 `ca44ab5b`（`codex/gdn-a5-vf-gate-load`），
+实验分支为 `codex/gdn-a5-vf-sync-elision`。已保留的性能基线为尾部免写回 `fec1e18b`，
+历史 main 基线为 `c9e2f1db`。
 接口见 [api.md](api.md)，开发记录和待验证项见 [validation.md](validation.md)。
 
 ## 1. 目标
@@ -10,20 +11,24 @@
 用户回传 fec1e18b 的 200 条精度全过，端到端两次为 18.34/18.33 μs，均值约 18.335 μs；
 该版本的独立 RGDR Task Duration 尚未提供。更早 c36e18ce 的主 kernel 均值约 4.48 μs，
 不能将该值直接当作 fec1e18b 的 kernel 基线。
-本轮只迁移已有单任务路径中衰减系数和 beta 的读取方式：保留原 Exp/Cast 生产与 V_S，
-让 VF 从其 UB 地址广播加载。已保留的尾部 scratch 免写回、两遍循环、UB 配置和 GM 输出继续保持。
+第一步 ca44ab5b 已将衰减系数和 beta 的读取迁移到 VF，保留原 Exp/Cast 生产与 V_S。
+用户回传第一步与修改前性能几乎不变，未提供具体耗时、RGDR Task Duration 或本轮精度报告；
+只记录为未观测到收益，不将它替代 fec1e18b 的已保留结果。
+本轮仅删除 SINGLE_WORK=1 中显式 V_S 的 Fetch/Set/Wait，核验不再需要的 Vector→Scalar 等待。
+VF、原 Exp/Cast、尾部 scratch 免写回、两遍循环、UB 配置、队列和 GM 输出均保持第一步实现。
 
-本轮假设是：移除外层两次 UB Scalar GetValue，并在 VF 内直接消费同一 FP32 值，可能减少
-Scalar 指令和参数交接成本；代价是增加 VF 广播加载和寄存器活跃区间，收益尚不确定。
+本轮假设是：当所有准备结果都由 VF 消费时，去掉 Main Scalar 等待前置 Vector 完成的往返，
+可能使输出分配和 VF 发射更早完成；Vector 数据依赖仍必须满足，不减少实际计算时间。
+原事件覆盖的等待可能已被队列或硬件顺序吸收，现有数据不足以估计独占耗时或保证收益。
 性能口径固定为原 ATK `op_summary` 中 `OP Type=RecurrentGatedDeltaRule` 的 `Task Duration(us)`，
 其它 Neg/有限性检查 task 不混入算子时间。沿用原输入、预热、每轮 20 样本及统计方式，
-以 fec1e18b/本轮分支交错复测，main 只作为历史参考。
+先以 ca44ab5b/本轮分支交错复测隔离同步效果，再与 fec1e18b 比较两步累计结果；main 只作历史参考。
 目标是在跨轮波动下仍能降低 RGDR 均值/中位数，且精度、其它路径不退化；未实测前不宣称收益。
-当前没有这两次 Scalar 读取的独占时间和寄存器 spill 数据，不能预设固定的 μs 收益。
+当前没有 V_S 的独占等待时间，不能预设固定的 μs 收益。
 
-可达性：算法、两遍 VF、GM 和 UB 逻辑数据字节数不变；两个 FP32 系数仍需各读一次，只是
-消费方从 Scalar 改为 VF。第一步保留 V_S，不将它的等待时间算作本轮可消除的成本。
-这是一轮小范围可归因实验；若 Task Duration 没有稳定下降，则不继续堆叠该方案。
+可达性：算法、两遍 VF、GM/UB 逻辑字节数与 ca44ab5b 相同。本轮只可能减少 event 指令和
+Main Scalar 的等待，收益上限受实际可重叠发射工作限制。若精度失败立即恢复 ca44ab5b；
+若 Task Duration 无稳定下降，结束该路线并继续保留 fec1e18b，不继续叠加优化。
 
 ## 2. Stage 0：Vector，保持原递推，特化单 work 控制
 
@@ -42,7 +47,7 @@ VF 新增内部编译期参数 `writeUpdatedScratch=true`；Compute 将 `!single
 因此仅已有 SINGLE_WORK=1 实例使用 false，其余 BF16/FP32、单/多 token 通用实例均使用 true。
 它不进入公开 kernel 模板、host TilingKey 或 tiling struct，不扩大原专用路径范围。
 
-本轮 VF 末尾增加内部类型参数 `gateType=float`。general 调用继续传两个 float，实例的标量
+沿用第一步 VF 内部类型参数 `gateType=float`。general 调用继续传两个 float，实例的标量
 参数类型不变；只有 SINGLE_WORK=1 调用传两个 `__ubuf__ float *`，由编译期类型选择广播读取。
 不传结构体或引用。静态断言限定 UB 系数模式为 BF16、g-only、无 updated scratch 的已有专用实例。
 general 的四种 gate 组合和调度继续沿父版本路径。
@@ -54,8 +59,8 @@ general 的四种 gate 组合和调度继续沿父版本路径。
 2. 读取一次 `ssmStateIndices[0]`，复用作初始 state 与最终 state 的 block index。
    地址为 `stateStride0 * index`，head=0、V片起点=0；不假定 block index 为零或 block stride 连续。
 3. 原 `CopyInGamaBeta(0,1)` → `CopyInQKV(0,0,1)` → `PrefetchState(stateOffset,128)` →
-   `LoadPrefetchedState(128)` → 一对显式 `V_S` Set/Wait；等待前置 Vector 操作完成后，
-   直接调用 `Compute(128,0,0)`，不再以 Scalar GetValue 读取两个系数。
+   `LoadPrefetchedState(128)` → `Compute(128,0,0)`；删除原显式 V_S Fetch/Set/Wait。
+   不再以 Scalar GetValue 读取两个系数，Main Scalar 仅取得地址并发射 VF。
    Compute 将 gamaInUb、betaInUb 的 UB 裸指针交给 VF；gamaInUb 保存的是已计算的 exp(g)，
    betaInUb 保存的是 BF16 beta 经 Cast 后的 FP32 值。
 4. 原 `CopyOutAttn(0,128)` → `CopyOutState(stateOffset,128)`。单 token、单分片下，原 host 可选的
@@ -70,12 +75,12 @@ GM 元数据 GetValue 从 5 次降为 3 次：长度不再为平均负载重复�
 
 保持原两遍 VF、归约树、gate Exp、q scale、Cast 舍入和全部 GM 输出。
 数学仍为 FP32 gate/state-dot → delta → rank-one 更新 → state-query projection → BF16 state/out。
-本轮 UB 系数模式中，第一遍前以 DIST_BRC_B32 将 exp(g) 加载到一个 FP32 RegTensor，
+沿用的 UB 系数模式中，第一遍前以 DIST_BRC_B32 将 exp(g) 加载到一个 FP32 RegTensor，
 把原两次 Muls(state, state, gama) 改为 Mul(state, state, gateReg)。第一遍完成及原
 LocalMemBar 之后，将同一 gateReg 改装载 beta，第二遍用 Mul(delta, attn, gateReg) 替换原 Muls。
 每个系数只广播一次，位于 row 循环之外。general 模式保留原三个 Muls。
-R21：FP32 乘法的操作数、乘法/加法顺序、Exp、Cast、归约树和 mask 不变，不引入 FMA 或
-输入值域变化；Mul 与 Muls 生成指令及最终误差仍须在 A5 按原精度规则验证。
+R21：相对 ca44ab5b，全部 VF 数学、FP32 操作数、乘加顺序、Exp、Cast、归约树和 mask 原样保持，
+不引入 FMA 或输入值域变化；删除事件后的输入可见性须在 A5 按原精度规则验证。
 
 FP32 state scratch 的生命周期如下，地址仍为 tmpBuff 相对区间 `[12800,78336)`：
 
@@ -109,28 +114,50 @@ FP32 state `[12800,78336)`、beta `[78336,78400)`、g `[78400,78464)`。
 
 每次有效工作逻辑读取 BF16 state 32 KiB、写回 32 KiB，Q/K/V 共 768 B、g/beta 共 6 B，均不变。
 新路径复用的 index 位于 scalar 局部变量，不占 UB，不改变任何输入/输出地址所有权。
-本轮无新增 UB 分配，g/beta 均沿用原地址。新增一只逻辑 FP32 RegTensor（256 B）在两遍之间
+本轮无新增 UB 分配，g/beta 均沿用原地址。第一步引入的一只逻辑 FP32 RegTensor（256 B）在两遍之间
 复用：第一遍消费 exp(g) 后才装载 beta；实际寄存器分配与 spill 需看 A5 编译产物。
 
 ### 同步与退出
 
 保留各 Copy/Compute 函数中的原 Alloc/EnQue/DeQue/Free、PIPE_V 和 VF LocalMemBar。
-输入 ready 和输出 ready 继续由原队列事件保证。专用路径在发射 Compute/VF 之前，
-通过 TPipe 动态取得一个 `HardEvent::V_S` event ID，先 SetFlag 再 WaitFlag，形成一次完成依赖。
-生产方是此前发射的 gate Exp、beta Cast、Q/K/V Cast/scale 和 state Cast，消费方改为后续 VF；
-Set/Wait 的位置、数量和配对均保留。第二步同步收敛不在本轮实现，不能直接删除该依赖。
-输出仍以原 CopyOut 函数释放，TPipe 的退出生命周期不变。空工作在读取/写入 state、分配输出前返回。
-空工作也在取得该 event ID 之前返回，因此不会出现缺少 Set 的 Wait。
+本轮仅删除 ProcessSingleWork 中显式 V_S 的 Fetch/Set/Wait，不替换为 PIPE_ALL、其它跨 pipe
+事件或新增 VF 内屏障。Main Scalar 不再读取任一 Vector 生产的 UB 数据；Compute 的 GetPhyAddr
+只取得地址，VF 消费准备结果。general 的 Scalar 读取与原同步保持不变。
+
+| 依赖 | 生产方 → 消费方 | 本轮保留的顺序/同步 |
+| --- | --- | --- |
+| 输入搬入 ready | MTE2 → gate/beta/QKV/state Vector | 各输入原 EnQue/DeQue；V_MTE2 释放仍由原队列管理 |
+| g / beta FP32 UB | Exp / Cast → VF 系数广播 | 同 AIV 的 PIPE_V/VF 发射顺序；无 Main Scalar 数值消费 |
+| QKV FP32 UB | Cast 和 q scale → VF load | 原 CopyInQKV 内 PIPE_V 保留；后续按相同 Vector 顺序消费 |
+| state FP32 UB | LoadPrefetchedState 的 Cast → VF load | state 队列 ready；其后 VF 按相同 Vector 顺序消费 |
+| gated scratch / dot → 第二遍 | VF VEC_STORE → VEC_LOAD | 第一处原 LocalMemBar，保留 |
+| attention tmp → 输出转换 | VF VEC_STORE → VEC_LOAD | 第二处原 LocalMemBar，保留 |
+| 输出 ready / 释放 | VF → MTE3 → slot free | 原输出 EnQue/DeQue/Free 和 TPipe 退出，保留 |
+
+有效工作同步伪代码：输入各自搬入/队列 ready → gate/beta 和 QKV Vector 准备 → state 队列 ready
+及 Cast → VF（原两处内部 LocalMemBar）→ 原输出队列 ready/MTE3 → 释放。输入队列均为原 slot 0，
+输出槽按原队列深度选择；单 work 不新增 slot 回绕或跨核事件。此处新增显式事件数量为 0，
+相比 ca44ab5b 少一次 V_S ID 取得和一对 Set/Wait；不预设整个编译产物中 V_S 的总数为 0。
+空工作在读取/写入 state、分配输出前返回，不发射 VF 或事件，不存在未配对的 Wait。
+
+顺序依据：[官方 PipeBarrier 文档](https://asc.gitcode.com/api/SIMD-API/basic_api/sync_control/intra_core_sync/PipeBarrier_ISASI.html)
+说明 Ascend 950PR/950DT 的 PIPE_V 间同步由硬件保证；
+[官方 LocalMemBar 文档](https://www.hiascend.com/document/detail/en/CANNCommunityEdition/910/API/ascendcopapi/docs/en/api/SIMD-API/basic_api/reg_vector_compute/sync_control/LocalMemBar.md)
+规定 VF 内不同 UB 读写流水的依赖须单独保护。两者不互相替代。
+前一个链接为 asc-devkit master 文档（2026-10-29 核对），不能当作目标 CANN 9.1 编译产物证据。
+这是删除无 Scalar 消费的显式 V_S 的依据；真实 CANN 9.1 API lowering、VF 融合后的同步和
+MTE ready 仍需编译产物及 MSS/精度验证，源码顺序检查不能证明设备执行时序。
 
 2026-10-29 用户回传：无显式同步时 case 0 的 out/stateRef 全部非有限；强制 general 后通过；
 恢复专用路径并增加上述 V_S 后通过。这支持前置 Vector 完成时序相关问题；由于该事件覆盖所有
 前置 Vector 操作，尚不能单独归因于 gate/beta 中的某一个读取，也未证明编译器漏插同步的具体原因。
-修复前的性能数据不能作为本版本的验收结果，必须在精度回归后重新测量。
+该失败发生于仍有 UB Scalar GetValue 的旧路径，本轮依赖前提已不同；历史成功也不能证明
+本轮安全。若 case 0 再次非有限或 MSS 报同步问题，立即恢复 ca44ab5b，按完整依赖链排查。
 
 ### 设计复核
 
 R01/R20：本例仅一个 AIV/work，未改变原 head 所有权；其它工作全部回退。
 R03/R08/R11/R17：沿用原 UB/queue/workspace 和地址，无新增容量或复用风险。
 R10/R16：沿用同 token 元数据复用和 GM state 搬入/写回；仅去掉已无消费者的第二遍 UB 写回。
-R21：只替换三个系数乘法的供参形式，保留数值顺序和转换。本机无内网设备；
+R21：本轮只移除无 Main Scalar 数值消费者的显式事件，保留 VF 数学和转换。本机无内网设备；
 已保留版本的成功结果不替代本轮验证，本轮精度、MSS/确定性和性能均待设备验证。
