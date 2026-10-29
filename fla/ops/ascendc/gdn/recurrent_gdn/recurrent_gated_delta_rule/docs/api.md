@@ -15,5 +15,8 @@ state block stride 和 tensor view offset 继续沿原调用链处理。
 
 其它 dtype、gate、accepted-token、shape、分片和 SoC 使用原通用路径。没有新增 profiling 输入或符号。
 
-本轮尾部 scratch 实验沿用上述选择条件，仅省去专用 VF 内无后续消费者的 updated FP32 UB 写回。
+已保留的尾部 scratch 实验沿用上述选择条件，仅省去专用 VF 内无后续消费者的 updated FP32 UB 写回。
 公开 stateRef 的 GM 写回仍执行；通用路径继续保存逐 token 递推所需的 FP32 scratch。
+
+本轮仅在该专用实例内，将已完成 Exp/Cast 的两个 FP32 系数通过 UB 裸指针交给 VF，
+公开接口、输入值域和参数类型均不变；general 继续使用原标量传参。V_S 保留，未实施同步收敛。

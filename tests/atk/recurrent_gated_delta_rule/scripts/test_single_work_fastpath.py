@@ -13,6 +13,7 @@ ROOT = Path(__file__).resolve().parents[4]
 OP = ROOT / "fla/ops/ascendc/gdn/recurrent_gdn/recurrent_gated_delta_rule"
 BASE = "c9e2f1db"
 SCRATCH_BASE = "c36e18ce"
+GATE_BASE = "fec1e18b"
 KERNEL = OP / "op_kernel/arch35/recurrent_gated_delta_rule.h"
 
 
@@ -52,6 +53,43 @@ def resolve_scratch_guard(source, keep):
             inner = source[begin:end] if keep else ""
             return source[:start] + inner + source[end + 1:]
     raise AssertionError("unclosed scratch-write guard")
+
+
+def resolve_constexpr(source, condition, keep):
+    """Resolve the named experiment conditions, including their optional else."""
+    def closing_brace(begin):
+        depth = 1
+        for end in range(begin + 1, len(source)):
+            depth += (source[end] == "{") - (source[end] == "}")
+            if depth == 0:
+                return end
+        raise AssertionError("unclosed constexpr branch")
+
+    marker = "if constexpr (" + condition + ")"
+    while marker in source:
+        start = source.index(marker)
+        begin = source.index("{", start)
+        end = closing_brace(begin)
+        selected = source[begin + 1:end] if keep else ""
+        after = end + 1
+        alternate = re.match(r"\s*else\s*\{", source[after:])
+        if alternate:
+            else_begin = after + alternate.end() - 1
+            else_end = closing_brace(else_begin)
+            if not keep:
+                selected = source[else_begin + 1:else_end]
+            after = else_end + 1
+        source = source[:start] + selected + source[after:]
+    return source
+
+
+def gate_vf_body(source, from_ub):
+    source = resolve_constexpr(source, "gatesFromUb", from_ub)
+    source = re.sub(r"constexpr bool gatesFromUb = [^;]+;", "", source)
+    source = re.sub(r"static_assert\(.*?\);", "", source, flags=re.DOTALL)
+    if not from_ub:
+        source = source.replace("RegTensor<float> gateReg;", "")
+    return source
 
 
 def cpp_contract_source():
@@ -161,7 +199,8 @@ int main() {
                 assert(h.ssmStateIndicesGm_.reads == 1);
                 assert(h.inputOffset == stride * static_cast<uint64_t>(index));
                 assert(h.outputOffset == h.inputOffset);
-                assert(h.gama_ == .25f && h.beta_ == .25f);
+                // The control path no longer reads the UB scalars; VF math is not simulated.
+                assert(h.gama_ == 0 && h.beta_ == 0);
             } else {
                 assert(h.calls.empty() && h.ssmStateIndicesGm_.reads == 0);
                 assert(!h.vectorReady && !h.vectorPublished);
@@ -200,8 +239,8 @@ class SingleWorkContractTest(unittest.TestCase):
 
     def test_only_second_pass_scratch_stores_are_optional(self):
         current, old = KERNEL.read_text(encoding="utf-8"), baseline(KERNEL, SCRATCH_BASE)
-        self.assertIn("bool writeUpdatedScratch = true>", current)
-        vf = body(current, "ComputeRecurrentGatedDeltaRuleVF")
+        self.assertIn("bool writeUpdatedScratch = true,", current)
+        vf = gate_vf_body(body(current, "ComputeRecurrentGatedDeltaRuleVF"), False)
         parent_vf = body(old, "ComputeRecurrentGatedDeltaRuleVF")
         # The full-write version must retain every original operation.
         self.assertEqual(normalize_cpp(resolve_scratch_guard(vf, True)), normalize_cpp(parent_vf))
@@ -218,13 +257,16 @@ class SingleWorkContractTest(unittest.TestCase):
 
     def test_scratch_policy_is_limited_to_existing_single_work_path(self):
         current, parent = KERNEL.read_text(encoding="utf-8"), baseline(KERNEL, SCRATCH_BASE)
-        compute = body(current, "Compute")
+        compute = resolve_constexpr(body(current, "Compute"), "singleWork", False)
         choices = re.findall(r"ComputeRecurrentGatedDeltaRuleVF<stateType, outType, "
                              r"(true|false), (true|false), !singleWork>", compute)
         self.assertCountEqual(choices, [("true", "true"), ("true", "false"),
                                        ("false", "true"), ("false", "false")])
-        self.assertEqual(compute.replace(", !singleWork>", ">"), body(parent, "Compute"))
-        self.assertEqual(body(current, "ProcessSingleWork"), body(parent, "ProcessSingleWork"))
+        self.assertEqual(normalize_cpp(compute.replace(", !singleWork>", ">")),
+                         normalize_cpp(body(parent, "Compute")))
+        control = body(parent, "ProcessSingleWork").replace("gama_ = gamaInUb.GetValue(0);", "")
+        control = control.replace("beta_ = betaInUb.GetValue(0);", "")
+        self.assertEqual(normalize_cpp(body(current, "ProcessSingleWork")), normalize_cpp(control))
         for relative in ("op_host/recurrent_gated_delta_rule_single_work.h",
                          "op_host/recurrent_gated_delta_rule_tiling.cpp",
                          "op_kernel/recurrent_gated_delta_rule_struct.h",
@@ -232,6 +274,37 @@ class SingleWorkContractTest(unittest.TestCase):
             path = OP / relative
             with self.subTest(path=relative):
                 self.assertEqual(path.read_text(encoding="utf-8"), baseline(path, SCRATCH_BASE))
+
+    def test_vf_gate_delivery_and_general_fallback(self):
+        current, parent = KERNEL.read_text(encoding="utf-8"), baseline(KERNEL, GATE_BASE)
+        self.assertIn("typename gateType = float>", current)
+        self.assertIn("gateType gama, gateType beta)", current)
+        self.assertIn("hasGama && !hasGamaK && !writeUpdatedScratch", current)
+        vf = body(current, "ComputeRecurrentGatedDeltaRuleVF")
+        parent_vf = body(parent, "ComputeRecurrentGatedDeltaRuleVF")
+        self.assertEqual(normalize_cpp(gate_vf_body(vf, False)), normalize_cpp(parent_vf))
+        row_loop = "for (uint16_t row = 0; row < rows; ++row)"
+        expected = parent_vf.replace(row_loop,
+            "RegTensor<float> gateReg;\n"
+            "DataCopy<float, LoadDist::DIST_BRC_B32>(gateReg, gama);\n" + row_loop, 1)
+        barrier = "LocalMemBar<MemType::VEC_STORE, MemType::VEC_LOAD>();"
+        expected = expected.replace(barrier, barrier + "\n"
+            "DataCopy<float, LoadDist::DIST_BRC_B32>(gateReg, beta);", 1)
+        for dst, src, scalar in (("state0", "state0", "gama"), ("state1", "state1", "gama"),
+                                 ("delta", "attn", "beta")):
+            expected = expected.replace(f"Muls({dst}, {src}, {scalar}, fullFp32Mask);",
+                                        f"Mul({dst}, {src}, gateReg, fullFp32Mask);")
+        self.assertEqual(normalize_cpp(gate_vf_body(vf, True)), normalize_cpp(expected))
+        compute = body(current, "Compute")
+        self.assertEqual(normalize_cpp(resolve_constexpr(compute, "singleWork", False)),
+                         normalize_cpp(body(parent, "Compute")))
+        special = resolve_constexpr(compute, "singleWork", True)
+        self.assertIn("gamaAddr = reinterpret_cast<__ubuf__ float *>(gamaInUb.GetPhyAddr())", special)
+        self.assertIn("betaAddr = reinterpret_cast<__ubuf__ float *>(betaInUb.GetPhyAddr())", special)
+        self.assertIn("true, false, !singleWork, __ubuf__ float *>", special)
+        self.assertRegex(special, r"gamaAddr,\s*betaAddr\);")
+        self.assertNotIn("gama_, beta_", special)
+        self.assertNotIn("GetValue", special)
 
     def test_tiling_layout_and_public_interfaces_unchanged(self):
         path = OP / "op_kernel/recurrent_gated_delta_rule_struct.h"
@@ -257,7 +330,7 @@ class SingleWorkContractTest(unittest.TestCase):
         self.assertIn("SocVersion::ASCEND950", host)
         self.assertIn("GET_TPL_TILING_KEY(stateDtypeKey, singleWork)", host)
 
-    def test_specialized_control_pairs_sync_before_scalar_reads(self):
+    def test_specialized_control_pairs_sync_before_vf(self):
         source = body(KERNEL.read_text(encoding="utf-8"), "ProcessSingleWork")
         self.assertNotRegex(source, r"\b(for|while|PipeBarrier)\s*[<(]")
         self.assertEqual(source.count("FetchEventID(HardEvent::V_S)"), 1)
@@ -266,8 +339,10 @@ class SingleWorkContractTest(unittest.TestCase):
         positions = [source.index(text) for text in (
             "LoadPrefetchedState(128)", "FetchEventID(HardEvent::V_S)",
             "SetFlag<HardEvent::V_S>(vToS)", "WaitFlag<HardEvent::V_S>(vToS)",
-            "gamaInUb.GetValue(0)", "betaInUb.GetValue(0)", "Compute(128, 0, 0)")]
+            "Compute(128, 0, 0)")]
         self.assertEqual(positions, sorted(positions))
+        self.assertNotIn("gamaInUb.GetValue", source)
+        self.assertNotIn("betaInUb.GetValue", source)
         self.assertEqual(source.count("ssmStateIndicesGm_.GetValue"), 1)
         self.assertLess(source.index("if (prefix"), source.index("ssmStateIndicesGm_.GetValue"))
         self.assertLess(source.index("return;"), source.index("FetchEventID"))
