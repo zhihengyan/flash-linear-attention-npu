@@ -38,7 +38,8 @@ general 实例的成员初始化、调度和原 VF 不变。
 2. 读取一次 `ssmStateIndices[0]`，复用作初始 state 与最终 state 的 block index。
    地址为 `stateStride0 * index`，head=0、V片起点=0；不假定 block index 为零或 block stride 连续。
 3. 原 `CopyInGamaBeta(0,1)` → `CopyInQKV(0,0,1)` → `PrefetchState(stateOffset,128)` →
-   `LoadPrefetchedState(128)`；读取原 UB 中的 g/beta，调用原 `Compute(128,0,0)`。
+   `LoadPrefetchedState(128)` → 一对显式 `V_S` Set/Wait；等待前置 Vector 操作完成后，
+   读取原 UB 中的 g/beta，调用原 `Compute(128,0,0)`。
 4. 原 `CopyOutAttn(0,128)` → `CopyOutState(stateOffset,128)`。单 token、单分片下，原 host 可选的
    `(state,attn)` 深度 `(1,1)/(1,2)/(2,2)` 均按此顺序写回；特化只移除 pending 状态变量和循环控制，
    不改变队列深度。
@@ -75,12 +76,22 @@ FP32 state `[12800,78336)`、beta `[78336,78400)`、g `[78400,78464)`。
 ### 同步与退出
 
 保留各 Copy/Compute 函数中的原 Alloc/EnQue/DeQue/Free、PIPE_V 和 VF LocalMemBar。
-输入 ready 和输出 ready 继续由原队列事件保证；没有新 barrier、手写事件或跨核同步。
+输入 ready 和输出 ready 继续由原队列事件保证。专用路径在读取 `gamaInUb/betaInUb` 之前，
+通过 TPipe 动态取得一个 `HardEvent::V_S` event ID，先 SetFlag 再 WaitFlag，形成一次完成依赖。
+生产方是此前发射的 gate Exp、beta Cast、Q/K/V Cast/scale 和 state Cast，消费方是标量读取及
+后续 Compute；每次有效调用只执行一对 Set/Wait，不持有未消费的通知，不引入跨核同步或 PIPE_ALL。
 输出仍以原 CopyOut 函数释放，TPipe 的退出生命周期不变。空工作在读取/写入 state、分配输出前返回。
+空工作也在取得该 event ID 之前返回，因此不会出现缺少 Set 的 Wait。
+
+2026-10-29 用户回传：无显式同步时 case 0 的 out/stateRef 全部非有限；强制 general 后通过；
+恢复专用路径并增加上述 V_S 后通过。这支持前置 Vector 完成时序相关问题；由于该事件覆盖所有
+前置 Vector 操作，尚不能单独归因于 gate/beta 中的某一个读取，也未证明编译器漏插同步的具体原因。
+修复前的性能数据不能作为本版本的验收结果，必须在精度回归后重新测量。
 
 ### 设计复核
 
 R01/R20：本例仅一个 AIV/work，未改变原 head 所有权；其它工作全部回退。
 R03/R08/R11/R17：沿用原 UB/queue/workspace 和地址，无新增容量或复用风险。
 R10/R16：仅复用同一 token 的元数据，不更改 state 的搬入/写回次数。
-R21：VF 数学、顺序和转换不变。用户已授权此方向的编码；无内网设备，真实编译、精度和性能均标为待验证。
+R21：VF 数学、顺序和转换不变。本机无内网设备；case 0 的设备结果采用用户回传，
+本版本完整精度回归、其它路径与修复后性能仍待设备验证。

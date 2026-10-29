@@ -384,6 +384,10 @@ private:
         CopyInQKV(0, 0, 1);
         PrefetchState(stateOffset, 128);
         LoadPrefetchedState(128);
+        // Complete the preceding Vector producers before reading their UB scalars.
+        TEventID vToS = GetTPipePtr()->FetchEventID(HardEvent::V_S);
+        SetFlag<HardEvent::V_S>(vToS);
+        WaitFlag<HardEvent::V_S>(vToS);
         gama_ = gamaInUb.GetValue(0);
         beta_ = betaInUb.GetValue(0);
         Compute(128, 0, 0);
