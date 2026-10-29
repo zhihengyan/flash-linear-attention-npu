@@ -12,6 +12,7 @@ import unittest
 ROOT = Path(__file__).resolve().parents[4]
 OP = ROOT / "fla/ops/ascendc/gdn/recurrent_gdn/recurrent_gated_delta_rule"
 BASE = "c9e2f1db"
+SCRATCH_BASE = "c36e18ce"
 KERNEL = OP / "op_kernel/arch35/recurrent_gated_delta_rule.h"
 
 
@@ -27,9 +28,30 @@ def body(source, name):
     raise AssertionError("unclosed function: " + name)
 
 
-def baseline(path):
-    return subprocess.check_output(["git", "show", BASE + ":" + path.relative_to(ROOT).as_posix()],
+def baseline(path, ref=BASE):
+    return subprocess.check_output(["git", "show", ref + ":" + path.relative_to(ROOT).as_posix()],
                                    cwd=ROOT, text=True, encoding="utf-8")
+
+
+def normalize_cpp(source):
+    source = re.sub(r"//[^\n]*|/\*.*?\*/", "", source, flags=re.DOTALL)
+    return re.sub(r"\s+", "", source)
+
+
+def resolve_scratch_guard(source, keep):
+    """Expand only the experiment's constexpr guard for source comparison."""
+    marker = "if constexpr (writeUpdatedScratch)"
+    if source.count(marker) != 1:
+        raise AssertionError("expected exactly one scratch-write guard")
+    start = source.index(marker)
+    begin = source.index("{", start) + 1
+    depth = 1
+    for end in range(begin, len(source)):
+        depth += (source[end] == "{") - (source[end] == "}")
+        if depth == 0:
+            inner = source[begin:end] if keep else ""
+            return source[:start] + inner + source[end + 1:]
+    raise AssertionError("unclosed scratch-write guard")
 
 
 def cpp_contract_source():
@@ -167,14 +189,49 @@ class SingleWorkContractTest(unittest.TestCase):
         self.assertEqual(cases[0], old[0])
         self.assertEqual(cases[1:], accuracy[1:3])
 
-    def test_original_vf_buffers_and_pipeline_helpers_unchanged(self):
+    def test_original_buffers_and_pipeline_helpers_unchanged(self):
         current, old = KERNEL.read_text(encoding="utf-8"), baseline(KERNEL)
-        for name in ("ComputeRecurrentGatedDeltaRuleVF", "Init", "SetGlobalTensors", "InitLocalBuffers",
-                     "CopyInQKV", "PrefetchState", "LoadPrefetchedState", "ExpMasked", "Compute",
+        for name in ("Init", "SetGlobalTensors", "InitLocalBuffers",
+                     "CopyInQKV", "PrefetchState", "LoadPrefetchedState", "ExpMasked",
                      "CopyOutAttn", "CopyOutState", "CopyInGamaBeta", "ProcessHead", "IsCurrentBlock"):
             with self.subTest(name=name):
                 self.assertEqual(body(current, name), body(old, name))
         self.assertEqual(body(current, "ProcessGeneral"), body(old, "Process"))
+
+    def test_only_second_pass_scratch_stores_are_optional(self):
+        current, old = KERNEL.read_text(encoding="utf-8"), baseline(KERNEL, SCRATCH_BASE)
+        self.assertIn("bool writeUpdatedScratch = true>", current)
+        vf = body(current, "ComputeRecurrentGatedDeltaRuleVF")
+        parent_vf = body(old, "ComputeRecurrentGatedDeltaRuleVF")
+        # The full-write version must retain every original operation.
+        self.assertEqual(normalize_cpp(resolve_scratch_guard(vf, True)), normalize_cpp(parent_vf))
+        update = "Add(state1, state1, update1, fullFp32Mask);"
+        output = "RegTensor<float> out0;"
+        tail_begin = parent_vf.index(update) + len(update)
+        tail_end = parent_vf.index(output, tail_begin)
+        expected = parent_vf[:tail_begin] + parent_vf[tail_end:]
+        # The no-write version must differ only in that exact tail store block.
+        # In particular, first-pass gated scratch and both GM outputs stay intact.
+        self.assertEqual(normalize_cpp(resolve_scratch_guard(vf, False)), normalize_cpp(expected))
+        self.assertLess(vf.index(update), vf.index("if constexpr (writeUpdatedScratch)"))
+        self.assertLess(vf.index("if constexpr (writeUpdatedScratch)"), vf.index(output))
+
+    def test_scratch_policy_is_limited_to_existing_single_work_path(self):
+        current, parent = KERNEL.read_text(encoding="utf-8"), baseline(KERNEL, SCRATCH_BASE)
+        compute = body(current, "Compute")
+        choices = re.findall(r"ComputeRecurrentGatedDeltaRuleVF<stateType, outType, "
+                             r"(true|false), (true|false), !singleWork>", compute)
+        self.assertCountEqual(choices, [("true", "true"), ("true", "false"),
+                                       ("false", "true"), ("false", "false")])
+        self.assertEqual(compute.replace(", !singleWork>", ">"), body(parent, "Compute"))
+        self.assertEqual(body(current, "ProcessSingleWork"), body(parent, "ProcessSingleWork"))
+        for relative in ("op_host/recurrent_gated_delta_rule_single_work.h",
+                         "op_host/recurrent_gated_delta_rule_tiling.cpp",
+                         "op_kernel/recurrent_gated_delta_rule_struct.h",
+                         "op_kernel/recurrent_gated_delta_rule.cpp"):
+            path = OP / relative
+            with self.subTest(path=relative):
+                self.assertEqual(path.read_text(encoding="utf-8"), baseline(path, SCRATCH_BASE))
 
     def test_tiling_layout_and_public_interfaces_unchanged(self):
         path = OP / "op_kernel/recurrent_gated_delta_rule_struct.h"

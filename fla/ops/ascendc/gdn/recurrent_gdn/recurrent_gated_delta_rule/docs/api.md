@@ -14,3 +14,6 @@ prefix=1、length=0 的合法空工作保持无 state 写入。state index 仍�
 state block stride 和 tensor view offset 继续沿原调用链处理。
 
 其它 dtype、gate、accepted-token、shape、分片和 SoC 使用原通用路径。没有新增 profiling 输入或符号。
+
+本轮尾部 scratch 实验沿用上述选择条件，仅省去专用 VF 内无后续消费者的 updated FP32 UB 写回。
+公开 stateRef 的 GM 写回仍执行；通用路径继续保存逐 token 递推所需的 FP32 scratch。

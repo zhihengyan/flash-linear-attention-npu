@@ -53,7 +53,7 @@ struct RGDRInitParams {
     GM_ADDR finalState;
 };
 
-template <typename stateType, typename outType, bool hasGama, bool hasGamaK>
+template <typename stateType, typename outType, bool hasGama, bool hasGamaK, bool writeUpdatedScratch = true>
 __simd_vf__ inline void ComputeRecurrentGatedDeltaRuleVF(
     __ubuf__ float *state, __ubuf__ float *key, __ubuf__ float *query, __ubuf__ float *value,
     __ubuf__ float *gamaK, __ubuf__ stateType *stateOut, __ubuf__ outType *attnOut,
@@ -153,11 +153,14 @@ __simd_vf__ inline void ComputeRecurrentGatedDeltaRuleVF(
         Mul(update1, delta, key1, fullFp32Mask);
         Add(state0, state0, update0, fullFp32Mask);
         Add(state1, state1, update1, fullFp32Mask);
-        if constexpr (std::is_same<stateType, float32_t>()) {
-            DataCopy(state + rowOffset, state0, fullFp32Mask);
-            DataCopy(state + rowOffset + FP32_PER_REG, state1, fullFp32Mask);
-        } else {
-            DataCopy<float, StoreDist::DIST_INTLV_B32>(state + rowOffset, state0, state1, fullFp32Mask);
+        if constexpr (writeUpdatedScratch) {
+            // A following token consumes this update; the one-token path has no consumer.
+            if constexpr (std::is_same<stateType, float32_t>()) {
+                DataCopy(state + rowOffset, state0, fullFp32Mask);
+                DataCopy(state + rowOffset + FP32_PER_REG, state1, fullFp32Mask);
+            } else {
+                DataCopy<float, StoreDist::DIST_INTLV_B32>(state + rowOffset, state0, state1, fullFp32Mask);
+            }
         }
 
         RegTensor<float> out0;
@@ -496,23 +499,23 @@ private:
         __ubuf__ float *attnTmpAddr = reinterpret_cast<__ubuf__ float *>(attnInUb.GetPhyAddr());
         if (hasGama_) {
             if (hasGamaK_) {
-                ComputeRecurrentGatedDeltaRuleVF<stateType, outType, true, true>(
+                ComputeRecurrentGatedDeltaRuleVF<stateType, outType, true, true, !singleWork>(
                     stateAddr, keyAddr, queryAddr, valueAddr, gamaKAddr, stateOutAddr, attnOutAddr,
                     attnTmpAddr, static_cast<uint16_t>(curSingleV), static_cast<uint16_t>(alignK_),
                     gama_, beta_);
             } else {
-                ComputeRecurrentGatedDeltaRuleVF<stateType, outType, true, false>(
+                ComputeRecurrentGatedDeltaRuleVF<stateType, outType, true, false, !singleWork>(
                     stateAddr, keyAddr, queryAddr, valueAddr, gamaKAddr, stateOutAddr, attnOutAddr,
                     attnTmpAddr, static_cast<uint16_t>(curSingleV), static_cast<uint16_t>(alignK_),
                     gama_, beta_);
             }
         } else if (hasGamaK_) {
-            ComputeRecurrentGatedDeltaRuleVF<stateType, outType, false, true>(
+            ComputeRecurrentGatedDeltaRuleVF<stateType, outType, false, true, !singleWork>(
                 stateAddr, keyAddr, queryAddr, valueAddr, gamaKAddr, stateOutAddr, attnOutAddr,
                 attnTmpAddr, static_cast<uint16_t>(curSingleV), static_cast<uint16_t>(alignK_),
                 gama_, beta_);
         } else {
-            ComputeRecurrentGatedDeltaRuleVF<stateType, outType, false, false>(
+            ComputeRecurrentGatedDeltaRuleVF<stateType, outType, false, false, !singleWork>(
                 stateAddr, keyAddr, queryAddr, valueAddr, gamaKAddr, stateOutAddr, attnOutAddr,
                 attnTmpAddr, static_cast<uint16_t>(curSingleV), static_cast<uint16_t>(alignK_),
                 gama_, beta_);
