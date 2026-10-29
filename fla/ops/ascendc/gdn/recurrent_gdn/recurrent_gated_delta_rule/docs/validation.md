@@ -1,10 +1,39 @@
-# A5 单 work 实验开发记录
+# A5 单 work 与尾部 scratch 实验开发记录
 
-基线 main `c9e2f1db`，目标分支 `codex/gdn-a5-single-work-fastpath`。
+本轮直接基线 `c36e18ce`（`codex/gdn-a5-single-work-fastpath`），
+实验分支 `codex/gdn-a5-tail-scratch-elision`；历史 main 为 `c9e2f1db`。
 用户授权仅编码和本地静态检查；A5/CANN 在内网，本地无 CANN、torch 或 C++ 编译器，不请求重新提供 SSH。
 本文件保留到内网验收完成，不能把源码检查记为 NPU 精度或性能通过。
 
-## 当前实验
+## 当前实验：仅省去单任务尾部 FP32 scratch 写回
+
+用户明确授权以当前正确版本新建分支进行方向 1 编码。本轮只通过 VF 内部编译期参数
+`writeUpdatedScratch` 控制第二遍 updated state 的 UB 写回；Compute 传 `!singleWork`。
+原第一遍 gated state 写回、两遍循环、全部数值运算和 GM 输出、UB/queue/workspace、V_S 同步、
+host/key/入口/接口保持。JSON、生成器、CPU 标杆、executor 和 case 188 均不修改。
+
+| 模型 case | 轮次 / 状态 | 触发证据或预计关键路径 | 结构决策或候选与唯一主要变量 | 精度结果 | 性能前后值 | 瓶颈变化 | 依据或结论 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| A5，B=T=Nk=Nv=1，K=V=128，BF16 state，g-only；perf 0 | c36e18ce 基线 | 每个 work 在 VF 第二遍仍写 updated scratch，后续无读取 | 已保留单 work + V_S | 用户报告精度全过 | Task Duration 两轮 4.51/4.45 μs，合并约 4.48 μs | 无同轮 Store/PMU | 本轮直接对照，不能用旧问题版本替代 |
+| 同上 | 本轮 / 待实测 | 去掉无消费者的 UB Store，是否在关键路径尚待实测 | SINGLE_WORK=1 的 writeUpdatedScratch=false，其余 true | 本机仅静态检查，设备待测 | 待与 c36e18ce 交错比较 | 理论少写 UB 64 KiB/work；实际发射/重叠待核对 | 未宣称性能收益 |
+
+静态验证计划：解析 guarded store 的范围；true 分支应与原 VF 逐 token 一致，false 分支应仅少
+第二遍 Store；Compute 的四种 gate dispatch 均由 `!singleWork` 控制；ProcessSingleWork 与 c36e18ce
+一致；公开接口、host/key、测试资产、缓冲和同步保持。设备验证沿用下文单算子构建/安装/产物校验，
+先 case 0 精度，再回归通用多 token case 2、FP32、gk、accepted、layout 及原有矩阵和 MSS/确定性。
+原精度标准和值域不变；用户此前要求不处理的 case 188 保持原样。
+本轮每次比较均重建、安装并校验对应分支产物，先精度后性能，每轮保持相同 20 个样本、预热与环境。
+本机没有 CANN/NPU，不将父分支的设备验证结论转记为本实验通过。
+
+本轮本地检查：`python -B tests/atk/recurrent_gated_delta_rule/scripts/test_single_work_fastpath.py -v`
+共 8 项，7 项通过，1 项因无 C++ 编译器跳过。源码展开确认 true 与原 VF 相同、false 仅删除末尾
+scratch Store；Compute/host/入口/控制路径和原输入资产的范围检查通过。此结果不能代替 CANN 编译、
+硬件访存检查、精度或性能；本轮 NPU 验证仍未执行。
+另外验证了源码防回归检查能拒绝五种错误变体：实验未生效、general 错误省略写回、
+错误删除第一遍 scratch、错误删除 GM state 输出、丢失 V_S Wait。Python AST、文档链接、
+生产代码/测试输入修改范围和 `git diff --check` 均通过；这些均为静态证据。
+
+## 已保留基线 c36e18ce 的实现与验证记录
 
 设计见 [design.md](design.md)，接口边界见 [api.md](api.md)。改变单 work 标量控制、元数据复用，
 并在 UB 标量读取前显式完成前置 Vector 操作。

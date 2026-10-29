@@ -69,7 +69,7 @@ stateStride2=128、g-only、无 accepted-token 输入选择 `SINGLE_WORK=1`。
 
 | 模板参数 `(D_T_STATE,SINGLE_WORK)` | 精度 case | perf case | MSS / determinism case | 设备选择证据 |
 | --- | ---: | ---: | ---: | --- |
-| `(BF16,1)`，A5 single | 0 | 0 | 0 | 用户回传加 V_S 后 case 0 成功；数值 key 日志待归档 |
+| `(BF16,1)`，A5 single | 0 | 0 | 0 | 父版本 c36e18ce 的 case 0 成功；本轮 scratch 实验待测 |
 | `(FP32,0)`，general | 1 | — | 1 | 内网待采集 |
 | `(BF16,0)`，general | 2 | — | 2 | 内网待采集 |
 
@@ -79,12 +79,20 @@ stateStride2=128、g-only、无 accepted-token 输入选择 `SINGLE_WORK=1`。
 host DEBUG 日志新增 `stateDtypeKey / singleWork / tilingKey`，与实际 kernel 选择及
 blockDim 对照；不能只根据 case 的 shape 认定命中。
 
-2026-10-29，专用路径在 `LoadPrefetchedState` 后、读取 UB 中的 g/beta 前增加一对
+已保留基线 `c36e18ce`：2026-10-29，专用路径在 `LoadPrefetchedState` 后、读取 UB 中的 g/beta 前增加一对
 `V_S` Set/Wait。用户回传 GM 初始化开启时 case 0 成功，随后报告精度测试全过；
 具体执行范围和报告待归档，MSS/确定性待验证。修复后端到端为 18.4–18.5 μs，
 对照 main 18.7–18.8 μs。修复版 RGDR 两轮各 20 个样本，均值分别为 4.51/4.45 μs，
 合并约 4.48 μs，相对历史 main 4.87 μs 约改善 8.0%；同轮 main 的 kernel 统计待补。
 修复前的性能结果不能作为本版本的收益结论。
+
+### 当前实验：尾部 FP32 scratch 免写回
+
+分支 `codex/gdn-a5-tail-scratch-elision` 从 c36e18ce 创建，只让 SINGLE_WORK=1 的 VF 使用
+`writeUpdatedScratch=false`，省去第二遍更新后的 64 KiB UB 写回。第一遍 gated state、
+两遍循环、V_S、GM state/out 和缓冲配置保留；general 的多 token 递推仍写 updated scratch。
+该开关不改变 host/key、公开接口或测试输入，精度/性能/MSS JSON 均与父版本一致，case 188 不改动。
+本轮性能直接与 c36e18ce 的相同 perf case 0 交错比较，不将父版本的通过记录当作本实验结果。
 
 无需 NPU 的本地回归入口如下；没有 C++ 编译器时会明确跳过 C++ 控制语义测试，
 其余源码对照不能代替 CANN 编译、模板选择、NPU 精度或同步检查：
@@ -93,7 +101,10 @@ blockDim 对照；不能只根据 case 的 shape 认定命中。
 python -B tests/atk/recurrent_gated_delta_rule/scripts/test_single_work_fastpath.py -v
 ```
 
-该脚本核对原 VF/缓冲/搬运/同步函数和公开接口与 main 基线一致；有 C++17 编译器时，
+该脚本核对原缓冲/搬运/同步函数和公开接口与 main 基线一致，并将 VF 的 scratch guard 作源码展开：
+true 应与 c36e18ce 原 VF 一致，false 应仅删去第二遍尾部 Store；四个 gate dispatch 均由
+`!singleWork` 控制，ProcessSingleWork 与父版本一致。该检查不是 CANN 编译或设备数值验证。
+有 C++17 编译器时，
 还会执行生产代码中的选择谓词和单 work 控制函数，检查空工作、不合法 prefix/length、
 非零 state index 和 padded block stride 的地址及调用顺序。专用路径的新增 V_S 检查
 覆盖 Set/Wait 配对、标量读取前完成 Wait，以及空工作不发射事件；录制 API 顺序不等于验证硬件同步。
