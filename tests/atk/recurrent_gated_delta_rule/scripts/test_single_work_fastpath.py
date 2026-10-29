@@ -51,14 +51,38 @@ struct Input {
     unsigned reads = 0;
     int32_t GetValue(unsigned i) { ++reads; return values.at(i); }
 };
-struct Scalar { float GetValue(unsigned i) { assert(i == 0); return .25f; } };
+// Recording shims check issue order only; they do not model hardware completion.
+enum class HardEvent { V_S };
+using TEventID = unsigned;
+struct Scalar {
+    const bool *vectorReady;
+    float GetValue(unsigned i) { assert(i == 0 && *vectorReady); return .25f; }
+};
+struct Pipe {
+    std::vector<int> *calls;
+    TEventID FetchEventID(HardEvent event) {
+        assert(event == HardEvent::V_S); calls->push_back(8); return 3;
+    }
+};
 struct Harness {
     Input cuSeqlensGm_, ssmStateIndicesGm_;
-    Scalar gamaInUb, betaInUb;
+    std::vector<int> calls;
+    bool vectorReady = false, vectorPublished = false;
+    Scalar gamaInUb{&vectorReady}, betaInUb{&vectorReady};
+    Pipe pipe{&calls};
     uint64_t stateStride0_;
     float gama_ = 0, beta_ = 0;
-    std::vector<int> calls;
     uint64_t inputOffset = 0, outputOffset = 0;
+    Pipe *GetTPipePtr() { return &pipe; }
+    template <HardEvent event> void SetFlag(TEventID id) {
+        static_assert(event == HardEvent::V_S);
+        assert(id == 3 && !vectorPublished); vectorPublished = true; calls.push_back(9);
+    }
+    template <HardEvent event> void WaitFlag(TEventID id) {
+        static_assert(event == HardEvent::V_S);
+        assert(id == 3 && vectorPublished); vectorPublished = false;
+        vectorReady = true; calls.push_back(10);
+    }
     void CopyInGamaBeta(int a, int b) { assert(a == 0 && b == 1); calls.push_back(1); }
     void CopyInQKV(int a, int b, int c) { assert(a == 0 && b == 0 && c == 1); calls.push_back(2); }
     void PrefetchState(uint64_t offset, int v) { assert(v == 128); inputOffset = offset; calls.push_back(3); }
@@ -110,13 +134,15 @@ int main() {
             bool active = length > 0 && length <= 8 && prefix >= 0 && prefix <= 1 && prefix + length <= 1;
             assert(h.cuSeqlensGm_.reads == 2);
             if (active) {
-                assert((h.calls == std::vector<int>{1,2,3,4,5,6,7}));
+                assert((h.calls == std::vector<int>{1,2,3,4,8,9,10,5,6,7}));
+                assert(h.vectorReady && !h.vectorPublished);
                 assert(h.ssmStateIndicesGm_.reads == 1);
                 assert(h.inputOffset == stride * static_cast<uint64_t>(index));
                 assert(h.outputOffset == h.inputOffset);
                 assert(h.gama_ == .25f && h.beta_ == .25f);
             } else {
                 assert(h.calls.empty() && h.ssmStateIndicesGm_.reads == 0);
+                assert(!h.vectorReady && !h.vectorPublished);
             }
         }
     }
@@ -174,11 +200,20 @@ class SingleWorkContractTest(unittest.TestCase):
         self.assertIn("SocVersion::ASCEND950", host)
         self.assertIn("GET_TPL_TILING_KEY(stateDtypeKey, singleWork)", host)
 
-    def test_no_loop_or_new_sync_in_specialized_control(self):
+    def test_specialized_control_pairs_sync_before_scalar_reads(self):
         source = body(KERNEL.read_text(encoding="utf-8"), "ProcessSingleWork")
-        self.assertNotRegex(source, r"\b(for|while|PipeBarrier|WaitFlag|SetFlag)\s*[<(]")
+        self.assertNotRegex(source, r"\b(for|while|PipeBarrier)\s*[<(]")
+        self.assertEqual(source.count("FetchEventID(HardEvent::V_S)"), 1)
+        self.assertEqual(re.findall(r"SetFlag<HardEvent::V_S>\((\w+)\)", source), ["vToS"])
+        self.assertEqual(re.findall(r"WaitFlag<HardEvent::V_S>\((\w+)\)", source), ["vToS"])
+        positions = [source.index(text) for text in (
+            "LoadPrefetchedState(128)", "FetchEventID(HardEvent::V_S)",
+            "SetFlag<HardEvent::V_S>(vToS)", "WaitFlag<HardEvent::V_S>(vToS)",
+            "gamaInUb.GetValue(0)", "betaInUb.GetValue(0)", "Compute(128, 0, 0)")]
+        self.assertEqual(positions, sorted(positions))
         self.assertEqual(source.count("ssmStateIndicesGm_.GetValue"), 1)
         self.assertLess(source.index("if (prefix"), source.index("ssmStateIndicesGm_.GetValue"))
+        self.assertLess(source.index("return;"), source.index("FetchEventID"))
         self.assertLess(source.index("Compute(128"), source.index("CopyOutAttn(0"))
         self.assertLess(source.index("CopyOutAttn(0"), source.index("CopyOutState(stateOffset"))
 

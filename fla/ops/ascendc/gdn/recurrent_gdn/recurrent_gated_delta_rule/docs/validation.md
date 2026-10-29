@@ -6,35 +6,79 @@
 
 ## 当前实验
 
-设计见 [design.md](design.md)，接口边界见 [api.md](api.md)。只改变单 work 标量控制和元数据复用。
+设计见 [design.md](design.md)，接口边界见 [api.md](api.md)。改变单 work 标量控制、元数据复用，
+并在 UB 标量读取前显式完成前置 Vector 操作。
 不引入 A/B 或 profiling 分支代码，不更改 public ABI、CPU 标杆、200 条 ATK 精度用例或精度标准。
 MSS / determinism 保留原 case 0，选取已有精度 case 1/2 补齐 FP32/general 与 BF16/general。
 
 | 项目 | 证据 / 状态 |
 | --- | --- |
 | main 参考 | 用户 main/B 交错实验 main 均值 4.89、4.85、4.87 μs，合并 4.87 μs |
-| 目标 | 相同原 case、环境、预热/采样方式下主 kernel 均值/中位数稳定下降，内网待测 |
+| 目标 | 相同原 case、环境、预热/采样方式下主 kernel 均值/中位数稳定下降；修复版两轮均值合并约 4.48 μs，相对历史 main 约改善 8.0%，同轮 main 待补 |
 | 模板选择 | 声明 BF16/general、FP32/general、BF16/single 三个组合，入口传参与 host key 参数一致；源码检查通过，设备实际选择待验证 |
-| VF/UB/同步 | 原 VF、InitLocalBuffers、Copy/Compute/ProcessHead/IsCurrentBlock 函数体及 general 调度与 main 相同，源码对照通过 |
+| VF/UB/同步 | 原 VF、InitLocalBuffers、Copy/Compute/ProcessHead/IsCurrentBlock 函数体及 general 调度与 main 相同；专用控制新增一对 V_S Set/Wait |
 | 公共接口与原输入 | 原 ACLNN 声明/实现、OpDef、tiling struct 字段、CPU 标杆、200 条精度 JSON、perf JSON 和生成器对照 main 通过 |
 | 本地脚本 | `test_single_work_fastpath.py -v`：6 项，5 通过，1 因无 C++ 编译器跳过 |
+| 同步源码防回归检查 | 能拒绝原无同步版本、遗漏 Wait、Wait 位于标量读取之后、模板尖括号缺失四种错误变体；仅为源码检查 |
 | 测试资产与文档 | Python AST、精度 200 / 性能 1 / MSS 3 条 JSON 与 case_spec 一致性、新增 Markdown 链接检查通过 |
 | C++ 选择/控制语义测试 | 脚本会编译生产选择头和提取的单 work 控制函数；本机未运行，不算已通过 |
 | 格式检查 | `git diff --check` 通过 |
-| 实际 CANN 编译 | 未执行 |
-| 原 ATK 200 条精度 | 未执行 |
+| 实际 CANN 编译 | 本机未执行；用户已编译加 V_S 的专用路径并回传 case 0 成功 |
+| ATK 精度 | 用户随后回传修复版精度测试全过；具体执行范围、seed 和完整报告待归档 |
 | 非连续/空工作/accepted/gk/FP32/A2A3 回归 | 未执行设备验证 |
-| 默认 case 性能与 PMU | 未执行，不宣称收益 |
+| 默认 case 性能与 PMU | 修复版用户回传 RGDR 均值 4.51/4.45 μs，每轮 20 样本，合并约 4.48 μs；端到端 18.4–18.5 μs，对照 main 18.7–18.8 μs；同轮 main kernel/PMU 待补 |
 
 采用仓库 CHUNK_DEPENDENT/V1 参考（来源 a14961e9dfe8c8264768d67fb447101873da4ecf），
 仅参考递推状态生命周期、tiling 模板与同步核对方法；本例没有 Cube 或跨核 workspace。
+
+## 2026-10-29：case 0 非有限输出与 V_S 修复
+
+固定原 case 0 和 seed=20260826，精度运行开启 `ATK_GM_INIT_MODE=on`，范围为 `[0,1)`。
+以下设备结果均为用户回传，本机没有运行设备测试：
+
+| 变体 | 结果 |
+| --- | --- |
+| 原专用路径 SINGLE_WORK=1 | out 的 128 个元素、stateRef 的 16384 个元素全部非有限 |
+| 当前分支临时强制 singleWork=false | case 0 执行成功 |
+| 恢复 SINGLE_WORK=1，在 LoadPrefetchedState 后、UB 标量读取前增加一对 V_S | case 0 执行成功 |
+
+本轮将用户验证成功的 event 取得与 Set/Wait 原样加入专用路径，不保留强制 general 的诊断修改。
+不改 JSON、生成器、executor、CPU 标杆或容差；case 188 按用户要求不处理。
+结果支持前置 Vector 完成时序相关问题，尚不能单独判定是 gama、beta 或 state 输入准备的哪项依赖，
+也不能据此宣称已经确认编译器缺陷。源码回归新增 Set/Wait 配对、发射位置及空工作提前退出检查；
+可选 C++ harness 仅记录 API 发射顺序，不模拟设备完成或数值正确性，本机因无编译器而跳过。
+
+用户后续回传：加 V_S 后精度测试全过，端到端耗时 18.4–18.5 μs，对照 main 的
+18.7–18.8 μs（按用户所述区间理解）。区间差约 0.2–0.4 μs，中点 18.75 → 18.45 μs，
+约改善 1.6%。这属于用户报告的端到端结果；不能替代修复版 RGDR Task Duration 或据此计算 V_S 的独占耗时。
+
+用户继续提供两轮 RGDR Task Duration，并明确两轮都来自加 V_S 的修复版：
+
+| 轮次 | 样本数 | 均值 / 中位数（μs） | 整体标准差（μs） | P90 / P99（μs） |
+| --- | ---: | ---: | ---: | ---: |
+| 1 | 20 | 4.51 / 4.49 | 0.14 | 4.64 / 4.85 |
+| 2 | 20 | 4.45 / 4.39 | 0.17 | 4.63 / 4.87 |
+
+由相同样本数的轮均值汇总，修复版均值约 4.48 μs；相对历史 main 的 4.87 μs，
+减少约 0.39 μs（8.0%）。未提供同轮 main，所以该数值目前是历史基线比较。
+修复前问题版本均值 4.46 μs 与修复版相差约 0.02 μs，两轮修复版均值本身相差 0.06 μs，
+现有汇总不足以证明 V_S 导致明显 kernel 退化，更不能将 0.02 μs 认作 V_S 的独占成本。
+kernel 节省的 0.39 μs 在约 18.75 μs 的端到端尺度上粗略对应 2.1%，与端到端约 1–2% 的
+改善量级一致；端到端先前变化的原因仍需同轮完整 task/调用链数据分析。
+
+余下验证：归档修复版精度执行范围/报告，完成 MSS/确定性及单任务边界，并补充同轮
+main/修复版的 RGDR Task Duration 交错统计。修复前约 8.4% 的 kernel 改善不能作为修复后的收益。
+当前 V_S 位于 state Cast 之后，会等待该位置之前的 Vector 完成；将其前移到 gate/beta 之后
+会改变输入搬运与 Vector 的重叠，并可能失去对 state 准备的保护，仅是待验证候选，未改动实现。
+没有设备证据时不删除已使精度恢复的同步，也不将前移视为必然加速。
 
 ## 实现追溯与静态检查边界
 
 | 设计项 | 实现位置 | 本地证据 / 剩余验证 |
 | --- | --- | --- |
 | A5 与 shape/gate/stride 条件 | `op_host/recurrent_gated_delta_rule_single_work.h`、tiling `DoLibApiTiling` | 三组合、入口参数对照通过；选择谓词的 C++ 执行和真实 tiling 日志待测 |
-| 单 work、元数据复用 | arch35 `ProcessSingleWork` | 不含任务循环和新同步；prefix/length 先检查，state index 只读一次；行为测试待编译运行 |
+| 单 work、元数据复用 | arch35 `ProcessSingleWork` | 不含任务循环；prefix/length 先检查，state index 只读一次；行为测试待编译运行 |
+| 前置 Vector → Scalar 完成依赖 | arch35 `ProcessSingleWork` 的 V_S Fetch/Set/Wait | 静态配对和顺序检查通过；用户报告精度全过、修复版均值约 4.48 μs；完整报告及同轮 main 待归档 |
 | 回退调度 | arch35 `ProcessGeneral` | 函数体与 main `Process` 一致 |
 | Stage 数学、搬运、队列和释放 | 原 VF、InitLocalBuffers、Copy/Compute | 函数体一致；生成机器码、自动同步及 NPU 精度待测 |
 | 公开 ABI / tiling 数据 | 原 OpDef、aclnn、packed struct | 源码与 main 一致；新私有模板参数需重建 host 与 kernel，不能只替换旧 `.o` |

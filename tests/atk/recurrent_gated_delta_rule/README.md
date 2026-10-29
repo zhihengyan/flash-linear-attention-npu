@@ -69,7 +69,7 @@ stateStride2=128、g-only、无 accepted-token 输入选择 `SINGLE_WORK=1`。
 
 | 模板参数 `(D_T_STATE,SINGLE_WORK)` | 精度 case | perf case | MSS / determinism case | 设备选择证据 |
 | --- | ---: | ---: | ---: | --- |
-| `(BF16,1)`，A5 single | 0 | 0 | 0 | 内网待采集 |
+| `(BF16,1)`，A5 single | 0 | 0 | 0 | 用户回传加 V_S 后 case 0 成功；数值 key 日志待归档 |
 | `(FP32,0)`，general | 1 | — | 1 | 内网待采集 |
 | `(BF16,0)`，general | 2 | — | 2 | 内网待采集 |
 
@@ -78,6 +78,13 @@ stateStride2=128、g-only、无 accepted-token 输入选择 `SINGLE_WORK=1`。
 数值 TilingKey 应以当前 CANN 生成结果为准，不能直接沿用 main 的历史数值。
 host DEBUG 日志新增 `stateDtypeKey / singleWork / tilingKey`，与实际 kernel 选择及
 blockDim 对照；不能只根据 case 的 shape 认定命中。
+
+2026-10-29，专用路径在 `LoadPrefetchedState` 后、读取 UB 中的 g/beta 前增加一对
+`V_S` Set/Wait。用户回传 GM 初始化开启时 case 0 成功，随后报告精度测试全过；
+具体执行范围和报告待归档，MSS/确定性待验证。修复后端到端为 18.4–18.5 μs，
+对照 main 18.7–18.8 μs。修复版 RGDR 两轮各 20 个样本，均值分别为 4.51/4.45 μs，
+合并约 4.48 μs，相对历史 main 4.87 μs 约改善 8.0%；同轮 main 的 kernel 统计待补。
+修复前的性能结果不能作为本版本的收益结论。
 
 无需 NPU 的本地回归入口如下；没有 C++ 编译器时会明确跳过 C++ 控制语义测试，
 其余源码对照不能代替 CANN 编译、模板选择、NPU 精度或同步检查：
@@ -88,7 +95,8 @@ python -B tests/atk/recurrent_gated_delta_rule/scripts/test_single_work_fastpath
 
 该脚本核对原 VF/缓冲/搬运/同步函数和公开接口与 main 基线一致；有 C++17 编译器时，
 还会执行生产代码中的选择谓词和单 work 控制函数，检查空工作、不合法 prefix/length、
-非零 state index 和 padded block stride 的地址及调用顺序。
+非零 state index 和 padded block stride 的地址及调用顺序。专用路径的新增 V_S 检查
+覆盖 Set/Wait 配对、标量读取前完成 Wait，以及空工作不发射事件；录制 API 顺序不等于验证硬件同步。
 内网构建、安装、产物校验和 A5 验证步骤见
 [开发记录](../../../fla/ops/ascendc/gdn/recurrent_gdn/recurrent_gated_delta_rule/docs/validation.md)。
 
