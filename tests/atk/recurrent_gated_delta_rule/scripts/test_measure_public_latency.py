@@ -4,6 +4,8 @@ import csv
 import json
 from pathlib import Path
 import tempfile
+import subprocess
+import sys
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
@@ -102,28 +104,35 @@ class TimingControlTest(unittest.TestCase):
                 return result
 
         class Capture:
+            step_number = 0
+
             def __enter__(self):
-                self_outer.assertEqual(len(clones), 3)
-                active[0] = True
+                self_outer.assertEqual(len(clones), 4)
+                active[0] = False  # First step is profiler warmup.
                 return self
 
             def __exit__(self, *args):
                 active[0] = False
 
             def step(self):
-                self_outer.assertTrue(active[0])
+                self.step_number += 1
+                active[0] = 1 <= self.step_number <= 3
 
         self_outer = self
         def create_profile(**kwargs):
             self.assertFalse(kwargs["experimental_config"]["data_simplification"])
+            self.assertEqual(kwargs["experimental_config"]["aic_metrics"], "none")
+            self.assertEqual(kwargs["schedule"], {"wait": 0, "warmup": 1, "active": 3, "repeat": 1})
             return Capture()
         profiler = SimpleNamespace(
             ProfilerActivity=SimpleNamespace(CPU="cpu", NPU="npu"),
+            AiCMetrics=SimpleNamespace(AiCoreNone="none"), schedule=lambda **kw: kw,
             ProfilerLevel=SimpleNamespace(Level0=0), _ExperimentalConfig=lambda **kw: kw,
             tensorboard_trace_handler=lambda path: path, profile=create_profile)
         torch = SimpleNamespace(profiler=SimpleNamespace(record_function=lambda name: nullcontext()))
+        recorded = []
         def call(state):
-            self.assertTrue(active[0])
+            recorded.append(active[0])
             self.assertIn(state, clones)
             submitted.append(state)
             return state
@@ -132,7 +141,8 @@ class TimingControlTest(unittest.TestCase):
                                                   lambda: None, 3, Path("unused-profile-path"))
         self.assertEqual(states, clones)
         self.assertEqual(outputs, submitted)
-        self.assertEqual(len({id(s) for s in submitted}), 3)
+        self.assertEqual(len({id(s) for s in submitted}), 4)
+        self.assertEqual(recorded, [False, True, True, True])
 
 
 class EvidenceTest(unittest.TestCase):
@@ -203,6 +213,71 @@ class EvidenceTest(unittest.TestCase):
                 bench.summarize(values)
         self.assertEqual(bench.summarize([0])["mean_us"], 0)
         self.assertEqual(bench.summarize([1, 2, 3])["median_us"], 2)
+
+    def test_kernel_details_mapping_and_op_summary_are_not_pooled(self):
+        with tempfile.TemporaryDirectory(dir=ROOT, prefix=".rgdr-latency-test-") as temp:
+            root = Path(temp).resolve()
+            root.relative_to(ROOT)
+            for name, headers in (("op_summary.csv", ["OP Type", "Task Duration(us)", "Task Wait Time(us)"]),
+                                  ("kernel_details.csv", ["Type", "Duration(us)", "Wait Time(us)"])):
+                with (root / name).open("w", newline="", encoding="utf-8-sig") as file:
+                    writer = csv.writer(file)
+                    writer.writerow(headers)
+                    writer.writerows([("RecurrentGatedDeltaRule", 4.2, 1000), ("RecurrentGatedDeltaRule", 4.4, 2000)])
+            evidence = bench.summarize_profile(root, 2)
+            self.assertEqual(len(evidence), 2)
+            self.assertEqual({e["duration_column"] for e in evidence}, {"Duration(us)", "Task Duration(us)"})
+            for entry in evidence:
+                self.assertEqual(entry["tasks"]["RecurrentGatedDeltaRule"]["count"], 2)
+                self.assertAlmostEqual(entry["tasks"]["RecurrentGatedDeltaRule"]["mean_us"], 4.3)
+            # A partial raw export cannot be counted as a complete run or pooled
+            # with another view, but does not hide a complete kernel_details view.
+            (root / "op_summary.csv").write_text("OP Type,Task Duration(us)\nRecurrentGatedDeltaRule,4.2\n")
+            inventory = bench.profile_inventory(root)
+            self.assertEqual(len(bench.summarize_profile(root, 2, inventory)), 1)
+            self.assertEqual({e["status"] for e in inventory["csv_files"]}, {"accepted", "unexpected_rgdr_count"})
+
+    def test_unsupported_units_and_invalid_durations_retain_inventory(self):
+        with tempfile.TemporaryDirectory(dir=ROOT, prefix=".rgdr-latency-test-") as temp:
+            root = Path(temp).resolve()
+            root.relative_to(ROOT)
+            table = root / "kernel_details.csv"
+            table.write_text("Type,Duration(ms)\nRecurrentGatedDeltaRule,0.0042\n")
+            with self.assertRaises(RuntimeError):
+                bench.collect_profile_summary(root, 1, root)
+            inventory = json.loads((root / "profile_inventory.json").read_text(encoding="utf-8"))
+            self.assertEqual(inventory["csv_files"][0]["status"], "unsupported_columns_or_units")
+            for value in ("nan", "inf", "-1", ""):
+                table.write_text(f"Type,Duration(us)\nRecurrentGatedDeltaRule,{value}\n")
+                with self.subTest(value=value), self.assertRaises(RuntimeError):
+                    bench.collect_profile_summary(root, 1, root)
+                inventory = json.loads((root / "profile_inventory.json").read_text(encoding="utf-8"))
+                self.assertEqual(inventory["csv_files"][0]["status"], "invalid_duration")
+
+    def test_offline_cli_preserves_previous_run_and_requires_no_online_environment(self):
+        with tempfile.TemporaryDirectory(dir=ROOT, prefix=".rgdr-latency-test-") as temp:
+            root = Path(temp).resolve()
+            root.relative_to(ROOT)
+            previous = root / "result.json"
+            previous.write_text('{"status":"failed","statistics":{"host_submit_us":{"mean_us":12.4}}}')
+            original_bytes = previous.read_bytes()
+            profile = root / "profile"
+            profile.mkdir()
+            table = profile / "kernel_details.csv"
+            table.write_text("Type,Duration(us)\nRecurrentGatedDeltaRule,4.2\nRecurrentGatedDeltaRule,4.4\n")
+            parsed = root / "parsed"
+            # No --run-package / --repo-root, and this also runs on Windows
+            # without torch/NPU or a SIGALRM implementation.
+            result = subprocess.run([sys.executable, "-B", str(Path(bench.__file__).resolve()),
+                                     "--parse-profile", str(profile), "--profile-samples", "2",
+                                     "--output", str(parsed)], capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("profile:", result.stdout)
+            report = json.loads((parsed / "result.json").read_text(encoding="utf-8"))
+            self.assertEqual(report["status"], "complete")
+            self.assertEqual(report["mode"], "offline_profile_parse")
+            self.assertEqual(previous.read_bytes(), original_bytes)
+            self.assertTrue((parsed / "profile_inventory.json").is_file())
 
 
 if __name__ == "__main__":

@@ -160,15 +160,53 @@ Event 的 `elapsed_time` 单位为 ms，脚本转为 us。接口依据见
 和 [使用示例](https://gitee.com/ascend/mstt/tree/master/profiler) 接入；本机尚无 NPU 运行验证。
 Event、host 墙钟和 Task Duration 不互相替代；同步后逐次调用是串行诊断，不是模型吞吐测试。
 
-`--profile` 额外执行默认 20 次调用，先在 profiler 外预分配相同初值的独立 state，
+`--profile` 额外执行 1 次 profiler warmup 和默认 20 次 active 调用，
+使用有限的 schedule（wait=0、warmup=1、active=profile-samples、repeat=1），
+最后一次 step 完成 RECORD_AND_SAVE 后退出，避免在默认 RECORD 状态停止的警告。
+Level0 显式设置 `AiCMetrics.AiCoreNone`，不请求硬件流水指标。先在 profiler 外预分配相同初值的独立 state，
 采集窗口内不做 state reset、Neg 或有限性检查，保留其它真实调用任务。设置 `data_simplification=False`
 保留 CANN 导出的 op_summary，避免精简阶段删除原始任务表。同步/CPU marker 会扰动间隙，
-profile 墙钟与无 profiler 的统计分开。每份 op_summary 独立校验目标 task 数，避免重复 CSV 混算。
+profile 墙钟与无 profiler 的统计分开。兼容原 `op_summary*.csv`（OP Type / Task Duration(us)）
+和 torch_npu 2.10 的 `kernel_details.csv`（Type / Duration(us)）。后者由官方逐列映射自前者，
+不是用 Event 或 wait 时间替代 Task Duration。参考
+[官方列名映射](https://github.com/Ascend/pytorch/blob/v2.10.0/torch_npu/profiler/analysis/prof_common_func/_csv_headers.py)。
+每份任务表独立校验目标 task 数；不拼接 partial 文件、不累加重复导出视图。至少有一份完整且计数
+正确的任务表才通过；partial/unsupported 表的原因保留在 `profile_inventory.json`。
 每次 NPU 测量有 60 秒 watchdog（含准备/下发/同步）；超时会终止进程，留下已有结果。
 
 脚本打印 `output=...`。默认结果位于本算子 `runs/public_latency/<UTC时间戳>/`，包含 `result.json`、
-`artifact_check.log` 和可选 `profile/`。记录 commit/dirty、设备/stream、实际包/库/目标 `.o` 哈希、
+`artifact_check.log` 和可选 `profile/`、`profile_inventory.json`。记录 commit/dirty、设备/stream、实际包/库/目标 `.o` 哈希、
 case_spec 和原始计时样本。已有输出目录会拒绝覆盖；失败状态不会记为成功。
+
+### 已完成计时、汇总 profile 失败时的恢复
+
+若终端已打印全部 host/Event 统计，但最后报 `no RGDR op_summary ...`，先重解析现有数据，
+无需重建/安装 `.run`、无需 NPU，也不重复 100 次计时。先更新本诊断分支中的脚本，再在仓根执行：
+
+```bash
+python tests/atk/recurrent_gated_delta_rule/scripts/measure_public_latency.py \
+  --parse-profile tests/atk/recurrent_gated_delta_rule/runs/public_latency/20261102T092552_902541Z/profile \
+  --profile-samples 20
+```
+
+把路径替换为对应运行目录即可。解析结果写入该路径下新建的 `reparse/<UTC时间戳>/`，
+包括 `result.json` 和 `profile_inventory.json`，不会改写原运行的 result.json/统计。
+成功时回传 `profile:` 行。若仍失败，回传新 `profile_inventory.json` 的文本，
+其中包含实际 CSV 文件名、表头、目标任务数和拒绝原因；不能以缺失或部分数据宣称 profile 成功。
+
+只有旧采集缺少完整任务表时，才重新采集 profile；不必重复 host/Event 计时：
+
+```bash
+python tests/atk/recurrent_gated_delta_rule/scripts/measure_public_latency.py \
+  --device 1 --label scratch --run-package build_out/fla_npu_linux-x86_64.run \
+  --profile-only --profile-samples 20
+```
+
+`--profile-only` 仍核对安装产物、生成原输入并预热，不产生新的 host/Event 样本。
+在线模式在计时已完成而 profile 失败时标记 `timings_complete_profile_failed`，保留原样本和统计。
+2026-11-02 用户回传 scratch 的 host_submit 中位数 11.738 us、call_and_sync 中位数 23.711 us，
+均值分别 12.41849/26.14316 us，存在长尾；Event 中位数 16.881 us。它们是有效的未加 profiler
+诊断样本，不能将 Event 时间称作 RGDR kernel 时间，也不能在缺少同协议 main 数据时宣称提速。
 
 ### 第二步：用同一脚本测 main
 
@@ -197,7 +235,8 @@ python /tmp/rgdr_measure_public_latency.py --repo-root "$PWD" \
 python -B tests/atk/recurrent_gated_delta_rule/scripts/test_measure_public_latency.py -v
 ```
 
-2026-11-02 本地控制/证据检查 9 项通过；原 scratch 检查 7 项通过、1 项因无 C++ 编译器跳过。
+2026-11-02 导出格式修复后的本地控制/证据检查 12 项通过；原 scratch 检查记录为 7 项通过、
+1 项因无 C++ 编译器跳过。
 这些检查使用录制回调/文件 fixture，不执行 torch/NPU，也不模拟硬件计时或验收设备精度。
 
 ## 执行方式

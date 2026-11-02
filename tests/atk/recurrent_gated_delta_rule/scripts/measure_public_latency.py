@@ -131,38 +131,96 @@ def validate_opapi_check(text, expected):
         raise RuntimeError("op_api check did not prove this installed package's library; see artifact_check.log")
 
 
-def summarize_profile(directory, expected_calls):
+def profile_inventory(directory):
+    root = Path(directory)
+    files = sorted(p for p in root.rglob("*") if p.is_file())
+    tables = []
+    for path in files:
+        if path.suffix == ".csv":
+            with path.open(encoding="utf-8-sig", newline="") as file:
+                columns = next(csv.reader(file), [])
+            tables.append({"file": str(path), "columns": columns})
+    return {"root": str(root), "exists": root.is_dir(), "csv_files": tables,
+            "files": [str(p.relative_to(root)) for p in files[:100]], "file_list_truncated": len(files) > 100}
+
+
+def summarize_profile(directory, expected_calls, inventory=None):
     # Keep each exported file separate: duplicate views are not extra samples.
+    # torch_npu 2.10 maps op_summary -> kernel_details and renames its columns:
+    # https://github.com/Ascend/pytorch/blob/v2.10.0/torch_npu/profiler/analysis/prof_common_func/_csv_headers.py
+    inventory = inventory if inventory is not None else profile_inventory(directory)
     evidence = []
-    for path in sorted(Path(directory).rglob("*op_summary*.csv")):
+    for entry in inventory["csv_files"]:
+        path = Path(entry["file"])
+        if "op_summary" not in path.stem and not path.stem.startswith("kernel_details"):
+            entry["status"] = "not_a_task_table"
+            continue
+        columns = entry["columns"]
+        if "Task Duration(us)" in columns:
+            duration_column = "Task Duration(us)"
+            type_column = next((c for c in ("OP Type", "Op Type") if c in columns), None)
+        elif "Duration(us)" in columns:
+            duration_column = "Duration(us)"
+            type_column = "Type" if "Type" in columns else None
+        else:
+            duration_column = type_column = None
+        if not type_column:
+            entry["status"] = "unsupported_columns_or_units"
+            continue
         groups = defaultdict(list)
         with path.open(encoding="utf-8-sig", newline="") as file:
             for row in csv.DictReader(file):
-                kind = row.get("OP Type") or row.get("Op Type") or "unknown"
-                if row.get("Task Duration(us)"):
-                    groups[kind].append(float(row["Task Duration(us)"]))
+                kind = (row.get(type_column) or "unknown").strip()
+                try:
+                    value = float(row[duration_column])
+                    if not math.isfinite(value) or value < 0:
+                        raise ValueError("nonfinite/negative duration")
+                except (TypeError, ValueError, KeyError) as error:
+                    entry["status"] = "invalid_duration"
+                    raise RuntimeError(f"invalid {duration_column} in {path}") from error
+                groups[kind].append(value)
         targets = [k for k in groups if k.lower().replace("_", "") == "recurrentgateddeltarule"]
+        entry.update(duration_column=duration_column, type_column=type_column,
+                     rgdr_count=sum(len(groups[k]) for k in targets))
         if not targets:
+            entry["status"] = "no_rgdr_tasks"
             continue
         if len(targets) != 1 or len(groups[targets[0]]) != expected_calls:
-            raise RuntimeError(f"unexpected RGDR task count in {path}; inspect the retained profile")
-        evidence.append({"file": str(path), "tasks": {k: summarize(v) for k, v in groups.items()}})
+            entry["status"] = "unexpected_rgdr_count"
+            continue
+        entry["status"] = "accepted"
+        evidence.append({"file": str(path), "duration_column": duration_column,
+                         "metric": "RGDR Task Duration(us); kernel_details column mapping preserves units",
+                         "tasks": {k: summarize(v) for k, v in groups.items()}})
     if not evidence:
-        raise RuntimeError("no RGDR op_summary Task Duration evidence; unprofiled timings are retained")
+        details = [{k: e[k] for k in ("file", "status", "rgdr_count") if k in e} for e in inventory["csv_files"]]
+        raise RuntimeError(f"no complete RGDR task table for {expected_calls} calls; "
+                           f"inspect profile_inventory.json; tables={json.dumps(details)}")
     return evidence
+
+
+def collect_profile_summary(directory, expected_calls, output):
+    inventory = profile_inventory(directory)
+    try:
+        return summarize_profile(directory, expected_calls, inventory)
+    finally:
+        write_result(Path(output) / "profile_inventory.json", inventory)
 
 
 def profile_calls(torch, torch_npu, call_with_state, initial_state, synchronize, count, output):
     # All allocations/resets finish BEFORE starting the profiler.
     with npu_deadline():
-        states = [initial_state.clone() for _ in range(count)]
+        # One profiler warmup step, then exactly count active calls.
+        states = [initial_state.clone() for _ in range(count + 1)]
         synchronize()
     profiler = torch_npu.profiler
     results = []
     with profiler.profile(
         activities=[profiler.ProfilerActivity.CPU, profiler.ProfilerActivity.NPU],
+        schedule=profiler.schedule(wait=0, warmup=1, active=count, repeat=1),
         experimental_config=profiler._ExperimentalConfig(
-            profiler_level=profiler.ProfilerLevel.Level0, data_simplification=False),
+            profiler_level=profiler.ProfilerLevel.Level0, aic_metrics=profiler.AiCMetrics.AiCoreNone,
+            data_simplification=False),
         record_shapes=True, profile_memory=False, with_stack=False,
         on_trace_ready=profiler.tensorboard_trace_handler(str(output)),
     ) as capture:
@@ -250,16 +308,18 @@ def run(args, root, output, report):
                 result = call()
                 synchronize()
         finite_check(result, inputs["state"])
-        start, end = torch.npu.Event(enable_timing=True), torch.npu.Event(enable_timing=True)
-        # Eagerly initialize both lazily-created event handles outside timing.
-        with npu_deadline():
-            start.record(stream)
-            end.record(stream)
-            synchronize()
-        report["status"] = "measuring"
+        modes = () if args.profile_only else ("wall", "event", "empty_wall", "empty_event")
+        if modes:
+            start, end = torch.npu.Event(enable_timing=True), torch.npu.Event(enable_timing=True)
+            # Eagerly initialize both lazily-created event handles outside timing.
+            with npu_deadline():
+                start.record(stream)
+                end.record(stream)
+                synchronize()
+        report["status"] = "profiling" if args.profile_only else "measuring"
         write_result(output / "result.json", report)
         samples = defaultdict(list)
-        for mode in ("wall", "event", "empty_wall", "empty_event"):
+        for mode in modes:
             selected = call if not mode.startswith("empty") else lambda: None
             for _ in range(args.samples):
                 with npu_deadline():
@@ -274,7 +334,9 @@ def run(args, root, output, report):
 
         source_files = [root / OP_REL / name for name in (CASE_NAME, "executor_recurrent_gated_delta_rule.py")]
         report.update({
-            "status": "timings_complete", "label": args.label, "case_spec": spec,
+            "status": "profiling" if args.profile_only else "timings_complete",
+            "timing_status": "not_run" if args.profile_only else "complete",
+            "label": args.label, "case_spec": spec,
             "git_commit": git_value(root, "rev-parse", "HEAD"),
             "git_branch": git_value(root, "branch", "--show-current"),
             "git_status": git_value(root, "status", "--porcelain"),
@@ -303,19 +365,45 @@ def run(args, root, output, report):
             print(f"{key}: n={stats['count']} mean={stats['mean_us']:.5f} median={stats['median_us']:.5f} "
                   f"std={stats['std_us']:.5f} p90={stats['p90_us']:.5f}", flush=True)
         if args.profile:
+            report["profile_status"] = "collecting"
+            write_result(output / "result.json", report)
             results, states = profile_calls(torch, torch_npu, call_with_state, initial_state, synchronize,
                                            args.profile_samples, output / "profile")
             finite_check(results[-1], states[-1])
-            report["system_profile"] = summarize_profile(output / "profile", args.profile_samples)
+            report["system_profile"] = collect_profile_summary(output / "profile", args.profile_samples, output)
+            report["profile_status"] = "complete"
             for evidence in report["system_profile"]:
                 print("profile:", json.dumps(evidence, ensure_ascii=False), flush=True)
         report["status"] = "complete"
 
 
+def parse_existing_profile(args):
+    source = args.parse_profile.resolve()
+    if not source.is_dir():
+        raise ValueError("--parse-profile must point to an existing profile/output directory")
+    output = (args.output or source / "reparse" /
+              datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S_%fZ")).resolve()
+    output.mkdir(parents=True, exist_ok=False)
+    report = {"status": "started", "mode": "offline_profile_parse", "source": str(source),
+              "expected_calls": args.profile_samples, "output": str(output)}
+    print(f"output={output}", flush=True)
+    try:
+        report["system_profile"] = collect_profile_summary(source, args.profile_samples, output)
+        report["status"] = "complete"
+        for evidence in report["system_profile"]:
+            print("profile:", json.dumps(evidence, ensure_ascii=False), flush=True)
+    except Exception as error:
+        report.update(status="failed", error=f"{type(error).__name__}: {error}")
+        raise
+    finally:
+        # New result only; the previous run's timings/result.json remain intact.
+        write_result(output / "result.json", report)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--repo-root", type=Path, help="required when running a copy outside the checkout")
-    parser.add_argument("--run-package", type=Path, required=True, help="this build's exact .run, not a wheel")
+    parser.add_argument("--run-package", type=Path, help="mandatory online: this build's exact .run, not a wheel")
     parser.add_argument("--built-kernel", type=Path, help="override staged kernel root, not the binary/bin directory")
     parser.add_argument("--device", type=int, default=0)
     parser.add_argument("--case-id", type=int, default=0)
@@ -323,13 +411,22 @@ def main():
     parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument("--samples", type=int, default=100)
     parser.add_argument("--profile", action="store_true", help="separate system profile AFTER unprofiled measurements")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--parse-profile", type=Path, help="offline reparse existing CSVs; no NPU/package/build needed")
+    mode.add_argument("--profile-only", action="store_true", help="collect profile without repeating timing samples")
     parser.add_argument("--profile-samples", type=int, default=20)
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
+    if args.profile_samples <= 0:
+        parser.error("profile-samples must be positive")
+    if args.parse_profile:
+        parse_existing_profile(args)
+        return
+    args.profile = args.profile or args.profile_only
     root = args.repo_root or next((p for p in Path(__file__).resolve().parents if (p / OP_REL / CASE_NAME).is_file()), None)
     if root is None or not (root / OP_REL / CASE_NAME).is_file():
         parser.error("--repo-root must point to the selected branch checkout")
-    if args.run_package.suffix != ".run" or not args.run_package.is_file():
+    if not args.run_package or args.run_package.suffix != ".run" or not args.run_package.is_file():
         parser.error("--run-package must be an existing .run from this build")
     if min(args.warmup, args.samples, args.profile_samples) <= 0 or args.device < 0:
         parser.error("warmup/samples/profile-samples must be positive; device must be nonnegative")
@@ -345,7 +442,10 @@ def main():
     try:
         run(args, root, output, report)
     except Exception as error:
-        report.update(status="failed", error=f"{type(error).__name__}: {error}")
+        status = "timings_complete_profile_failed" if report.get("timing_status") == "complete" else "failed"
+        report.update(status=status, error=f"{type(error).__name__}: {error}")
+        if report.get("profile_status") == "collecting":
+            report["profile_status"] = "failed"
         raise
     finally:
         write_result(output / "result.json", report)

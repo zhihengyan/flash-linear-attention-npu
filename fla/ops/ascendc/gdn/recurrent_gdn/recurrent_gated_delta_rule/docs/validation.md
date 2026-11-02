@@ -2,6 +2,27 @@
 
 ## 2026-11-02：独立公开入口延迟诊断（不改算子）
 
+### profile 导出兼容性修复
+
+用户在线完成全部 100 次 host/Event 计时，后续 CANN 解析日志已显示完成；最后在任务表汇总时报
+`no RGDR op_summary Task Duration evidence`。这是脚本导出格式/列名覆盖不足，不能据此判断
+算子执行失败或推翻前面的计时。旧报告中的失败状态及已保存统计保留，不改写用户原始结果。
+
+官方 torch_npu v2.10.0 `_csv_headers.py` 将 op_summary 的 OP Type / Task Duration(us)
+映射为 kernel_details.csv 的 Type / Duration(us)。本次同时读取这两种明确的 schema，
+只接受 us、有限非负的 Duration 和完整目标 task 数；不同 CSV 视图不合并，partial 表不能充当
+完整样本，有其它完整视图时在 inventory 中注明 partial 的原因。没有实际用户文件清单时，
+这项缺陷是已确认的源码兼容性问题；不能断言用户导出中一定存在完整 kernel_details。
+
+增加 `--parse-profile` 纯离线重解析，写入新目录并输出 CSV/表头/计数 inventory，原计时结果不变。
+若旧采集不完整，再用 `--profile-only` 单独采集。在线计时完成而 profile 失败时分别记录两阶段状态。
+profile 采用 1 次 warmup + N 次 active 的有限 schedule，末次 step 完成保存；Level0 显式禁用
+AiCore metrics，消除默认 aic_metrics 不匹配和在 RECORD 状态停止的配置问题。
+输入、kernel/host/runtime、ATK 资产均不改动。修复后控制/证据检查 12/12 通过，新增原/新表头映射、
+重复/partial 导出、unsupported units/invalid duration 的 inventory，以及无需 NPU/包的离线 CLI。
+原 result.json 在离线 CLI 测试中逐字节保持。Python AST、本地链接、7 份 ATK 输入/标杆资产一致性
+和 git diff --check 通过。计时循环数和旧样本不改动；尚未在用户 A5 环境验证新 profile 采集调度。
+
 分支 `codex/gdn-a5-public-latency-diagnostic` 直接从 scratch `fec1e18b` 创建。
 只增加独立诊断脚本、脚本单测及说明，不改变 kernel/host/runtime、ATK JSON/YAML、executor、
 生成器、CPU 标杆或精度标准。用户确认本机只编码和静态检查，设备精度不作为本轮前置。
