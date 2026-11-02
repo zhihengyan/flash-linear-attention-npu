@@ -517,10 +517,14 @@ __aicore__ inline void MulKktGateVF(LocalTensor<float> &kkt, LocalTensor<float> 
     {
         MaskReg lowerMask0, lowerMask1;
         RegTensor<float> k0, k1, g0, g1;
+        uint32_t lowerCount0 = 0;
+        uint32_t lowerCount1 = 0;
         for (uint16_t i = 0; i < 32; i++) {
             const uint32_t r0 = static_cast<uint32_t>(i) * 128;
-            lowerMask0 = UpdateMask<float>(static_cast<uint32_t>(i) * 2);
-            lowerMask1 = UpdateMask<float>(static_cast<uint32_t>(i) * 2 + 1);
+            lowerCount0 = static_cast<uint32_t>(i) * 2;
+            lowerCount1 = lowerCount0 + 1;
+            lowerMask0 = UpdateMask<float>(lowerCount0);
+            lowerMask1 = UpdateMask<float>(lowerCount1);
             LoadAlign(k0, kktAddr + r0);
             LoadAlign(k1, kktAddr + r0 + 64);
             LoadAlign(g0, gMatAddr + r0);

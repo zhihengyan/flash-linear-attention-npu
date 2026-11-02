@@ -36,7 +36,7 @@ python scripts/verify_libcust_opapi_md5.py --run-package <本轮 run 包>
 
 | 设计项 | 代码位置与实际实现 | 当前证据 / 状态 |
 | --- | --- | --- |
-| Stage3 严格下三角 | `chunk_gated_delta_rule_fwd_prepare_vf.h` `MulKktGateVF` | 已实现 masked Mul/Store；待构建与设备验证 |
+| Stage3 严格下三角 | `chunk_gated_delta_rule_fwd_prepare_vf.h` `MulKktGateVF` | 首次构建确认 `UpdateMask(uint32_t&)` 拒绝临时值；已改为左值 `lowerCount0/1`，待重新构建与设备验证 |
 | Stage3 上三角零值 | 同文件 `GateLowerLVF` | 原实现全行 Select 后 Store，零值先于 masked Store 建立 |
 | Stage7 packed W/U | `chunk_gated_delta_rule_fwd_prepare.h`、`_matmul.h` | 仅方案，未修改代码 |
 | 资源与同步 | Prepare `InitOnChip`、Stage3/7 | Stage3 未改变地址、容量、event 或计数 |
