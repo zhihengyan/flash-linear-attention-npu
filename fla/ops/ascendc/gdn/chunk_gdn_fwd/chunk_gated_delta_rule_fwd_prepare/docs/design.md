@@ -9,8 +9,9 @@ GDN 前向准备链路，chunk 之间无状态依赖。每核以最多四个 val
 AIV0/AIV1 分别处理 task 0/2 与 1/3，ping/pong 槽由 task id 决定；GVA owner 只计算一次
 Q/K norm 与 KKT。
 
-本轮只优化 Prepare 内部 Stage3 和 Stage7，不改变公开接口、数学语义、输出舍入顺序或支持范围。
-两项必须独立验证，不将收益混合归因。
+本轮只推进 Prepare 内部 Stage7，不改变公开接口、数学语义、输出舍入顺序或支持范围。
+Stage3 masked Mul／Store 候选已实测为负收益并回退，实验数据仅保留在验证记录中，不与
+Stage7 混合归因。
 
 固定性能环境：Ascend 950、device 2、相同 ATK 性能 JSON 与统计入口。性能结果为端到端
 `chunk_gated_delta_rule_fwd` 两条 case 的正式中位数；每项至少复测两轮，收益须超过基线波动。
@@ -21,8 +22,8 @@ Q/K norm 与 KKT。
 | 训练 case 1 | `B=2,HK=HV=32,T=8192,K=V=128,BT=64`，定长无状态输出 | 2707.735 µs | 2704.416～2709.092 µs | 精度通过且稳定下降 |
 
 基线波动分别为 7.321/4.676 µs。历史均值 1704.700/2704.500 µs 仅用于交叉验证。
-候选 1 减少 Stage3 约一半有效乘法与写回，候选 2 减少 Stage7 的 A 重复 LoadA 并合并 W/U
-MMAD；二者均直接作用于现有 Prepare 计算路径，但最终收益必须设备实测，不预写百分比。
+Stage7 候选减少 A 的重复 LoadA 并合并 W/U MMAD，直接作用于现有 Prepare 计算路径，
+但最终收益必须设备实测，不预写百分比。
 
 ## 2. Stage 0–7 完整详设
 
@@ -75,10 +76,9 @@ KKT:  [140,172) KiB 两个 16 KiB FP32 ND bank
 ```
 
 `GateLowerLVF` 计算 `G[i,j]=-beta[i]*exp*(clip(g[i]-g[j],-50,50))`（`i>j`），
-并在同一全行 Store 中把对角线和上三角显式写零。等待 KKT 后，本轮优化后的
-`MulKktGateVF` 仍读取完整两行，但只对每行严格下三角的前 `i` 个元素执行 FP32 Mul 与
-masked Store；其余地址不写入，因而保留前一步的零值。数学结果、有效乘法输入和写回
-数值不变，PackDiagLeaves、UB→L1 NZ 与 VCS 输入布局均不变。
+并在同一全行 Store 中把对角线和上三角显式写零。等待 KKT 后，`MulKktGateVF` 读取完整
+两行，对全部 64 列执行 FP32 Mul 与全行 Store，得到 `-L=KKT⊙G`。PackDiagLeaves、
+UB→L1 NZ 与 VCS 输入布局均保持原实现。
 
 `-L` 写入 `L1[64,128) KiB` 对应 task 的 FP32 NZ slot；两个 32×32 逆叶块分别写入
 LeafLeft/Right 的 L1 slot。V_MTE3 与 MTE3_V 保持原闭环，Stage3 完成后由 MTE3 发布
@@ -112,7 +112,7 @@ L0C W/U 为 `[0,64)` 与 `[64,128) KiB`，各保留一个 `64×128 FP32` 结果�
 ROW_MAJOR Fixpipe 到 UB：`W[172,204) KiB`、`U[204,236) KiB`，下一 pack 由所属 AIV drain
 到 GM；V=256 的 U 两个 128 列半块直接写 GM，不走 UB retained。
 
-第二项候选仅在 `K=V=128` 时启用：L0A 只装载一次 A，kbg/vb 组成 packed N=256 的 L0B，
+本轮候选仅在 `K=V=128` 时启用：L0A 只装载一次 A，kbg/vb 组成 packed N=256 的 L0B，
 一次 `C[64,256]FP32=A[64,64]BF16 @ B[64,256]BF16`，再由两个 L0C 半区分别 Fixpipe 到原
 W/U UB。packed B 的 NZ fragment 必须按全宽 256 列组织，右半起始于第二个 16 KiB bank；
 在布局推导与编译验证完成前不实施。V=256 保持原三次 MMAD 路径。M_MTE1、MTE1_M、FIX_M、
@@ -120,10 +120,10 @@ M_FIX 的输入/输出所有权与 drain 协议不变。
 
 ### 搬运与同步汇总
 
-本轮 Stage3 不减少 Load，只减少约一半 Mul/Store 有效元素；Stage7 目标减少一次 A 的
-L1→L0A 装载和一次 MMAD launch，不增加 GM 流量或 workspace。所有输入仍按原路径从 GM 读取，
-L2 策略不变。跨核 Stage1→2、Stage2→3、Stage3→4、Stage4→下一 pack Stage1、Stage6→7、
-Stage7→drain 的 event id、方向、生产 pipe 和计数均保持不变；核内只复用已等待完成的
-HardEvent，不提前释放仍被 MMAD/Fixpipe 使用的 L0/L1/UB。
+Stage3 保持原始全量 Load、Mul 和 Store；Stage7 目标减少一次 A 的 L1→L0A 装载和一次
+MMAD launch，不增加 GM 流量或 workspace。所有输入仍按原路径从 GM 读取，L2 策略不变。
+跨核 Stage1→2、Stage2→3、Stage3→4、Stage4→下一 pack Stage1、Stage6→7、Stage7→drain
+的 event id、方向、生产 pipe 和计数均保持不变；核内只复用已等待完成的 HardEvent，
+不提前释放仍被 MMAD/Fixpipe 使用的 L0/L1/UB。
 
 开发期实测、精度和逐轮采用结论见 [validation.md](validation.md)。

@@ -13,14 +13,19 @@ bash tests/atk/chunk_gated_delta_rule_fwd/scripts/run_matrix.sh 2
 ATK_OUTPUT_ROOT="tests/atk/chunk_gated_delta_rule_fwd/atk_output/perf_$(git rev-parse --short HEAD)_$(date +%Y%m%d_%H%M%S)" bash tests/atk/run_test_cpu.sh -op=chunk_gated_delta_rule_fwd -npu_device_id=2 -scope=performance --soc=ascend950
 ```
 
-每轮先构建并安装单算子 run 包，确认 MD5 一致后重启测试 Python 进程：
+每轮先构建并安装包含 DUT 及其公开入口依赖的 9 算子 wheel，确认 MD5 一致后重启测试
+Python 进程。不得用只含 Prepare 的单算子包覆盖精度、性能共用环境，否则 `libcust_opapi.so`
+会缺少公开融合算子和 `chunk_local_cumsum` 等符号；MD5 一致不代表符号齐全。
 
 ```bash
-bash build.sh --pkg --soc=ascend950 --vendor_name=fla_npu --ops=chunk_gated_delta_rule_fwd_prepare -j8
+FLA_NPU_SOC=ascend950 \
+FLA_NPU_OPS=chunk_gated_delta_rule_fwd,chunk_gated_delta_rule_fwd_prepare,chunk_local_cumsum,chunk_scaled_dot_kkt,solve_tri,recompute_w_u_fwd,chunk_gated_delta_rule_fwd_h,chunk_fwd_h,chunk_fwd_o \
+python3 scripts/build_wheel.py
 
-./build_out/fla_npu_linux-*.run --install
+WHEEL=$(ls -t dist/*.whl | head -n 1)
+python3 -m pip install --force-reinstall --no-cache-dir --no-deps "$WHEEL"
 
-python scripts/verify_libcust_opapi_md5.py --run-package <本轮 run 包>
+python scripts/verify_libcust_opapi_md5.py
 ```
 
 ## 性能追踪
@@ -29,17 +34,18 @@ python scripts/verify_libcust_opapi_md5.py --run-package <本轮 run 包>
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | 推理 case 0 | 基线 | Prepare Stage3/7 | 原始实现 | 用户给定稳定基线 | 1705.298 µs；范围 1703.162～1710.482 µs | 待本轮 profiling | 三轮波动 7.321 µs |
 | 训练 case 1 | 基线 | Prepare Stage3/7 | 原始实现 | 用户给定稳定基线 | 2707.735 µs；范围 2704.416～2709.092 µs | 待本轮 profiling | 三轮波动 4.676 µs |
-| 两条 case | Stage3 / 待设备实测 | 64×64 仅 2016 个严格下三角元素，原实现对 4096 元素 Mul/Store | 仅将 Stage3 Mul/Store 改为 lower mask；Load、打包、VCS、同步不变 | 待 500 条 | 待至少两轮 | 待核对 Stage3 Vector 时间 | 精度通过且端到端收益超过噪声才采用 |
-| 两条 case | Stage7 / 待设计实测 | W/U 重复 LoadA，K=V=128 存在两个 N=128 MMAD | 仅 K=V=128 合并 packed N=256；V=256 原路径 | 未实施、未测试 | 未测试 | 未测试 | Stage3 闭环后独立开展 |
+| 两条 case | Stage3 / 负收益，放弃并回退 | 原实现对 4096 个元素执行 Mul/Store；候选只减少有效 lane | 候选仅将 Mul/Store 改为 lower mask，Load、打包、VCS、同步不变 | 正式 500 条未完整跑通 | 用户报告两次均值约 1710／2715 µs，基线为 1705.298／2707.735 µs | 无有效收益 | 循环、Load、Mul 和 Store 调用次数均未减少，却新增 UpdateMask 和 masked Store 开销；训练慢约 7.265 µs，超过基线波动，不能保留 |
+| 两条 case | Stage7 / 待设计实测 | W/U 重复 LoadA，K=V=128 存在两个 N=128 MMAD | 仅 K=V=128 合并 packed N=256；V=256 原路径 | 未实施、未测试 | 未测试 | 未测试 | Stage3 回退闭环后独立开展 |
 
 ## 追溯与检查
 
 | 设计项 | 代码位置与实际实现 | 当前证据 / 状态 |
 | --- | --- | --- |
-| Stage3 严格下三角 | `chunk_gated_delta_rule_fwd_prepare_vf.h` `MulKktGateVF` | 首次构建确认 `UpdateMask(uint32_t&)` 拒绝临时值；已改为左值 `lowerCount0/1`，待重新构建与设备验证 |
-| Stage3 上三角零值 | 同文件 `GateLowerLVF` | 原实现全行 Select 后 Store，零值先于 masked Store 建立 |
+| Stage3 严格下三角 | `chunk_gated_delta_rule_fwd_prepare_vf.h` `MulKktGateVF` | 已回退为原始全量 Mul／Store；负收益 masked 候选不再保留 |
+| Stage3 上三角零值 | 同文件 `GateLowerLVF`、`MulKktGateVF` | GateLowerLVF 先写零，原始 KKT⊙G 全行乘法和写回保持对角线、上三角为零 |
 | Stage7 packed W/U | `chunk_gated_delta_rule_fwd_prepare.h`、`_matmul.h` | 仅方案，未修改代码 |
-| 资源与同步 | Prepare `InitOnChip`、Stage3/7 | Stage3 未改变地址、容量、event 或计数 |
+| 资源与同步 | Prepare `InitOnChip`、Stage3/7 | Stage3 回退不改变地址、容量、event 或计数 |
 
-本地无生产 NPU；构建、500 条精度和性能均不得标记为已执行。若 Stage3 编译或精度失败，
-优先回退本项并检查 masked Store 语义，不以修改 CPU 标杆、容差或上三角数学定义规避。
+本地无生产 NPU。Stage3 的构建和 MD5 检查曾由用户确认通过，但正式 500 条精度未完整跑通，
+性能也只有用户报告的两次均值，没有每轮原始值，因此不得标记为精度通过或稳定收益。后续每项
+优化仍须先完成正式精度，再至少进行两轮同口径性能复测；每轮只改变一个主要变量。
