@@ -3,9 +3,18 @@
 
 from __future__ import annotations
 
+import sys
+from pathlib import Path
 from typing import Any
 
 import torch
+
+# ATK loads this file as a plugin and does not guarantee that its directory is
+# on sys.path. Resolve the sibling role/reference modules independently of the
+# caller's working directory and PYTHONPATH.
+_OP_DIR = str(Path(__file__).resolve().parent)
+if _OP_DIR not in sys.path:
+    sys.path.insert(0, _OP_DIR)
 
 from atk.configs.dataset_config import InputDataset
 from atk.configs.results_config import TaskResult
