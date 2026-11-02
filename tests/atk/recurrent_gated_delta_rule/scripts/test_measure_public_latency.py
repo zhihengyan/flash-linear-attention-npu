@@ -14,6 +14,7 @@ import weakref
 import measure_public_latency as bench
 
 ROOT = Path(__file__).resolve().parents[4]
+REPORTED_TASK_NAME = "aclnnRecurrentGatedDeltaRule_RecurrentGatedDeltaRule_RecurrentGatedDeltaRule"
 
 
 class TimingControlTest(unittest.TestCase):
@@ -237,6 +238,51 @@ class EvidenceTest(unittest.TestCase):
             self.assertEqual(len(bench.summarize_profile(root, 2, inventory)), 1)
             self.assertEqual({e["status"] for e in inventory["csv_files"]}, {"accepted", "unexpected_rgdr_count"})
 
+    def test_reported_na_type_uses_exact_name_and_original_duration_in_both_views(self):
+        with tempfile.TemporaryDirectory(dir=ROOT, prefix=".rgdr-latency-test-") as temp:
+            root = Path(temp).resolve()
+            root.relative_to(ROOT)
+            # The three concrete durations supplied by the user, not a claim
+            # about the mean of all twenty device samples.
+            for name, headers in (("op_summary.csv", ["OP Type", "Op Name", "Task Duration(us)"]),
+                                  ("kernel_details.csv", ["Type", "Name", "Duration(us)"])):
+                with (root / name).open("w", newline="", encoding="utf-8-sig") as file:
+                    writer = csv.writer(file)
+                    writer.writerow(headers)
+                    writer.writerows(("N/A", REPORTED_TASK_NAME, v) for v in (3.606, 3.605, 3.644))
+            inventory = bench.profile_inventory(root)
+            evidence = bench.summarize_profile(root, 3, inventory)
+            self.assertEqual(len(evidence), 2)
+            for entry in evidence:
+                values = entry["tasks"]["RecurrentGatedDeltaRule"]
+                self.assertEqual(values["count"], 3)
+                self.assertAlmostEqual(values["mean_us"], 3.618333333333333)
+                self.assertEqual(entry["rgdr_match_sources"], {"exact_op_name": 3})
+            for entry in inventory["csv_files"]:
+                self.assertEqual(entry["row_count"], 3)
+                self.assertEqual(entry["type_counts"], {"N/A": 3})
+                self.assertEqual(entry["rgdr_count"], 3)
+
+    def test_name_fallback_rejects_substrings_placeholders_and_conflicting_types(self):
+        with tempfile.TemporaryDirectory(dir=ROOT, prefix=".rgdr-latency-test-") as temp:
+            root = Path(temp).resolve()
+            root.relative_to(ROOT)
+            with (root / "kernel_details.csv").open("w", newline="", encoding="utf-8-sig") as file:
+                writer = csv.writer(file)
+                writer.writerow(["Type", "Name", "Duration(us)"])
+                writer.writerows([
+                    ("N/A", REPORTED_TASK_NAME, 3.606),
+                    ("N/A", REPORTED_TASK_NAME + "Profile", 999),
+                    ("N/A", "prefix_" + REPORTED_TASK_NAME, 999),
+                    ("N/A", "PLACE_HOLDER_SQE", 999),
+                    ("Cast", REPORTED_TASK_NAME, 999),
+                ])
+            evidence = bench.summarize_profile(root, 1)
+            self.assertEqual(evidence[0]["tasks"]["RecurrentGatedDeltaRule"]["mean_us"], 3.606)
+            self.assertEqual(evidence[0]["rgdr_match_sources"], {"exact_op_name": 1})
+            with self.assertRaises(RuntimeError):
+                bench.summarize_profile(root, 2)
+
     def test_unsupported_units_and_invalid_durations_retain_inventory(self):
         with tempfile.TemporaryDirectory(dir=ROOT, prefix=".rgdr-latency-test-") as temp:
             root = Path(temp).resolve()
@@ -264,7 +310,7 @@ class EvidenceTest(unittest.TestCase):
             profile = root / "profile"
             profile.mkdir()
             table = profile / "kernel_details.csv"
-            table.write_text("Type,Duration(us)\nRecurrentGatedDeltaRule,4.2\nRecurrentGatedDeltaRule,4.4\n")
+            table.write_text(f"Type,Name,Duration(us)\nN/A,{REPORTED_TASK_NAME},4.2\nN/A,{REPORTED_TASK_NAME},4.4\n")
             parsed = root / "parsed"
             # No --run-package / --repo-root, and this also runs on Windows
             # without torch/NPU or a SIGALRM implementation.

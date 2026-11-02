@@ -170,6 +170,10 @@ profile 墙钟与无 profiler 的统计分开。兼容原 `op_summary*.csv`（OP
 和 torch_npu 2.10 的 `kernel_details.csv`（Type / Duration(us)）。后者由官方逐列映射自前者，
 不是用 Event 或 wait 时间替代 Task Duration。参考
 [官方列名映射](https://github.com/Ascend/pytorch/blob/v2.10.0/torch_npu/profiler/analysis/prof_common_func/_csv_headers.py)。
+用户 A5 实际导出中 Type/OP Type 均为 N/A，但 Name/Op Name 是完整的
+`aclnnRecurrentGatedDeltaRule_RecurrentGatedDeltaRule_RecurrentGatedDeltaRule`。
+类型缺失时，仅用该完整名称精确回退；不做子串匹配、不覆盖明确的其它类型，继续读取原 Duration。
+inventory 保留原类型计数、总行数和 `rgdr_match_sources`。task_time 中的 PLACE_HOLDER_SQE 不计入 RGDR。
 每份任务表独立校验目标 task 数；不拼接 partial 文件、不累加重复导出视图。至少有一份完整且计数
 正确的任务表才通过；partial/unsupported 表的原因保留在 `profile_inventory.json`。
 每次 NPU 测量有 60 秒 watchdog（含准备/下发/同步）；超时会终止进程，留下已有结果。
@@ -185,7 +189,7 @@ case_spec 和原始计时样本。已有输出目录会拒绝覆盖；失败状�
 
 ```bash
 python tests/atk/recurrent_gated_delta_rule/scripts/measure_public_latency.py \
-  --parse-profile tests/atk/recurrent_gated_delta_rule/runs/public_latency/20261102T092552_902541Z/profile \
+  --parse-profile tests/atk/recurrent_gated_delta_rule/runs/public_latency/20261102T122553_836006Z/profile \
   --profile-samples 20
 ```
 
@@ -235,7 +239,7 @@ python /tmp/rgdr_measure_public_latency.py --repo-root "$PWD" \
 python -B tests/atk/recurrent_gated_delta_rule/scripts/test_measure_public_latency.py -v
 ```
 
-2026-11-02 导出格式修复后的本地控制/证据检查 12 项通过；原 scratch 检查记录为 7 项通过、
+2026-11-02 类型 N/A 修复后的本地控制/证据检查 14 项通过；原 scratch 检查记录为 7 项通过、
 1 项因无 C++ 编译器跳过。
 这些检查使用录制回调/文件 fixture，不执行 torch/NPU，也不模拟硬件计时或验收设备精度。
 

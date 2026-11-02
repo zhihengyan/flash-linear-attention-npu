@@ -25,6 +25,8 @@ import time
 
 OP_REL = Path("tests/atk/recurrent_gated_delta_rule")
 CASE_NAME = "atk_recurrent_gated_delta_rule_perf.json"
+RGDR_TYPE = "RecurrentGatedDeltaRule"
+RGDR_TASK_NAME = "aclnnRecurrentGatedDeltaRule_RecurrentGatedDeltaRule_RecurrentGatedDeltaRule"
 
 
 def sha256(path):
@@ -167,10 +169,27 @@ def summarize_profile(directory, expected_calls, inventory=None):
         if not type_column:
             entry["status"] = "unsupported_columns_or_units"
             continue
+        name_column = "Op Name" if "Op Name" in columns else "Name" if "Name" in columns else None
         groups = defaultdict(list)
+        type_counts, match_sources = defaultdict(int), defaultdict(int)
+        unmatched_names = []
         with path.open(encoding="utf-8-sig", newline="") as file:
             for row in csv.DictReader(file):
-                kind = (row.get(type_column) or "unknown").strip()
+                raw_type = (row.get(type_column) or "").strip()
+                type_counts[raw_type or "<empty>"] += 1
+                name = (row.get(name_column) or "").strip() if name_column else ""
+                kind = raw_type or "unknown"
+                if kind.lower().replace("_", "") == "recurrentgateddeltarule":
+                    kind = RGDR_TYPE
+                    match_sources["op_type"] += 1
+                elif raw_type.upper() in ("", "N/A", "NA", "UNKNOWN") and name == RGDR_TASK_NAME:
+                    # Real A5 export: Type=N/A, but this complete launcher/op
+                    # name identifies RGDR. Never use a substring or override
+                    # another explicit type; retain the original duration.
+                    kind = RGDR_TYPE
+                    match_sources["exact_op_name"] += 1
+                elif name and name not in unmatched_names and len(unmatched_names) < 3:
+                    unmatched_names.append(name)
                 try:
                     value = float(row[duration_column])
                     if not math.isfinite(value) or value < 0:
@@ -180,7 +199,9 @@ def summarize_profile(directory, expected_calls, inventory=None):
                     raise RuntimeError(f"invalid {duration_column} in {path}") from error
                 groups[kind].append(value)
         targets = [k for k in groups if k.lower().replace("_", "") == "recurrentgateddeltarule"]
-        entry.update(duration_column=duration_column, type_column=type_column,
+        entry.update(duration_column=duration_column, type_column=type_column, name_column=name_column,
+                     row_count=sum(type_counts.values()), type_counts=dict(type_counts),
+                     rgdr_match_sources=dict(match_sources), unmatched_name_examples=unmatched_names,
                      rgdr_count=sum(len(groups[k]) for k in targets))
         if not targets:
             entry["status"] = "no_rgdr_tasks"
@@ -191,6 +212,7 @@ def summarize_profile(directory, expected_calls, inventory=None):
         entry["status"] = "accepted"
         evidence.append({"file": str(path), "duration_column": duration_column,
                          "metric": "RGDR Task Duration(us); kernel_details column mapping preserves units",
+                         "rgdr_match_sources": dict(match_sources),
                          "tasks": {k: summarize(v) for k, v in groups.items()}})
     if not evidence:
         details = [{k: e[k] for k in ("file", "status", "rgdr_count") if k in e} for e in inventory["csv_files"]]

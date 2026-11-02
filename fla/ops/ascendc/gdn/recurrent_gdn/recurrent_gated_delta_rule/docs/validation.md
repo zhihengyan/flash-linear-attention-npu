@@ -4,6 +4,18 @@
 
 ### profile 导出兼容性修复
 
+后续实测证据：20261102T122553_836006Z 的 op_summary/kernel_details 均有 20 条数据，类型均为 N/A，
+完整任务名为 `aclnnRecurrentGatedDeltaRule_RecurrentGatedDeltaRule_RecurrentGatedDeltaRule`。
+task_time 的 20 条 KERNEL_AIVEC 对应 BF16 single-work `_85669048..._266`，另有 1 条 PLACE_HOLDER_SQE。
+已给出的前三条 Task ID 1088/1089/1090 及耗时 3.606/3.605/3.644 us 在原/映射任务表和 task_time 中一致。
+本次只在类型为空/N/A/unknown 时，用上述完整任务名的精确相等作为回退；明确的其它类型不覆盖，
+不使用子串、不接受 Profile 等后缀，不将 task_time 的占位任务计入 RGDR。仍读取原 Duration、校验
+完整的 N 条目标任务，不跨 CSV 视图拼样本。记录 row_count、原类型计数及匹配来源，便于审计。
+此证据确认之前的 0 是类型匹配遗漏，不是算子没执行。仅有三条具体耗时，不能推算整轮均值。
+类型 N/A 修复后本地控制/证据回归 14/14 通过，包括用户提供的三条记录在两种导出视图中精确
+回放、子串/后缀/占位任务/冲突类型排除，以及 N/A 数据通过完整离线 CLI 后原结果逐字节不变。
+AST、本地链接、git diff --check 及 7 份原始输入/标杆资产一致性检查通过；kernel/host/runtime 无 diff。
+
 用户在线完成全部 100 次 host/Event 计时，后续 CANN 解析日志已显示完成；最后在任务表汇总时报
 `no RGDR op_summary Task Duration evidence`。这是脚本导出格式/列名覆盖不足，不能据此判断
 算子执行失败或推翻前面的计时。旧报告中的失败状态及已保存统计保留，不改写用户原始结果。
