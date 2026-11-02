@@ -515,18 +515,21 @@ __aicore__ inline void MulKktGateVF(LocalTensor<float> &kkt, LocalTensor<float> 
     __ubuf__ float *gMatAddr = (__ubuf__ float *)G.GetPhyAddr();
     __VEC_SCOPE__
     {
-        MaskReg pregAll = CreateMask<float, MaskPattern::ALL>();
+        MaskReg lowerMask0, lowerMask1;
         RegTensor<float> k0, k1, g0, g1;
         for (uint16_t i = 0; i < 32; i++) {
             const uint32_t r0 = static_cast<uint32_t>(i) * 128;
+            lowerMask0 = UpdateMask<float>(static_cast<uint32_t>(i) * 2);
+            lowerMask1 = UpdateMask<float>(static_cast<uint32_t>(i) * 2 + 1);
             LoadAlign(k0, kktAddr + r0);
             LoadAlign(k1, kktAddr + r0 + 64);
             LoadAlign(g0, gMatAddr + r0);
             LoadAlign(g1, gMatAddr + r0 + 64);
-            Mul(g0, k0, g0, pregAll);
-            Mul(g1, k1, g1, pregAll);
-            StoreAlign(gMatAddr + r0, g0, pregAll);
-            StoreAlign(gMatAddr + r0 + 64, g1, pregAll);
+            Mul(g0, k0, g0, lowerMask0);
+            Mul(g1, k1, g1, lowerMask1);
+            // GateLowerLVF already zeroed the diagonal and upper triangle.
+            StoreAlign(gMatAddr + r0, g0, lowerMask0);
+            StoreAlign(gMatAddr + r0 + 64, g1, lowerMask1);
         }
     }
 }
