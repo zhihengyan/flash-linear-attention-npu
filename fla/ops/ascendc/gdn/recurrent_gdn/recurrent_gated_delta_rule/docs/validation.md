@@ -1,5 +1,45 @@
 # A5 单 work 与尾部 scratch 实验开发记录
 
+## 2026-11-02：独立公开入口延迟诊断（不改算子）
+
+分支 `codex/gdn-a5-public-latency-diagnostic` 直接从 scratch `fec1e18b` 创建。
+只增加独立诊断脚本、脚本单测及说明，不改变 kernel/host/runtime、ATK JSON/YAML、executor、
+生成器、CPU 标杆或精度标准。用户确认本机只编码和静态检查，设备精度不作为本轮前置。
+该入口用于诊断，不替代仓库要求经 ATK 发起的正式性能/精度验收。
+
+用户 2026-11-02 回传的 20 次调用共 160 条 task，ATK `device_perf=18.27275 us` 恰好等于
+所有 Task Duration 总和除以 20：Neg 1.96665、RGDR 4.42955、out 检查 5.50975、state 检查
+6.36680 us。该指标包含输入生成和有限性检查，不是公开调用的墙钟延迟，不能用差额归因 host。
+原日志未记录源码 commit，不把这组数自动归到某一个优化分支。
+
+测量设计：复用原 perf case 0 的 `build_inputs` 和公开 `ascendc.recurrent_gated_delta_rule`；
+仅支持已确认的默认连续 BF16 state、g-only、B=T=Nk=Nv=1、K=V=128。输入只生成一次，
+每次调用前恢复同一个 state 张量并同步，恢复和同步在计时区间外；不改变分布、seed 或容差。
+先预热，再独立测 host 提交/调用后同步和 Event stream 区间，避免 Event API 混入 host 计时。
+单独报告空同步和空 Event，不自动扣减。Event 区间可能包含 host 下发造成的空闲，不等同主 kernel。
+调用后同步仅用于串行诊断，不是模型吞吐基准；不做连续调用均摊。
+输出/最终 state 只在计时循环外做有限性 sanity check，不比较 CPU golden，不宣称精度通过。
+
+可选 `--profile` 在计时结束后另开 CPU+NPU profiler；预先构造每次调用的独立初始 state，
+记录默认 20 次公开调用，避免 state 重置/Neg/有限性检查混入采集区间。关闭 data_simplification
+以保留 CANN op_summary 和 trace，
+按每份 CSV 的目标 task 计数校验，不拼接多个副本。主 kernel 性能口径仍是 RGDR Task Duration。
+同步/CPU marker 会扰动间隙，不把 profiler 墙钟与无 profiler 的统计混算。
+
+产物证据：当前 `.run` 的 op_api 比对 + 当前 build 和已安装 OPP 内 RGDR `.o` 的完整相对路径/哈希
+集合比对。记录源码 commit/dirty、输入资产 SHA256、实际包和 stable 路径/哈希、SoC、设备、
+当前 stream、torch/torch_npu 版本与原始样本。空/缺失/不匹配的 RGDR 集合立即失败。
+每次 NPU 测量设置 60 秒 watchdog，范围含准备/提交/同步；不是 kernel 已进入的证明。
+
+本机无 CANN/NPU；本地结果：新增控制/证据单测 9/9 通过，覆盖时间窗口、state reset、Event ms→us、
+输出生命周期、profile 输入隔离/原始数据保留、产物集合缺失/不匹配拒绝和 CSV 副本隔离。
+原 scratch 检查 7 通过、1 因无 C++ 编译器跳过；Python AST、无 torch 的 --help 和本地文档链接通过。
+7 份 ATK 输入/标杆资产与 scratch 完全一致；kernel、host、Python runtime、C++ 适配层无 diff。
+git diff --check 通过。新脚本 NPU 计时/profiler 接口尚未上机验证，不能记为 CANN 编译、设备精度
+或性能通过。初次 Windows 系统 temp fixture 权限错误已通过将临时目录置于工作区解决。
+
+## 以下为已保留 scratch 的历史记录
+
 本轮直接基线 `c36e18ce`（`codex/gdn-a5-single-work-fastpath`），
 实验分支 `codex/gdn-a5-tail-scratch-elision`；历史 main 为 `c9e2f1db`。
 用户授权仅编码和本地静态检查；A5/CANN 在内网，本地无 CANN、torch 或 C++ 编译器，不请求重新提供 SSH。

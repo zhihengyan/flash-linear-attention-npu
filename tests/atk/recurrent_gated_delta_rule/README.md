@@ -69,7 +69,7 @@ stateStride2=128、g-only、无 accepted-token 输入选择 `SINGLE_WORK=1`。
 
 | 模板参数 `(D_T_STATE,SINGLE_WORK)` | 精度 case | perf case | MSS / determinism case | 设备选择证据 |
 | --- | ---: | ---: | ---: | --- |
-| `(BF16,1)`，A5 single | 0 | 0 | 0 | 父版本 c36e18ce 的 case 0 成功；本轮 scratch 实验待测 |
+| `(BF16,1)`，A5 single | 0 | 0 | 0 | 用户历史报告 scratch 200 条精度通过；新增诊断脚本未上机 |
 | `(FP32,0)`，general | 1 | — | 1 | 内网待采集 |
 | `(BF16,0)`，general | 2 | — | 2 | 内网待采集 |
 
@@ -86,7 +86,7 @@ blockDim 对照；不能只根据 case 的 shape 认定命中。
 合并约 4.48 μs，相对历史 main 4.87 μs 约改善 8.0%；同轮 main 的 kernel 统计待补。
 修复前的性能结果不能作为本版本的收益结论。
 
-### 当前实验：尾部 FP32 scratch 免写回
+### 已保留基线：尾部 FP32 scratch 免写回
 
 分支 `codex/gdn-a5-tail-scratch-elision` 从 c36e18ce 创建，只让 SINGLE_WORK=1 的 VF 使用
 `writeUpdatedScratch=false`，省去第二遍更新后的 64 KiB UB 写回。第一遍 gated state、
@@ -110,6 +110,95 @@ true 应与 c36e18ce 原 VF 一致，false 应仅删去第二遍尾部 Store；�
 覆盖 Set/Wait 配对、标量读取前完成 Wait，以及空工作不发射事件；录制 API 顺序不等于验证硬件同步。
 内网构建、安装、产物校验和 A5 验证步骤见
 [开发记录](../../../fla/ops/ascendc/gdn/recurrent_gdn/recurrent_gated_delta_rule/docs/validation.md)。
+
+## 固定输入的公开入口延迟诊断
+
+`codex/gdn-a5-public-latency-diagnostic` 从 scratch `fec1e18b` 创建，仅增加诊断工具。
+kernel/host/runtime 与 scratch 一致，不包含后续 state Cast 或输入启动融合实验。
+原 ATK JSON/YAML、executor、生成器、标杆和容差保持。本节是独立诊断，正式验收仍走 ATK。
+
+2026-11-02 用户回传的 ATK `device_perf=18.27275 us` 是 20 次调用中全部 task 的平均总和：
+Neg 1.96665、RGDR 4.42955、out 有限性检查 5.50975、state 有限性检查 6.36680 us。
+它包含测试输入生成和检查，不能当作公开入口墙钟延迟。原日志未提供代码 commit，不推定其源码版本。
+
+### 第一步：在 scratch 诊断分支构建并运行
+
+在已激活的原 CANN/conda 环境、仓库根目录执行。下例设备 1 与上述日志一致；两版本使用同一设备。
+只需重建单算子 run 包，无需全量 wheel。本脚本会检查 `.run` 的 op_api 与实际包路径，以及
+当前 build 和已安装 OPP 的 RGDR `.o` 相对路径/哈希集合；缺失、跳过或不匹配均不会当作通过。
+
+```bash
+git fetch origin
+git switch codex/gdn-a5-public-latency-diagnostic
+bash build.sh --soc=ascend950 --pkg --vendor_name=fla_npu --ops=recurrent_gated_delta_rule
+./build_out/fla_npu_linux-x86_64.run --install
+
+python tests/atk/recurrent_gated_delta_rule/scripts/measure_public_latency.py \
+  --device 1 --case-id 0 --label scratch \
+  --run-package build_out/fla_npu_linux-x86_64.run \
+  --warmup 20 --samples 100 --profile --profile-samples 20
+```
+
+输入来自原 perf case 0 的 `build_inputs`，只生成一次；每次调用前恢复同一个 state 张量并同步，
+恢复和预同步在计时区间外。该协议会影响缓存状态，绝对时间不与旧 ATK 结果混算。
+两版均在 `torch.inference_mode()` 下运行。host 和 Event 独立循环；输出在完成同步前保持引用，
+不在窗口内 D2H、检查有限性或重新构造输入。
+输出/最终 state 的有限性检查放在整个循环之后，仅为 sanity check，不宣称设备精度通过。
+
+| 输出字段 | 范围与解释 |
+| --- | --- |
+| `host_submit_us` | Python 公开调用（含薄调用闭包）开始到返回；不等待设备完成，不等同 kernel launch 时间 |
+| `call_and_sync_us` | 同一次公开调用开始到当前 stream 同步返回；含 host、等待和同步 API 开销 |
+| `post_return_wait_us` | 调用返回到同步返回；含队列/设备等待和同步开销，不是纯设备执行时间 |
+| `stream_event_us` | 独立循环中调用前后两个 NPU Event 的区间；可能包含 host 下发导致的 stream 空闲 |
+| `empty_*` | 同协议的空调用/空同步/Event 控制，单独报告，不自动相减 |
+| `system_profile` | 计时结束后单独采集的原始系统 profile；RGDR `Task Duration(us)` 才是主 kernel 指标 |
+
+Event 的 `elapsed_time` 单位为 ms，脚本转为 us。接口依据见
+[torch_npu Event/Stream](https://github.com/Ascend/pytorch/blob/master/torch_npu/npu/streams.py)。
+系统 profile 按官方 [profiler 实现](https://github.com/Ascend/pytorch/blob/master/torch_npu/profiler/profiler.py)
+和 [使用示例](https://gitee.com/ascend/mstt/tree/master/profiler) 接入；本机尚无 NPU 运行验证。
+Event、host 墙钟和 Task Duration 不互相替代；同步后逐次调用是串行诊断，不是模型吞吐测试。
+
+`--profile` 额外执行默认 20 次调用，先在 profiler 外预分配相同初值的独立 state，
+采集窗口内不做 state reset、Neg 或有限性检查，保留其它真实调用任务。设置 `data_simplification=False`
+保留 CANN 导出的 op_summary，避免精简阶段删除原始任务表。同步/CPU marker 会扰动间隙，
+profile 墙钟与无 profiler 的统计分开。每份 op_summary 独立校验目标 task 数，避免重复 CSV 混算。
+每次 NPU 测量有 60 秒 watchdog（含准备/下发/同步）；超时会终止进程，留下已有结果。
+
+脚本打印 `output=...`。默认结果位于本算子 `runs/public_latency/<UTC时间戳>/`，包含 `result.json`、
+`artifact_check.log` 和可选 `profile/`。记录 commit/dirty、设备/stream、实际包/库/目标 `.o` 哈希、
+case_spec 和原始计时样本。已有输出目录会拒绝覆盖；失败状态不会记为成功。
+
+### 第二步：用同一脚本测 main
+
+切换前把诊断脚本复制到 `/tmp`；main 本身不需要合入或修改诊断代码。切换后重建、安装 main 的
+run 包，`--repo-root` 指向 main checkout，脚本会读取该 checkout 的原始输入生成与用例。
+
+```bash
+cp tests/atk/recurrent_gated_delta_rule/scripts/measure_public_latency.py /tmp/rgdr_measure_public_latency.py
+git switch main
+bash build.sh --soc=ascend950 --pkg --vendor_name=fla_npu --ops=recurrent_gated_delta_rule
+./build_out/fla_npu_linux-x86_64.run --install
+
+python /tmp/rgdr_measure_public_latency.py --repo-root "$PWD" \
+  --device 1 --case-id 0 --label main \
+  --run-package build_out/fla_npu_linux-x86_64.run \
+  --warmup 20 --samples 100 --profile --profile-samples 20
+```
+
+先回传两组 stdout 的统计行和 `profile:` 行即可，无需压缩包或全量 trace。
+关注 `host_submit_us / call_and_sync_us / stream_event_us` 与 RGDR Task Duration，
+确认瓶颈后再选 kernel、调用层或任务消除方向。原 ATK 指标继续保留，不通过移除检查宣称提速。
+
+本地离线检查入口（不加载 torch/NPU）：
+
+```bash
+python -B tests/atk/recurrent_gated_delta_rule/scripts/test_measure_public_latency.py -v
+```
+
+2026-11-02 本地控制/证据检查 9 项通过；原 scratch 检查 7 项通过、1 项因无 C++ 编译器跳过。
+这些检查使用录制回调/文件 fixture，不执行 torch/NPU，也不模拟硬件计时或验收设备精度。
 
 ## 执行方式
 
