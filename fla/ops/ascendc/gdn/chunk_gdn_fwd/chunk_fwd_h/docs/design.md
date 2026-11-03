@@ -82,8 +82,9 @@ UB 直搬 L1。
 A5 从 MTE2 后开始的全部向量计算由 RegBase VF 完成。g-only 的完整 chunk 先将 64 个
 `exp(g_last-g_i)` 一次性向量化写入 gate-scale bank，Stage1 逐行广播该结果，不再重复执行
 64 次向量 Exp；tail chunk 保留标量 gate 读取和单元素写回，避免读取 DataCopyPad 未初始化的
-UB 余量。VF 只使用 `if constexpr` 模板分支和明确类型的 `for` 循环，并以两组 FP32 寄存器
-覆盖 128 列。
+UB 余量。VF 只使用 `if constexpr` 模板分支和明确类型的 `for` 循环：128 列路径以两组
+FP32 寄存器处理；64 列 half-head 路径以一组 FP32 寄存器处理，BF16 使用 UNPACK/PACK 转换，
+不再读取或写入未初始化的第二组寄存器。
 
 ### Stage2：第二次矩阵乘
 
@@ -173,13 +174,18 @@ scratch 链分别回收，不能用互斥分支漏掉其中一条。
 使用 `PIPE_S` 作为 scalar/control gate；下一 unit 的 kg/H/W MTE2 因而不能越过 ACK，
 不会与上一 unit 的未完成写回交叠。A2/A3 用 mode2 collective 完成同等的收口。
 
-Host 将 `(sequence, value_head)` 展平为连续 head task。设有效 sequence 数为 `N`、物理 AIC
-核数为 `C`，则 `totalHeadTasks=N*HV`、`headsPerCore=ceil(totalHeadTasks/C)`，实际启动核数为
+Host 将 `(sequence, value_head, v_part)` 展平为连续 head task。设有效 sequence 数为 `N`、
+物理 AIC 核数为 `C`，则 `totalHeadTasks=N*HV*valueSplit`、
+`headsPerCore=ceil(totalHeadTasks/C)`，实际启动核数为
 `blockDim=ceil(totalHeadTasks/headsPerCore)`。第 `coreIdx` 个 AIC 处理连续区间
 `[coreIdx*headsPerCore, min((coreIdx+1)*headsPerCore, totalHeadTasks))`，不再把同一 sequence
-的全部 head round 绑定到一个核。核内区间跨越 sequence 边界时必须拆分 work unit；同一
-sequence 内也按连续 value head 每四个一组拆分，因此每个 unit 最多四个 head。每个 head
-的全部 chunk 递推仍固定在同一核并顺序执行，不依赖 block 启动顺序建立状态依赖。
+的全部 head round 绑定到一个核。核内区间跨越 sequence 边界时必须拆分 work unit。
+
+`valueSplit=1` 时，同一 sequence 内按连续 value head 每四个一组拆分，每个 unit 最多四个
+head，行为保持原样。`valueSplit=2` 时，每个 unit 只有一个 `(hv,v_part)`，其中
+`hv=taskInSequence/2`、`vBegin=(taskInSequence&1)*64`、`vSize=64`；AIC/AIV 使用完全相同的
+解码，游标每次只前进一个 half-head task。每个 half-head 的全部 chunk 递推仍固定在同一核
+并顺序执行，不依赖 block 启动顺序建立状态依赖。
 
 ## 7. 变长序列
 
@@ -208,6 +214,7 @@ head round 的展开数组。kernel 在进入 chunk 循环前，按 `kNumHead/vN
 | `isVariedLen` | 是否启用 varlen 调度 |
 | `shapeBatch` | dense 的物理 batch；varlen 固定为 1 |
 | `tokenBatch` | varlen 的 sequence 数；dense 固定为 1 |
+| `valueSplit` | V 维任务切分数；A5 的 scalar-g、FP32 state、`state_v_first=false` 路径为 2，其余为 1 |
 | `vWorkspaceOffset` | A2/A3 P 的 GM scratch，按 FP32 slot stride 预留 `[blockDim,4,64,128]`；实际元素为 PType |
 | `vUpdateWorkspaceOffset` | Stage1 BF16 right 的 GM workspace，形状为 `[blockDim,4,64,128]` |
 | `kDecayWorkspaceOffset` | FP32 rolling state 的 GM workspace，形状为 `[blockDim,4,128,128]`；A5 使用每 AIV 两份常驻 state，不访问该段 |
@@ -241,3 +248,26 @@ state dtype 的模板选择保持运行语义优先级：存在 `initial_state` 
 代码不维护手写数值 key，也不在 kernel 内使用 `TILING_KEY_IS` 做二次分派。TilingKey 数值由
 目标 CANN 根据模板声明编码，只用于 host、binary metadata 和 runtime 之间的选择闭环，不作为
 公开接口或跨版本稳定语义。
+
+## 10. A5 half-head 并行实现
+
+仅在 Ascend 950、`SCALAR_G && STATE_FP32 && !STATE_V_FIRST` 时由 host 设置 `valueSplit=2`；
+其他模板和 A2/A3 始终保持 1。选择 V 维切半是因为不同 V 列的递推完全独立，两个 half-head
+可直接写回原输出的不同半列。K 维不能采用同样的无归约切分：`P=W@H` 与 `D=k^T@right`
+都需要完整 K 维，跨核切 K 会引入部分和与新的同步，因此不在本轮范围内。
+
+half-head 的公开 GM 布局不变，H/U/V_new/initial_state/final_state 的每行 stride 仍为 128，
+只在基址上加 `vBegin`，通过多行 DataCopy 或带 stride 的 TLA GM layout 读取/写入对应 64 列。
+片上 P/D/right/state/H 使用紧凑 64 列布局：P 为 `[64,64]`，D/state 为 `[128,64]`，U/right
+为 `[64,64]`。right 与非驻留 state workspace 的生产者和消费者统一以
+`FwdHCoreSlotOffset(core, roundHead, elementsPerHalfHead)` 寻址；host 仍按原最大槽容量预留，
+因此紧凑寻址只减少实际使用区间，不扩大分配或造成槽重叠。
+
+FP32 rolling state 在每个 half-head work unit 内继续驻留所属 AIV 的 UB，不跨 half-head 共享。
+单 head AIC/AIV pipeline、W/K 与 U/g 双 bank 预取、P/D/right ready/free、ROUND_DONE/ACK 均复用
+原协议；没有本地 head 的 AIV1 仍参与 round 握手，但不访问数据。64 列 VF 的 Load/Cast/Store
+只操作 `u0/p0/state0/d0`，128 列原双寄存器路径不变。
+
+该优化增加可调度任务并改善尾波，但 half-head 会重复装载 W/K，且每任务固定控制与同步开销
+不会减半。因此“任务数翻倍”不等于“性能翻倍”；最终是否保留必须由同 shape 的精度和端到端
+性能实测决定。当前实现尚未构建或上机验证。

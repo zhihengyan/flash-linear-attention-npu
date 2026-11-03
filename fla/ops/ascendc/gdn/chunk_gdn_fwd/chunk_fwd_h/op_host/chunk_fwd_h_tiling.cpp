@@ -77,6 +77,7 @@ static void ChunkFwdHTilingDataPrint(gert::TilingContext *context, ChunkFwdHTili
     OP_LOGD(nodeName, "=== isVariedLen: %ld", tiling.get_isVariedLen());
     OP_LOGD(nodeName, "=== shapeBatch: %ld", tiling.get_shapeBatch());
     OP_LOGD(nodeName, "=== tokenBatch: %ld", tiling.get_tokenBatch());
+    OP_LOGD(nodeName, "=== valueSplit: %ld", tiling.get_valueSplit());
     OP_LOGD(nodeName, ">>>>>>>>>>>>>>> Print ChunkFwdH tiling data end <<<<<<<<<<<<<<<<");
 }
 
@@ -150,6 +151,9 @@ ge::graphStatus Tiling4ChunkFwdH(gert::TilingContext *context)
     tilingCtx.useInitialState = useInitialState;
     tilingCtx.storeFinalState = storeFinalState;
     tilingCtx.chunkSize = chunkSize;
+    tilingCtx.enableValueSplit =
+        ascendcPlatform.GetSocVersion() == platform_ascendc::SocVersion::ASCEND950 &&
+        useG && stateDtypeToken == GDN::CHUNK_FWD_H_TPL_FP32 && !stateVFirst;
     tilingCtx.aicCoreNum = ascendcPlatform.GetCoreNumAic();
     tilingCtx.libApiWorkSpaceSize = ascendcPlatform.GetLibApiWorkSpaceSize();
 
@@ -217,6 +221,7 @@ ge::graphStatus Tiling4ChunkFwdH(gert::TilingContext *context)
     tiling.set_isVariedLen(plainTiling.isVariedLen);
     tiling.set_shapeBatch(plainTiling.shapeBatch);
     tiling.set_tokenBatch(plainTiling.tokenBatch);
+    tiling.set_valueSplit(plainTiling.valueSplit);
     tiling.set_vWorkspaceOffset(plainTiling.vWorkspaceOffset);
     tiling.set_vUpdateWorkspaceOffset(plainTiling.vUpdateWorkspaceOffset);
     tiling.set_kDecayWorkspaceOffset(plainTiling.kDecayWorkspaceOffset);

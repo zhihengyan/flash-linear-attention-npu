@@ -50,6 +50,7 @@ struct ChunkFwdHTilingContext {
     // attrs
     bool storeFinalState;
     int64_t chunkSize;
+    bool enableValueSplit;
     // platform
     uint32_t aicCoreNum;
     size_t libApiWorkSpaceSize;
@@ -81,8 +82,9 @@ public:
         }
 
         const uint64_t effectiveSequenceCount = static_cast<uint64_t>(batch);
+        const uint64_t valueSplit = ctx_.enableValueSplit ? 2U : 1U;
         const uint64_t totalHeadTasks =
-            effectiveSequenceCount * static_cast<uint64_t>(ctx_.vNumHead);
+            effectiveSequenceCount * static_cast<uint64_t>(ctx_.vNumHead) * valueSplit;
         const uint64_t physicalAicCores = static_cast<uint64_t>(ctx_.aicCoreNum);
         const uint64_t headsPerCore =
             (totalHeadTasks + physicalAicCores - 1) / physicalAicCores;
@@ -127,6 +129,7 @@ public:
         tiling.isVariedLen = isVariedLen;
         tiling.shapeBatch = shapeBatch;
         tiling.tokenBatch = tokenBatch;
+        tiling.valueSplit = static_cast<int64_t>(valueSplit);
     }
 
 private:

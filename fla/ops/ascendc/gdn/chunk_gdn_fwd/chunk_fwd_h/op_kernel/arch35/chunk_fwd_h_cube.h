@@ -46,19 +46,26 @@ public:
     {
         const FwdHCoreHeadRange range =
             FwdHResolveCoreHeadRange(args_.tiling, coreIdx_, coreNum_);
-        const uint32_t headsPerSequence = static_cast<uint32_t>(args_.tiling.vNumHead);
+        const uint32_t tasksPerSequence =
+            static_cast<uint32_t>(args_.tiling.vNumHead) * args_.tiling.valueSplit;
         uint32_t cachedSequence = FwdHSequenceCount(args_.tiling);
         FwdHSequenceSpan sequenceSpan{};
         for (uint32_t cursor = range.begin; cursor < range.end;) {
-            const uint32_t sequence = cursor / headsPerSequence;
-            const uint32_t hvBegin = cursor - sequence * headsPerSequence;
-            uint32_t unitHeads = range.end - cursor;
-            const uint32_t sequenceRemain = headsPerSequence - hvBegin;
-            if (unitHeads > sequenceRemain) {
-                unitHeads = sequenceRemain;
-            }
-            if (unitHeads > FWD_H_AIC_HEAD_SLOTS) {
-                unitHeads = FWD_H_AIC_HEAD_SLOTS;
+            const uint32_t sequence = cursor / tasksPerSequence;
+            const uint32_t taskInSequence = cursor - sequence * tasksPerSequence;
+            const bool splitValue = args_.tiling.valueSplit == 2;
+            const uint32_t hvBegin = splitValue ? taskInSequence / 2 : taskInSequence;
+            const uint32_t vBegin = splitValue ? (taskInSequence & 1U) * (FWD_H_V / 2) : 0;
+            const uint32_t vSize = splitValue ? FWD_H_V / 2 : FWD_H_V;
+            uint32_t unitHeads = splitValue ? 1 : range.end - cursor;
+            if (!splitValue) {
+                const uint32_t sequenceRemain = tasksPerSequence - hvBegin;
+                if (unitHeads > sequenceRemain) {
+                    unitHeads = sequenceRemain;
+                }
+                if (unitHeads > FWD_H_AIC_HEAD_SLOTS) {
+                    unitHeads = FWD_H_AIC_HEAD_SLOTS;
+                }
             }
             if (sequence != cachedSequence) {
                 sequenceSpan = FwdHResolveSequence(args_, sequence);
@@ -66,7 +73,8 @@ public:
             }
             const FwdHWorkUnit unit{
                 sequenceSpan,
-                FwdHBuildHeadRange<CompilePolicy::GATE_MODE>(args_.tiling, hvBegin, unitHeads)};
+                FwdHBuildHeadRange<CompilePolicy::GATE_MODE>(
+                    args_.tiling, hvBegin, unitHeads, vBegin, vSize)};
             cursor += unitHeads;
             if (unit.sequence.chunkCount != 0 && unit.headRound.activeHeadCount != 0) {
                 ProcessWorkUnit(unit, cursor < range.end);
@@ -311,7 +319,7 @@ private:
     __aicore__ inline uint64_t HOffset(const FwdHWorkUnit &unit, const FwdHChunkSpan &chunk,
                                        const FwdHHeadBinding &head) const
     {
-        return FwdHHOffset(args_.tiling, unit.sequence, head.hv, chunk.globalChunk);
+        return FwdHHOffset(args_.tiling, unit.sequence, head.hv, chunk.globalChunk) + head.vBegin;
     }
 
     // 保留 leaf stage 调用边界，使 TLA 临时对象在各 head/stage 之间复用标量栈区。
@@ -345,20 +353,33 @@ private:
         AscendC::GlobalTensor<bfloat16_t> gmH;
         if (chunk.first && args_.tiling.useInitialState != 0 && !CompilePolicy::STATE_FP32) {
             const uint64_t stateOffset = FwdHStateOffset<STATE_V_FIRST>(
-                args_.tiling, unit.sequence.sequence, head.hv, 0, 0);
+                args_.tiling, unit.sequence.sequence, head.hv, 0, 0) + head.vBegin;
             gmH.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(args_.initialState) + stateOffset);
         } else {
             AscendC::CrossCoreWaitFlag<0x4, PIPE_MTE2>(
                 FwdHAicPeerFlag(FWD_H_H_READY_FLAG, head.localSlot, head.aiv));
             gmH.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(args_.h) + HOffset(unit, chunk, head));
         }
-        auto gmHLayout = tla::MakeLayout<bfloat16_t, LayoutH>(FWD_H_K, FWD_H_V);
-        auto tensorH = tla::MakeTensor(gmH, gmHLayout, Catlass::Arch::PositionGM{});
-        auto blockH = tla::GetTile(tensorH, tla::MakeCoord(0, 0),
-                                   tla::MakeShape(FWD_H_K, FWD_H_V));
-        auto tensorL1H = tla::MakeTensor(L1HRight(hSlot), L1_H_LAYOUT, Catlass::Arch::PositionL1{});
-        CopyGmToL1BS0<decltype(blockH)> copyH;
-        copyH(tensorL1H, blockH);
+        auto l1HLayout = tla::MakeLayout<bfloat16_t, typename TileS0::LayoutTagL1B>(
+            FWD_H_K, head.vSize);
+        auto tensorL1H = tla::MakeTensor(L1HRight(hSlot), l1HLayout, Catlass::Arch::PositionL1{});
+        if (head.vSize == FWD_H_V) {
+            auto gmHLayout = tla::MakeLayout<bfloat16_t, LayoutH>(FWD_H_K, FWD_H_V);
+            auto tensorH = tla::MakeTensor(gmH, gmHLayout, Catlass::Arch::PositionGM{});
+            auto blockH = tla::GetTile(tensorH, tla::MakeCoord(0, 0),
+                                       tla::MakeShape(FWD_H_K, FWD_H_V));
+            CopyGmToL1BS0<decltype(blockH)> copyH;
+            copyH(tensorL1H, blockH);
+        } else {
+            auto gmHLayout = tla::MakeLayout(
+                tla::MakeShape(FWD_H_K, head.vSize),
+                tla::MakeStride(FWD_H_V, tla::Int<1>{}));
+            auto tensorH = tla::MakeTensor(gmH, gmHLayout, Catlass::Arch::PositionGM{});
+            auto blockH = tla::GetTile(tensorH, tla::MakeCoord(0, 0),
+                                       tla::MakeShape(FWD_H_K, head.vSize));
+            CopyGmToL1BS0<decltype(blockH)> copyH;
+            copyH(tensorL1H, blockH);
+        }
         AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE1>(HRightDoneEvent(hSlot));
     }
 
@@ -370,10 +391,12 @@ private:
         // 随后按 StateT 转为 PType，Fixpipe 直接写入该 head 所属 AIV 的 local slot。
         const uint32_t m = FwdHAlignCube(chunk.validTokens);
         auto tensorL1W = tla::MakeTensor(L1W(wSlot), L1_W_LAYOUT, Catlass::Arch::PositionL1{});
-        auto tensorL1H = tla::MakeTensor(L1HRight(hSlot), L1_H_LAYOUT, Catlass::Arch::PositionL1{});
+        auto l1HLayout = tla::MakeLayout<bfloat16_t, typename TileS0::LayoutTagL1B>(
+            FWD_H_K, head.vSize);
+        auto tensorL1H = tla::MakeTensor(L1HRight(hSlot), l1HLayout, Catlass::Arch::PositionL1{});
         auto layoutL0A = tla::MakeLayout<bfloat16_t, typename TileS0::LayoutTagL0A>(m, FWD_H_K);
-        auto layoutL0B = tla::MakeLayout<bfloat16_t, typename TileS0::LayoutTagL0B>(FWD_H_K, FWD_H_V);
-        auto layoutL0C = tla::MakeLayoutL0C(m, FWD_H_V);
+        auto layoutL0B = tla::MakeLayout<bfloat16_t, typename TileS0::LayoutTagL0B>(FWD_H_K, head.vSize);
+        auto layoutL0C = tla::MakeLayoutL0C(m, head.vSize);
         auto tensorL0A = tla::MakeTensor(L0A(pipelineSlot), layoutL0A, Catlass::Arch::PositionL0A{});
         auto tensorL0B = tla::MakeTensor(L0B(pipelineSlot), layoutL0B, Catlass::Arch::PositionL0B{});
         auto tensorL0C = tla::MakeTensor(L0C(pipelineSlot), layoutL0C, Catlass::Arch::PositionL0C{});
@@ -386,7 +409,7 @@ private:
         CopyL1ToL0BS0 copyB;
         copyA(tensorL0A, tla::GetTile(tensorL1W, tla::MakeCoord(0, 0), tla::MakeShape(m, FWD_H_K)));
         copyB(tensorL0B, tla::GetTile(tensorL1H, tla::MakeCoord(0, 0),
-                                     tla::MakeShape(FWD_H_K, FWD_H_V)));
+                                     tla::MakeShape(FWD_H_K, head.vSize)));
         AscendC::SetFlag<AscendC::HardEvent::MTE1_MTE2>(WReadyEvent(wSlot));
         AscendC::SetFlag<AscendC::HardEvent::MTE1_MTE2>(HRightReadyEvent(hSlot));
         AscendC::SetFlag<AscendC::HardEvent::MTE1_M>(L0AReadyEvent(pipelineSlot));
@@ -422,10 +445,10 @@ private:
         AscendC::WaitFlag<AscendC::HardEvent::M_FIX>(FixDoneEvent(pipelineSlot));
         AscendC::LocalTensor<PType> pUb = UbBuffer()[
             FwdHLocalSlotBase(DataSlot(head))].template ReinterpretCast<PType>();
-        auto ubLayout = tla::MakeLayout<PType, LayoutOutput>(m, FWD_H_V);
+        auto ubLayout = tla::MakeLayout<PType, LayoutOutput>(m, head.vSize);
         auto tensorUb = tla::MakeTensor(pUb, ubLayout, Catlass::Arch::PositionUB{});
         auto blockUb = tla::GetTile(tensorUb, tla::MakeCoord(0, 0),
-                                    tla::MakeShape(chunk.validTokens, FWD_H_V));
+                                    tla::MakeShape(chunk.validTokens, head.vSize));
         CopyL0CToUbS0<decltype(blockUb)> copyP;
         copyP(blockUb, tensorL0C, static_cast<uint8_t>(head.aiv), 0);
         AscendC::CrossCoreSetFlag<0x4, PIPE_FIX>(
@@ -513,14 +536,16 @@ private:
         }
         AscendC::GlobalTensor<bfloat16_t> gmRight;
         const uint64_t offset = args_.tiling.vUpdateWorkspaceOffset / sizeof(bfloat16_t) +
-            FwdHCoreSlotOffset(coreIdx_, head.roundHead, FWD_H_CHUNK * FWD_H_V);
+            FwdHCoreSlotOffset(coreIdx_, head.roundHead, FWD_H_CHUNK * head.vSize);
         gmRight.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(args_.workspace) + offset);
         if constexpr (!STATE_V_FIRST) {
-            auto gmLayout = tla::MakeLayout<bfloat16_t, LayoutRightS2>(chunk.validTokens, FWD_H_V);
+            auto gmLayout = tla::MakeLayout<bfloat16_t, LayoutRightS2>(chunk.validTokens, head.vSize);
             auto tensorGm = tla::MakeTensor(gmRight, gmLayout, Catlass::Arch::PositionGM{});
             auto blockGm = tla::GetTile(tensorGm, tla::MakeCoord(0, 0),
-                                        tla::MakeShape(chunk.validTokens, FWD_H_V));
-            auto tensorL1 = tla::MakeTensor(L1HRight(hSlot), L1_RIGHT_S2_LAYOUT,
+                                        tla::MakeShape(chunk.validTokens, head.vSize));
+            auto l1RightLayout = tla::MakeLayout<bfloat16_t, typename TileS2::LayoutTagL1B>(
+                FWD_H_CHUNK, head.vSize);
+            auto tensorL1 = tla::MakeTensor(L1HRight(hSlot), l1RightLayout,
                                             Catlass::Arch::PositionL1{});
             CopyGmToL1BS2<decltype(blockGm)> copy;
             copy(tensorL1, blockGm);
@@ -546,8 +571,8 @@ private:
         const uint32_t m = FWD_H_K;
         const uint32_t k = FwdHAlignCube(chunk.validTokens);
         auto layoutL0A = tla::MakeLayout<bfloat16_t, typename TileS2::LayoutTagL0A>(m, k);
-        auto layoutL0B = tla::MakeLayout<bfloat16_t, typename TileS2::LayoutTagL0B>(k, FWD_H_V);
-        auto layoutL0C = tla::MakeLayoutL0C(m, FWD_H_V);
+        auto layoutL0B = tla::MakeLayout<bfloat16_t, typename TileS2::LayoutTagL0B>(k, head.vSize);
+        auto layoutL0C = tla::MakeLayoutL0C(m, head.vSize);
         auto tensorL0A = tla::MakeTensor(L0A(pipelineSlot), layoutL0A, Catlass::Arch::PositionL0A{});
         auto tensorL0B = tla::MakeTensor(L0B(pipelineSlot), layoutL0B, Catlass::Arch::PositionL0B{});
         auto tensorL0C = tla::MakeTensor(L0C(pipelineSlot), layoutL0C, Catlass::Arch::PositionL0C{});
@@ -574,12 +599,14 @@ private:
         } else {
             auto tensorKg = tla::MakeTensor(L1Kg(binding.slot), L1_LEFT_S2_LAYOUT,
                                             Catlass::Arch::PositionL1{});
-            auto tensorRight = tla::MakeTensor(L1HRight(hSlot), L1_RIGHT_S2_LAYOUT,
+            auto l1RightLayout = tla::MakeLayout<bfloat16_t, typename TileS2::LayoutTagL1B>(
+                FWD_H_CHUNK, head.vSize);
+            auto tensorRight = tla::MakeTensor(L1HRight(hSlot), l1RightLayout,
                                                Catlass::Arch::PositionL1{});
             copyA(tensorL0A, tla::GetTile(tensorKg, tla::MakeCoord(0, 0),
                                           tla::MakeShape(m, k)));
             copyB(tensorL0B, tla::GetTile(tensorRight, tla::MakeCoord(0, 0),
-                                          tla::MakeShape(k, FWD_H_V)));
+                                          tla::MakeShape(k, head.vSize)));
         }
         if (head.roundHead == binding.lastConsumer) {
             AscendC::SetFlag<AscendC::HardEvent::MTE1_MTE2>(WReadyEvent(binding.slot));
@@ -620,7 +647,7 @@ private:
         AscendC::WaitFlag<AscendC::HardEvent::M_FIX>(FixDoneEvent(pipelineSlot));
         AscendC::LocalTensor<float> dUb =
             UbBuffer()[FwdHLocalSlotBase(DataSlot(head))].template ReinterpretCast<float>();
-        auto ubLayout = tla::MakeLayout<float, LayoutOutput>(FWD_H_K, FWD_H_V);
+        auto ubLayout = tla::MakeLayout<float, LayoutOutput>(FWD_H_K, head.vSize);
         auto tensorUb = tla::MakeTensor(dUb, ubLayout, Catlass::Arch::PositionUB{});
         CopyL0CToUbS2<decltype(tensorUb)> copyD;
         copyD(tensorUb, tensorL0C, static_cast<uint8_t>(head.aiv), 0);
