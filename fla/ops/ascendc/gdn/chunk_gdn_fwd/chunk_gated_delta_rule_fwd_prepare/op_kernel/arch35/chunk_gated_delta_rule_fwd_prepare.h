@@ -15,18 +15,7 @@
 #ifndef CHUNK_GATED_DELTA_RULE_FWD_PREPARE_H
 #define CHUNK_GATED_DELTA_RULE_FWD_PREPARE_H
 
-#ifndef CATLASS_ARCH
-#define CATLASS_ARCH 3510
-#endif
-
 #include "kernel_operator.h"
-#include "catlass/arch/arch.hpp"
-#include "catlass/gemm/tile/tile_copy.hpp"
-#include "catlass/gemm/tile/tile_mmad.hpp"
-#include "catlass/layout/layout.hpp"
-#include "kernel_utils/tile/copy_l0c_to_ub.hpp"
-#include "tla/layout.hpp"
-#include "tla/tensor.hpp"
 #include "chunk_gated_delta_rule_fwd_prepare_common.h"
 #include "chunk_gated_delta_rule_fwd_prepare_vf.h"
 #include "chunk_gated_delta_rule_fwd_prepare_datacopy.h"
@@ -684,8 +673,8 @@ public:
     }
 
     // ========================= Stage 7 =========================
-    // K=V=128: one packed MMAD produces [W | U]; other shapes retain the
-    // original separate W/U pipeline. Results stay in the owning AIV's UB.
+    // W = A @ kbg (L0 ping), U = A @ vb (L0 pong). Fixpipe retains both
+    // results in the owning AIV's UB; the next pack drains them to GM.
     __aicore__ inline void Stage7_AicOne(const ChunkRange &chunk, int64_t hv, int64_t taskIdx)
     {
         const uint32_t rows = static_cast<uint32_t>(chunk.M);
@@ -706,13 +695,6 @@ public:
         wuFixpipeParams.params.srcNdStride = 0;
         wuFixpipeParams.params.dstNdStride = 0;
         WaitFlag<HardEvent::M_MTE1>(0);
-        if (nK == kGdnHeadDimK && nV == kGdnHeadDimK) {
-            WuPackedMatmulToUb<InDtype>(l1A[taskIdx], l1Kbg[taskIdx], l1Vb[taskIdx], l0AS7[0],
-                                        l0BS7[0], l0CS7[0], ubS7W[db], ubS7U[db], bt,
-                                        static_cast<int32_t>(nK + nV), bt, static_cast<int32_t>(rows),
-                                        static_cast<uint8_t>(taskIdx & 1), 0);
-            return;
-        }
         WuMatmulToL0C<InDtype>(l1A[taskIdx], l1Kbg[taskIdx], l0AS7[0], l0BS7[0], l0CS7[0], bt, static_cast<int32_t>(nK),
                                bt, 0);
         SetFlag<HardEvent::M_FIX>(0);

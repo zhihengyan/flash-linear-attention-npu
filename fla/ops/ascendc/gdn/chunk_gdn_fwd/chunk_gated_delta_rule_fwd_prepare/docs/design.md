@@ -10,9 +10,9 @@ GDN 前向准备链路，chunk 之间无状态依赖。task 按 value-head 组�
 `G=HV/HK=3/4` 保持每 pack 3/4 个 task；`G=1/2` 可按负载选择更短的 pack，但不得拆开同一
 HK 的 value-head 共享组。
 
-本轮推进 Prepare 内部 Stage7 和小 case pack 调度，不改变公开接口、数学语义、输出舍入顺序
-或支持范围。Stage3 masked Mul／Store 候选已实测为负收益并回退，实验数据仅保留在验证记录中，
-不与 Stage7、短 pack 混合归因。
+本轮只保留 Prepare 小 case pack 调度，不改变公开接口、数学语义、输出舍入顺序或支持范围。
+Stage3 masked Mul／Store 与 Stage7 packed W/U 候选均已回退，实验数据仅保留在验证记录中，
+不与短 pack 混合归因。
 
 固定性能环境：Ascend 950、device 2、相同 ATK 性能 JSON 与统计入口。性能结果为端到端
 `chunk_gated_delta_rule_fwd` 两条 case 的正式中位数；每项至少复测两轮，收益须超过基线波动。
@@ -23,8 +23,7 @@ HK 的 value-head 共享组。
 | 训练 case 1 | `B=2,HK=HV=32,T=8192,K=V=128,BT=64`，定长无状态输出 | 2707.735 µs | 2704.416～2709.092 µs | 精度通过且稳定下降 |
 
 基线波动分别为 7.321/4.676 µs。历史均值 1704.700/2704.500 µs 仅用于交叉验证。
-Stage7 候选减少 A 的重复 LoadA 并合并 W/U MMAD，直接作用于现有 Prepare 计算路径，
-但最终收益必须设备实测，不预写百分比。
+当前优化路径为小 case 短 pack；Stage7 packed W/U 候选已回退，不作为本轮性能方案。
 
 ## 2. Stage 0–7 完整详设
 
@@ -120,23 +119,13 @@ L0C W/U 为 `[0,64)` 与 `[64,128) KiB`，各保留一个 `64×128 FP32` 结果�
 ROW_MAJOR Fixpipe 到 UB：`W[172,204) KiB`、`U[204,236) KiB`，下一 pack 由所属 AIV drain
 到 GM；V=256 的 U 两个 128 列半块直接写 GM，不走 UB retained。
 
-本轮已在 `K=V=128` 路径实现 packed W/U：L0A 只装载一次 A，kbg/vb 分别装载到同一
-packed-NZ L0B 的 N 方向 `[0,128)` 与 `[128,256)` 半区，一次
-`C[64,256]FP32=A[64,64]BF16 @ B[64,256]BF16`。 packed L0B 为 32 KiB，L0C 为 64 KiB，
-均位于现有 S7 bank 内。两个输出从 L0C 的 `(0,0)`、`(0,128)` 分别取出，以 BF16
-ROW_MAJOR Fixpipe 到原 W/U UB；只写 `chunk.M` 个有效行，下一 pack 仍由所属 AIV drain
-到 GM。L1 输入与 L0 tile 均采用仓内 KDA 同类实现验证过的 TLA `GetTile` 形式，不把两个
-独立 128 列输出误当成两个独立 L0C 布局。
-
-V=256 保持原三次 MMAD 路径。packed 路径沿用 event 0 的 M_MTE1／MTE1_M／M_FIX／FIX_M
-生命周期：下一 task 覆写 L0A/L0B 前等待上一 task 的 M_MTE1，MMAD 前等待上一 L0C
-Fixpipe 完成，W/U 两次取出后再发布 FIX_M。跨核 drain 协议不变。当前状态是“实现与静态
-复核完成，待 CANN 构建、精度和性能验证”，尚不能据此声明数值正确或性能获益。
+Stage7 保持原 W/U 双 MMAD 与 ping/pong 生命周期；packed 候选因正式融合矩阵精度失败已完整
+回退，不再属于当前设计。
 
 ### 搬运与同步汇总
 
-Stage3 保持原始全量 Load、Mul 和 Store；Stage7 目标减少一次 A 的 L1→L0A 装载和一次
-MMAD launch，不增加 GM 流量或 workspace。所有输入仍按原路径从 GM 读取，L2 策略不变。
+Stage3 保持原始全量 Load、Mul 和 Store；Stage7 保持原 W/U 双 MMAD、装载和写回顺序，不增加
+GM 流量或 workspace。所有输入仍按原路径从 GM 读取，L2 策略不变。
 跨核 Stage1→2、Stage2→3、Stage3→4、Stage4→下一 pack Stage1、Stage6→7、Stage7→drain
 的 event id、方向、生产 pipe 和计数均保持不变；核内只复用已等待完成的 HardEvent，
 不提前释放仍被 MMAD/Fixpipe 使用的 L0/L1/UB。

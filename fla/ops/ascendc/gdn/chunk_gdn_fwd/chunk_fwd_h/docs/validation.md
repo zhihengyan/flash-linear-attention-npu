@@ -2,9 +2,9 @@
 
 ## 当前状态
 
-- 分支与基线：`feat/gdn-opt`，基线 `ea1f61a1`；当前提交 `ec611538`，half-head、Prepare 与 fwd_h 修复均已提交并推送。
+- 分支与基线：`feat/gdn-opt`，基线 `ea1f61a1`；当前提交 `3d822cf2`，half-head、Prepare 与 fwd_h 修复均已提交并推送。
 - 实现范围：仅在 Ascend 950、scalar-g、FP32 state、`state_v_first=false`，原任务少于物理 AIC 核且切分后 blockDim 增加时启用 `valueSplit=2`。
-- 当前证据：Prepare slim 与 `ec611538` 的 fwd_h 单算子精度均通过。当前融合矩阵仍有 435、380、277、279、280 等上一轮失败用例，完整失败集合待汇总；组合版本性能为 7783/10765 µs，相对 1705.298/2707.735 µs 基线严重负收益。原实现未限制 half-head 的适用任务规模，本地已增加空闲核及 blockDim 增长门控，待重新构建、精度与性能复测。
+- 当前证据：Prepare slim 与 fwd_h 单算子精度均通过。`3d822cf2` 的融合矩阵仍有 12/13/14、453/380/435 等失败；后三者已恢复 valueSplit=1、pack=4，仍失败说明 packed W/U 是共同活跃候选。按用户决定完整回退 Stage7 packed MMAD，保留 fwd_h 和小 case 短 pack 并行优化；回退后精度与性能均待上机复测。
 - 不得将任务数增加、理论核利用率或静态检查写成精度通过或性能收益。
 
 ## 固定验收环境
