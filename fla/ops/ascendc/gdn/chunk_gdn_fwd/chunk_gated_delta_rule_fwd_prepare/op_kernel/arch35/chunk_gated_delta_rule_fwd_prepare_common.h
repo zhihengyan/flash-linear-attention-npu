@@ -314,11 +314,25 @@ struct PrepareState {
         }
     }
 
-    // G=3 cannot fill 4 consecutive HV of one HK, so a pack is one HK group
-    // (nThis=3). G=1/2/4 fill a pack of 4: 4 HK, 2 HK, or 1 HK.
+    // Keep each HK sharing group inside one pack. Small G=1/2 cases may use
+    // shorter packs to engage otherwise idle cores; choose the lowest worst-case
+    // per-core task count and retain the larger pack when the cost ties.
     __aicore__ inline int64_t TasksPerPack() const
     {
-        return (HRatio == 3) ? 3 : kTasksPerRound;
+        const int64_t fullPack = (HRatio == 3) ? 3 : kTasksPerRound;
+        if (HRatio > 2 || numCore <= 0 || totalChunks <= 0) {
+            return fullPack;
+        }
+        int64_t bestPack = fullPack;
+        int64_t bestCost = CeilDiv(CeilDiv(totalChunks, fullPack), numCore) * fullPack;
+        for (int64_t pack = HRatio; pack < fullPack; pack += HRatio) {
+            const int64_t cost = CeilDiv(CeilDiv(totalChunks, pack), numCore) * pack;
+            if (cost < bestCost) {
+                bestCost = cost;
+                bestPack = pack;
+            }
+        }
+        return bestPack;
     }
 
     // G=2 full pack: place both HK owners first so AIV0/AIV1 each own one

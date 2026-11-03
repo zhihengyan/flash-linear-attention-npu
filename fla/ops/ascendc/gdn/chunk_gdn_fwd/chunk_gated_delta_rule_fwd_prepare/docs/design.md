@@ -5,13 +5,14 @@
 ## 1. 目标
 
 接口与支持范围以 [api.md](api.md) 为准。本算子在 Ascend 950 上以 MIX AIC:AIV=1:2 融合
-GDN 前向准备链路，chunk 之间无状态依赖。每核以最多四个 value-head task 为一 pack，
-AIV0/AIV1 分别处理 task 0/2 与 1/3，ping/pong 槽由 task id 决定；GVA owner 只计算一次
-Q/K norm 与 KKT。
+GDN 前向准备链路，chunk 之间无状态依赖。task 按 value-head 组成 pack，AIV0/AIV1 分别
+处理 task 0/2 与 1/3，ping/pong 槽由 task id 决定；GVA owner 只计算一次 Q/K norm 与 KKT。
+`G=HV/HK=3/4` 保持每 pack 3/4 个 task；`G=1/2` 可按负载选择更短的 pack，但不得拆开同一
+HK 的 value-head 共享组。
 
-本轮只推进 Prepare 内部 Stage7，不改变公开接口、数学语义、输出舍入顺序或支持范围。
-Stage3 masked Mul／Store 候选已实测为负收益并回退，实验数据仅保留在验证记录中，不与
-Stage7 混合归因。
+本轮推进 Prepare 内部 Stage7 和小 case pack 调度，不改变公开接口、数学语义、输出舍入顺序
+或支持范围。Stage3 masked Mul／Store 候选已实测为负收益并回退，实验数据仅保留在验证记录中，
+不与 Stage7、短 pack 混合归因。
 
 固定性能环境：Ascend 950、device 2、相同 ATK 性能 JSON 与统计入口。性能结果为端到端
 `chunk_gated_delta_rule_fwd` 两条 case 的正式中位数；每项至少复测两轮，收益须超过基线波动。
@@ -30,9 +31,15 @@ Stage7 候选减少 A 的重复 LoadA 并合并 W/U MMAD，直接作用于现有
 ### 任务域与资源
 
 task 是 `(sequence-chunk, hv)`，工作总量为 `chunkCount*HV`，`hk=hv/(HV/HK)`。
-固定 `BT=64`。Stage4 Y 使用每核 64 KiB GM workspace，四个 16 KiB slot，除此之外不新增
-workspace。L1 可用 512 KiB，当前最高使用地址 496 KiB；每 AIV UB 可用 248 KiB，V=128
-当前最高使用地址 236 KiB。L0A/L0B 各 64 KiB，L0C 256 KiB。本轮不增加任何片上常驻量。
+固定 `BT=64`。`G=1/2` 的候选 pack 从 `G` 到原 pack 大小按 `G` 递增，选择使
+`ceil(ceil(totalTasks/pack)/numCore)*pack` 最小者，平局保留较大 pack。该式表示最忙核的
+task 数；它只在确实存在核间负载差时缩短 pack，不减少总计算量，也不把“增加 pack 数”
+本身视为收益。所有 AIC/AIV 循环均按实际 `cur.nThis` 执行，初始 Stage4 credit 也按实际
+pack 大小发布。
+
+Stage4 Y 使用每核 64 KiB GM workspace，四个 16 KiB slot，除此之外不新增 workspace。
+L1 可用 512 KiB，当前最高使用地址 496 KiB；每 AIV UB 可用 248 KiB，V=128 当前最高使用
+地址 236 KiB。L0A/L0B 各 64 KiB，L0C 256 KiB。本轮不增加任何片上常驻量。
 
 | Stage | 执行单元 | 功能与主要结果 |
 | --- | --- | --- |
@@ -112,11 +119,18 @@ L0C W/U 为 `[0,64)` 与 `[64,128) KiB`，各保留一个 `64×128 FP32` 结果�
 ROW_MAJOR Fixpipe 到 UB：`W[172,204) KiB`、`U[204,236) KiB`，下一 pack 由所属 AIV drain
 到 GM；V=256 的 U 两个 128 列半块直接写 GM，不走 UB retained。
 
-本轮候选仅在 `K=V=128` 时启用：L0A 只装载一次 A，kbg/vb 组成 packed N=256 的 L0B，
-一次 `C[64,256]FP32=A[64,64]BF16 @ B[64,256]BF16`，再由两个 L0C 半区分别 Fixpipe 到原
-W/U UB。packed B 的 NZ fragment 必须按全宽 256 列组织，右半起始于第二个 16 KiB bank；
-在布局推导与编译验证完成前不实施。V=256 保持原三次 MMAD 路径。M_MTE1、MTE1_M、FIX_M、
-M_FIX 的输入/输出所有权与 drain 协议不变。
+本轮已在 `K=V=128` 路径实现 packed W/U：L0A 只装载一次 A，kbg/vb 分别装载到同一
+packed-NZ L0B 的 N 方向 `[0,128)` 与 `[128,256)` 半区，一次
+`C[64,256]FP32=A[64,64]BF16 @ B[64,256]BF16`。 packed L0B 为 32 KiB，L0C 为 64 KiB，
+均位于现有 S7 bank 内。两个输出从 L0C 的 `(0,0)`、`(0,128)` 分别取出，以 BF16
+ROW_MAJOR Fixpipe 到原 W/U UB；只写 `chunk.M` 个有效行，下一 pack 仍由所属 AIV drain
+到 GM。L1 输入与 L0 tile 均采用仓内 KDA 同类实现验证过的 TLA `GetTile` 形式，不把两个
+独立 128 列输出误当成两个独立 L0C 布局。
+
+V=256 保持原三次 MMAD 路径。packed 路径沿用 event 0 的 M_MTE1／MTE1_M／M_FIX／FIX_M
+生命周期：下一 task 覆写 L0A/L0B 前等待上一 task 的 M_MTE1，MMAD 前等待上一 L0C
+Fixpipe 完成，W/U 两次取出后再发布 FIX_M。跨核 drain 协议不变。当前状态是“实现与静态
+复核完成，待 CANN 构建、精度和性能验证”，尚不能据此声明数值正确或性能获益。
 
 ### 搬运与同步汇总
 
