@@ -29,11 +29,24 @@
 - `atk_chunk_gated_delta_rule_fwd.json`：既有泛化 500 条冻结矩阵，五种场景各 100 条，
   覆盖 BF16/FP16、MHA/GVA、V128/V256、chunk 64/128、定长/变长及状态组合。
 - `scripts/cases/legacy500_adapted.json`：既有 BF16/MHA 历史 500 条回归矩阵，不作为默认入口。
-- `atk_chunk_gated_delta_rule_fwd_perf.json`：A5 两条模型 case：
-  - 推理：`B=1,Hk=16,Hv=32,T=11274,K=V=128,chunk=64`，变长并输出最终状态；
-  - 训练：`B=2,Hk=Hv=32,T=8192,K=V=128,chunk=64`，定长无状态输出。
+- `atk_chunk_gated_delta_rule_fwd_perf.json`：A5 原两条模型 case 加六条小 case 性能用例：
+  - 推理 case 0：`B=1,Hk=16,Hv=32,T=11274,K=V=128,chunk=64`，变长并输出最终状态；
+  - 训练 case 1：`B=2,Hk=Hv=32,T=8192,K=V=128,chunk=64`，定长无状态输出；
+  - 小 case 2～7：BF16、K=V=128、chunk=64、FP32 零初态并输出最终状态，用于 Prepare 短 pack
+    和 fwd_h half-head 的同 shape A/B 测量，不替代精度矩阵。
 - `atk_chunk_gated_delta_rule_fwd_mss.json`：从冻结矩阵抽取 6 条精简用例，覆盖 V128/V256、
   chunk 64/128、定长/变长、FP16/BF16 和状态输出。
+
+小 case 的预期路径按当前 28 个 AIC 及调度公式静态推导，实际选择和性能均待上机确认：
+
+| case id | Shape 与序列 | 预期 Prepare pack | 预期 fwd_h valueSplit | 对照目的 |
+| --- | --- | ---: | ---: | --- |
+| 2 | `B=1,HK=HV=8,T=256`，G=1 | 1 | 2 | 两项优化共同触发 |
+| 3 | `B=1,HK=4,HV=8,T=256`，G=2 | 2 | 2 | 两项优化共同触发 |
+| 4 | `B=2,HK=4,HV=8,T=128`，G=2 | 2 | 1 | 仅 Prepare 短 pack |
+| 5 | `B=1,HK=4,HV=8,T=1024`，G=2 | 4 | 2 | 仅 fwd_h half-head |
+| 6 | `B=1,HK=2,HV=4,T=384`，两序列各 192，G=2 | 2 | 2 | varlen 联合触发 |
+| 7 | `B=1,HK=HV=32,T=256`，G=1 | 4 | 1 | 两项均不触发的对照 |
 
 A5 模型 shape 分别来源于 `推理model.csv` 和 `训练model.csv`，原文件 SHA256 为
 `a8f21a5ddc23b824b2b5ccc625d33db95dd9441b33f2b0c0e3e313e72aeaa363` 与
@@ -86,6 +99,13 @@ bash tests/atk/chunk_gated_delta_rule_fwd/scripts/run_matrix.sh 0
 bash tests/atk/run_test_cpu.sh -op=chunk_gated_delta_rule_fwd -npu_device_id=0 -scope=performance
 bash tests/atk/run_test_cpu.sh -op=chunk_gated_delta_rule_fwd -npu_device_id=0 -scope=determinism
 bash tests/atk/run_test_cpu.sh -op=chunk_gated_delta_rule_fwd -npu_device_id=0 -scope=mssanitizer
+```
+
+仅运行新增小 case 时设置性能范围；优化前后必须使用同一 JSON、设备、case 范围和统计方式：
+
+```bash
+PERFORMANCE_START=2 PERFORMANCE_END=7 \
+bash tests/atk/run_test_cpu.sh -op=chunk_gated_delta_rule_fwd -npu_device_id=0 -scope=performance --soc=ascend950
 ```
 
 正式结论必须记录代码 commit、ATK/CANN 版本、SoC、实际加载的 OPP、case JSON 哈希和原始报告。

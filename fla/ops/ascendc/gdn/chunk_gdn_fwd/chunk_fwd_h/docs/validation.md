@@ -2,9 +2,10 @@
 
 ## 当前状态
 
-- 分支与基线：`feat/gdn-opt`，基线 `ea1f61a1`；当前已推送提交 `c15adc11`，本地另有 VF 编译期分派修复待提交。
+- 分支与基线：`feat/gdn-opt`，基线 `ea1f61a1`；当前已推送提交 `a5ba454e`，本地新增六条小 case 性能用例。
 - 实现范围：仅在 Ascend 950、scalar-g、FP32 state、`state_v_first=false`，原任务少于物理 AIC 核且切分后 blockDim 增加时启用 `valueSplit=2`。
-- 当前证据：`c15adc11` 完整回退 packed W/U 后，正式融合精度已通过；但 case 0 性能为 3518 µs，仍为 1705.298 µs 基线的约 2.06 倍。该 case 已恢复 valueSplit=1、pack=4，因此本地继续修复未切分路径中的动态列宽热循环：Stage1、Stage3、S-1 改为 VF 调用前分派和模板常量列宽。修改后的构建、精度和性能均待上机验证。
+- 当前证据：`c15adc11` 完整回退 packed W/U 后，正式融合精度通过；`a5ba454e` 将 Stage1、Stage3、S-1 的 VF 列宽改为调用前分派和模板常量。用户报告该版本三次性能约为 1710／2021 µs，但测试时同时存在其他程序，数据只作受干扰参考，不作为无干扰正式性能结论。
+- 小 case 2～7 的调度选择仅为静态推导；实际 pack、valueSplit、blockDim、基线和优化后性能均待上机验证。
 - 不得将任务数增加、理论核利用率或静态检查写成精度通过或性能收益。
 
 ## 固定验收环境
@@ -27,11 +28,14 @@ bash tests/atk/run_test_cpu.sh -op=chunk_fwd_h -npu_device_id=2 -scope=accuracy 
 
 bash tests/atk/chunk_gated_delta_rule_fwd/scripts/run_matrix.sh 2
 
-ATK_OUTPUT_ROOT="tests/atk/chunk_gated_delta_rule_fwd/atk_output/perf_$(git rev-parse --short HEAD)_$(date +%Y%m%d_%H%M%S)" bash tests/atk/run_test_cpu.sh -op=chunk_gated_delta_rule_fwd -npu_device_id=2 -scope=performance --soc=ascend950
+PERFORMANCE_START=0 PERFORMANCE_END=1 ATK_OUTPUT_ROOT="tests/atk/chunk_gated_delta_rule_fwd/atk_output/perf_$(git rev-parse --short HEAD)_$(date +%Y%m%d_%H%M%S)" bash tests/atk/run_test_cpu.sh -op=chunk_gated_delta_rule_fwd -npu_device_id=2 -scope=performance --soc=ascend950
+
+PERFORMANCE_START=2 PERFORMANCE_END=7 ATK_OUTPUT_ROOT="tests/atk/chunk_gated_delta_rule_fwd/atk_output/small_perf_$(git rev-parse --short HEAD)_$(date +%Y%m%d_%H%M%S)" bash tests/atk/run_test_cpu.sh -op=chunk_gated_delta_rule_fwd -npu_device_id=2 -scope=performance --soc=ascend950
 ```
 
-验证顺序固定为 `chunk_fwd_h` 单算子精度 → 正式 500 条双标杆矩阵 → 两条正式性能 case。
-性能 case 至少复测两轮并保存逐轮原始值，与上述中位数及波动范围比较。
+验证顺序固定为 `chunk_fwd_h` 单算子精度 → 正式 500 条双标杆矩阵 → 两条正式性能 case →
+小 case A/B 性能。性能 case 至少复测两轮并保存逐轮原始值，与上述中位数及波动范围比较；
+小 case 必须在同一空闲设备上对基线和优化版本使用完全相同的 JSON、范围和统计方式。
 
 ## 性能追踪
 
@@ -39,7 +43,21 @@ ATK_OUTPUT_ROOT="tests/atk/chunk_gated_delta_rule_fwd/atk_output/perf_$(git rev-
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | 推理 case 0 | half-head / 严重负收益，增加适用门控后待复测 | 原 32 个 head task 已超过 28 核仍切为 64 个 half-head | 仅当原任务少于物理核且 split 后 blockDim 增加时启用 | fwd_h 单算子通过；融合矩阵仍有失败 | 1705.298 → 7783 µs（组合版本） | 待逐 kernel profiling | 固定开销及 W/K 重复装载增加；门控后正式 case 恢复 valueSplit=1 |
 | 训练 case 1 | half-head / 严重负收益，增加适用门控后待复测 | 原 64 个 head task 已超过 28 核仍切为 128 个 half-head | 同上 | 同上 | 2707.735 → 10765 µs（组合版本） | 待逐 kernel profiling | 门控后正式 case 恢复 valueSplit=1；组合值不作为单候选独立收益 |
-| 推理 case 0 | 编译期 VF 列宽 / 本地实现，待上机 | packed 回退且 valueSplit=1 后仍退化，运行时 valueSize 留在热循环 | VF 调用前一次分派；模板常量确定 64/128 列循环、stride 和寄存器分支 | c15adc11 正式融合精度通过；本修改待回归 | 1705.298 → 3518 µs（c15adc11）；本修改待测 | 目标是恢复原 128 列常量展开与地址优化 | half-head 保留；不能将待测修改写成收益 |
+| 推理 case 0 | 编译期 VF 列宽 / 受干扰复测 | packed 回退且 valueSplit=1 后仍退化，运行时 valueSize 留在热循环 | VF 调用前一次分派；模板常量确定 64/128 列循环、stride 和寄存器分支 | c15adc11 正式融合精度通过 | a5ba454e 用户报告约 1710／2021 µs | 其他程序同时运行，无法作稳定归因 | 需在空闲设备重跑；不预写收益 |
+
+### 小 case A/B 矩阵
+
+完整 shape 见 `tests/atk/chunk_gated_delta_rule_fwd/README.md`。以下预期路径按 28 个 AIC
+静态计算，不代表已观察到的运行时选择；基线与优化值均为待上机验证。
+
+| case id | 预期 pack / valueSplit | 归因目的 | ea1f61a1 基线 | 优化版本 | 状态 |
+| --- | --- | --- | --- | --- | --- |
+| 2 | 1 / 2 | G=1，两项联合 | 待测 | 待测 | 待上机验证 |
+| 3 | 2 / 2 | G=2，两项联合 | 待测 | 待测 | 待上机验证 |
+| 4 | 2 / 1 | 仅 Prepare | 待测 | 待测 | 待上机验证 |
+| 5 | 4 / 2 | 仅 fwd_h | 待测 | 待测 | 待上机验证 |
+| 6 | 2 / 2 | varlen 联合 | 待测 | 待测 | 待上机验证 |
+| 7 | 4 / 1 | 未触发对照 | 待测 | 待测 | 待上机验证 |
 
 ## 必测覆盖
 
@@ -52,7 +70,7 @@ ATK_OUTPUT_ROOT="tests/atk/chunk_gated_delta_rule_fwd/atk_output/perf_$(git rev-
 | 序列边界 | 单 chunk、两个 chunk、多 chunk、`T%64!=0` 尾 chunk；dense 与 varlen | H 的 chunk 前缀、tail 有效行、W/K lookahead 和末块写回正确 |
 | GM/片上布局 | H/U/V_new/initial/final state 的左右半列；right/state workspace | GM 行 stride 保持 128，片上紧凑 64 列，无跨行读写或槽重叠 |
 | 流水协议 | 单 head pipeline、空闲 AIV1、连续 work unit | P/D/right ready/free、ROUND_DONE/ACK 无死锁，state 不跨任务残留 |
-| 性能 | 两条正式 case，并补充一个原本存在明显核间尾波的小 case | 同时记录 blockDim、每核 half-head 数和端到端时间，识别重复 W/K 装载代价 |
+| 性能 | 两条正式 case 和小 case 2～7；case 4/5 分别隔离 Prepare/fwd_h，case 7 为未触发对照 | 同时记录 pack、valueSplit、blockDim 和端到端时间，识别短 pack 固定开销及重复 W/K 装载代价 |
 
 ## 静态复核记录
 

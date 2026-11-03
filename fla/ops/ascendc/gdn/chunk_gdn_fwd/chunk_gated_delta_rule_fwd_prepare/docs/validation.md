@@ -2,16 +2,18 @@
 
 ## 固定验收口径
 
-- 代码分支：`feat/gdn-opt`，本轮基线 `ea1f61a1`；当前已推送提交 `c15adc11`。
-- 当前验证：`c15adc11` 完整回退 Stage7 packed MMAD 后，正式融合精度已通过，仅保留 fwd_h 和小 case 短 pack 并行优化。case 0 性能仍为 3518 µs，高于 1705.298 µs 基线；该 case 的短 pack 已恢复 4、valueSplit 已恢复 1。当前本地修改仅将 fwd_h 的 VF 列宽改为调用前分派和编译期常量，Prepare 不再改动；性能待上机复测。
+- 代码分支：`feat/gdn-opt`，本轮基线 `ea1f61a1`；当前已推送提交 `a5ba454e`，本地新增六条小 case 性能用例。
+- 当前验证：`c15adc11` 完整回退 Stage7 packed MMAD 后，正式融合精度已通过，仅保留 fwd_h 和小 case 短 pack 并行优化。`a5ba454e` 将 fwd_h 的 VF 列宽改为调用前分派和编译期常量，Prepare 实现不再改动。用户报告三次性能约为 1710／2021 µs，但同时有其他程序运行，只作受干扰参考，不作为正式性能结论。
 - 硬件与设备：Ascend 950，device 2。
 - 精度：正式 500 条双标杆矩阵，每 25 条自动分片；最大相对误差比例 5、平均相对误差比例 1.5、均方根误差比例 1.5，沿用 ATK 判定。
-- 性能：固定两条正式 case，每项至少两轮，与正式中位数比较；不以 ACL event、理论核利用率或单 Stage timer 替代端到端结论。
+- 性能：固定两条正式 case，每项至少两轮，与正式中位数比较；小 case 使用同一 JSON 做基线/优化 A/B。不以 ACL event、理论核利用率或单 Stage timer 替代端到端结论。
 
 ```bash
 bash tests/atk/chunk_gated_delta_rule_fwd/scripts/run_matrix.sh 2
 
-ATK_OUTPUT_ROOT="tests/atk/chunk_gated_delta_rule_fwd/atk_output/perf_$(git rev-parse --short HEAD)_$(date +%Y%m%d_%H%M%S)" bash tests/atk/run_test_cpu.sh -op=chunk_gated_delta_rule_fwd -npu_device_id=2 -scope=performance --soc=ascend950
+PERFORMANCE_START=0 PERFORMANCE_END=1 ATK_OUTPUT_ROOT="tests/atk/chunk_gated_delta_rule_fwd/atk_output/perf_$(git rev-parse --short HEAD)_$(date +%Y%m%d_%H%M%S)" bash tests/atk/run_test_cpu.sh -op=chunk_gated_delta_rule_fwd -npu_device_id=2 -scope=performance --soc=ascend950
+
+PERFORMANCE_START=2 PERFORMANCE_END=7 ATK_OUTPUT_ROOT="tests/atk/chunk_gated_delta_rule_fwd/atk_output/small_perf_$(git rev-parse --short HEAD)_$(date +%Y%m%d_%H%M%S)" bash tests/atk/run_test_cpu.sh -op=chunk_gated_delta_rule_fwd -npu_device_id=2 -scope=performance --soc=ascend950
 ```
 
 每轮先构建并安装包含 DUT 及其公开入口依赖的 9 算子 wheel，确认 MD5 一致后重启测试
@@ -37,7 +39,21 @@ python scripts/verify_libcust_opapi_md5.py
 | 训练 case 1 | 基线 | Prepare Stage3/7 | 原始实现 | 用户给定稳定基线 | 2707.735 µs；范围 2704.416～2709.092 µs | 待本轮 profiling | 三轮波动 4.676 µs |
 | 两条 case | Stage3 / 负收益，放弃并回退 | 原实现对 4096 个元素执行 Mul/Store；候选只减少有效 lane | 候选仅将 Mul/Store 改为 lower mask，Load、打包、VCS、同步不变 | 正式 500 条未完整跑通 | 用户报告两次均值约 1710／2715 µs，基线为 1705.298／2707.735 µs | 无有效收益 | 循环、Load、Mul 和 Store 调用次数均未减少，却新增 UpdateMask 和 masked Store 开销；训练慢约 7.265 µs，超过基线波动，不能保留 |
 | 两条 case | Stage7 packed W/U / 精度失败，放弃并完整回退 | 原路径重复 LoadA，K=V=128 有两个 N=128 MMAD | 候选合并 packed N=256；当前恢复原 W/U 双 MMAD | Prepare slim 曾通过，但正式融合矩阵仍有 12/13/14、453/380/435 等失败 | 组合版本 7783/10765 µs，不作为单候选独立值 | 不再保留 packed 路径 | 用户决定完整回退；新增 TLA include、helper 和调用分支均删除 |
-| 小 case | 短 pack / 独立 slim 通过，增加大任务门控后待复测 | 原模型只看最忙核 task 数，case 1 会从 pack=4 错选 pack=1，case 0 平局仍选 4 | 仅 fullPacks<numCore 时评估短 pack，平局保留大 pack | Prepare slim 通过；Stage7 回退后待正式矩阵复测 | 组合版本 7783/10765 µs，不能作为单候选独立值 | pack 固定开销及流水粒度可能增加 | 两条正式 case 均恢复 pack=4；后续只选择存在空闲核的 shape |
+| 小 case | 短 pack / 独立 slim 通过，增加大任务门控后待复测 | 原模型只看最忙核 task 数，case 1 会从 pack=4 错选 pack=1，case 0 平局仍选 4 | 仅 fullPacks<numCore 时评估短 pack，平局保留大 pack | Prepare slim 通过；Stage7 回退后正式融合精度通过 | 组合版本 7783/10765 µs，不能作为单候选独立值 | pack 固定开销及流水粒度可能增加 | 两条正式 case 均恢复 pack=4；小 case 2～7 待做同 shape A/B |
+
+### 小 case A/B 矩阵
+
+完整 shape 见 `tests/atk/chunk_gated_delta_rule_fwd/README.md`。以下预期路径按 28 个 AIC
+静态计算，不代表已观察到的运行时选择；基线与优化值均为待上机验证。
+
+| case id | 预期 pack / valueSplit | 归因目的 | ea1f61a1 基线 | 优化版本 | 状态 |
+| --- | --- | --- | --- | --- | --- |
+| 2 | 1 / 2 | G=1，两项联合 | 待测 | 待测 | 待上机验证 |
+| 3 | 2 / 2 | G=2，两项联合 | 待测 | 待测 | 待上机验证 |
+| 4 | 2 / 1 | 仅 Prepare | 待测 | 待测 | 待上机验证 |
+| 5 | 4 / 2 | 仅 fwd_h | 待测 | 待测 | 待上机验证 |
+| 6 | 2 / 2 | varlen 联合 | 待测 | 待测 | 待上机验证 |
+| 7 | 4 / 1 | 未触发对照 | 待测 | 待测 | 待上机验证 |
 
 ## 待验证矩阵
 
@@ -47,8 +63,8 @@ python scripts/verify_libcust_opapi_md5.py
 3. **短 pack 调度**：覆盖 G=1/2 的 pack=1/2/4 可达组合、最后一个不完整 pack、跨 pack L1
    槽复用和最终 W/U drain；G=3/4 应保持原调度。
 4. **性能**：正式精度全部通过后，两条正式 case 至少各复测两轮并保留原始值。
-5. **小 case 性能证据**：额外选择短 pack 实际降低最忙核 task 数的 shape，同时记录 pack 选择、
-   理论最忙核 task 数和端到端时间。
+5. **小 case 性能证据**：运行 case 2～7，记录实际 pack 选择、理论最忙核 task 数和端到端时间；
+   case 4 隔离短 pack，case 7 检查未触发路径是否保持基线。
 
 ## 追溯与检查
 
