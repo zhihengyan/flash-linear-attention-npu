@@ -223,7 +223,7 @@ __simd_vf__ inline void FwdHStage1Arch35Vf(__ubuf__ bfloat16_t *uAndVNew,
         for (uint16_t col = 0; col < valueSize; col += BF16_PER_REG) {
             const uint32_t bf16Offset = rowBf16Offset + col;
             const uint32_t fp32Offset = rowFp32Offset + col;
-            if (valueSize == BF16_PER_REG) {
+            if (valueSize == FWD_H_V / 2) {
                 FwdHLoad64AsFloat<bfloat16_t>(u0, uAndVNew + bf16Offset, mask32);
                 if constexpr (HAS_P) {
                     FwdHLoad64AsFloat<PType>(p0, p + fp32Offset, mask32);
@@ -316,7 +316,7 @@ __simd_vf__ inline void FwdHStage3Arch35Vf(__ubuf__ bfloat16_t *stateBf16,
         for (uint16_t col = 0; col < valueSize; col += BF16_PER_REG) {
             const uint32_t bf16Offset = static_cast<uint32_t>(row) * valueSize + col;
             const uint32_t fp32Offset = static_cast<uint32_t>(row) * valueSize + col;
-            if (valueSize == BF16_PER_REG) {
+            if (valueSize == FWD_H_V / 2) {
                 if constexpr (STATE_FP32) {
                     if constexpr (ZERO_STATE) {
                         Duplicate(state0, 0.0f, mask32);
@@ -399,7 +399,7 @@ __simd_vf__ inline void FwdHSMinusOneArch35Vf(__ubuf__ float *state,
         for (uint16_t col = 0; col < valueSize; col += BF16_PER_REG) {
             const uint32_t fp32Offset = static_cast<uint32_t>(row) * valueSize + col;
             const uint32_t bf16Offset = static_cast<uint32_t>(row) * valueSize + col;
-            if (valueSize == BF16_PER_REG) {
+            if (valueSize == FWD_H_V / 2) {
                 FwdHLoad64AsFloat<float>(state0, state + fp32Offset, mask32);
                 FwdHStore64Bf16(h + bf16Offset, state0, mask32);
             } else {
