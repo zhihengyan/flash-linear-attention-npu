@@ -268,7 +268,9 @@ half-head 的公开 GM 布局不变，H/U/V_new/initial_state/final_state 的每
 FP32 rolling state 在每个 half-head work unit 内继续驻留所属 AIV 的 UB，不跨 half-head 共享。
 单 head AIC/AIV pipeline、W/K 与 U/g 双 bank 预取、P/D/right ready/free、ROUND_DONE/ACK 均复用
 原协议；没有本地 head 的 AIV1 仍参与 round 握手，但不访问数据。64 列 VF 的 Load/Cast/Store
-只操作 `u0/p0/state0/d0`，128 列原双寄存器路径不变。
+只操作 `u0/p0/state0/d0`，128 列原双寄存器路径不变。Stage1、Stage3、S-1 在 `VF_CALL` 前按
+`head.vSize` 做一次运行时分派，VF 内部以模板常量 `VALUE_SIZE=64/128` 确定循环边界、地址 stride
+和寄存器分支，不让未切分的 128 列热循环承担动态列宽开销。
 
 该优化只在能实际增加工作核时尝试改善尾波，但 half-head 会重复装载 W/K，且每任务固定控制与
 同步开销不会减半。因此“任务数翻倍”不等于“性能翻倍”；最终是否保留必须由同 shape 的精度

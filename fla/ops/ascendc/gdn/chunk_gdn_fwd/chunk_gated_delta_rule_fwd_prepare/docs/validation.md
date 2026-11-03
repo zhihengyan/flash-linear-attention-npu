@@ -2,8 +2,8 @@
 
 ## 固定验收口径
 
-- 代码分支：`feat/gdn-opt`，本轮基线 `ea1f61a1`；当前提交 `3d822cf2`。
-- 当前验证：Prepare slim 与 fwd_h 单算子精度均通过。`3d822cf2` 的融合矩阵仍有 12/13/14、453/380/435 等失败；后三者已恢复 valueSplit=1、pack=4，仍失败说明 packed W/U 是共同活跃候选。按用户决定完整回退 Stage7 packed MMAD，恢复原 W/U 双 MMAD，仅保留 fwd_h 和小 case 短 pack 并行优化。此前组合版本性能 7783/10765 µs 为严重负收益；回退后精度与性能均待上机复测。
+- 代码分支：`feat/gdn-opt`，本轮基线 `ea1f61a1`；当前已推送提交 `c15adc11`。
+- 当前验证：`c15adc11` 完整回退 Stage7 packed MMAD 后，正式融合精度已通过，仅保留 fwd_h 和小 case 短 pack 并行优化。case 0 性能仍为 3518 µs，高于 1705.298 µs 基线；该 case 的短 pack 已恢复 4、valueSplit 已恢复 1。当前本地修改仅将 fwd_h 的 VF 列宽改为调用前分派和编译期常量，Prepare 不再改动；性能待上机复测。
 - 硬件与设备：Ascend 950，device 2。
 - 精度：正式 500 条双标杆矩阵，每 25 条自动分片；最大相对误差比例 5、平均相对误差比例 1.5、均方根误差比例 1.5，沿用 ATK 判定。
 - 性能：固定两条正式 case，每项至少两轮，与正式中位数比较；不以 ACL event、理论核利用率或单 Stage timer 替代端到端结论。

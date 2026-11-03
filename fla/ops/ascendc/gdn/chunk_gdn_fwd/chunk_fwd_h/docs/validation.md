@@ -2,9 +2,9 @@
 
 ## 当前状态
 
-- 分支与基线：`feat/gdn-opt`，基线 `ea1f61a1`；当前提交 `3d822cf2`，half-head、Prepare 与 fwd_h 修复均已提交并推送。
+- 分支与基线：`feat/gdn-opt`，基线 `ea1f61a1`；当前已推送提交 `c15adc11`，本地另有 VF 编译期分派修复待提交。
 - 实现范围：仅在 Ascend 950、scalar-g、FP32 state、`state_v_first=false`，原任务少于物理 AIC 核且切分后 blockDim 增加时启用 `valueSplit=2`。
-- 当前证据：Prepare slim 与 fwd_h 单算子精度均通过。`3d822cf2` 的融合矩阵仍有 12/13/14、453/380/435 等失败；后三者已恢复 valueSplit=1、pack=4，仍失败说明 packed W/U 是共同活跃候选。按用户决定完整回退 Stage7 packed MMAD，保留 fwd_h 和小 case 短 pack 并行优化；回退后精度与性能均待上机复测。
+- 当前证据：`c15adc11` 完整回退 packed W/U 后，正式融合精度已通过；但 case 0 性能为 3518 µs，仍为 1705.298 µs 基线的约 2.06 倍。该 case 已恢复 valueSplit=1、pack=4，因此本地继续修复未切分路径中的动态列宽热循环：Stage1、Stage3、S-1 改为 VF 调用前分派和模板常量列宽。修改后的构建、精度和性能均待上机验证。
 - 不得将任务数增加、理论核利用率或静态检查写成精度通过或性能收益。
 
 ## 固定验收环境
@@ -39,6 +39,7 @@ ATK_OUTPUT_ROOT="tests/atk/chunk_gated_delta_rule_fwd/atk_output/perf_$(git rev-
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | 推理 case 0 | half-head / 严重负收益，增加适用门控后待复测 | 原 32 个 head task 已超过 28 核仍切为 64 个 half-head | 仅当原任务少于物理核且 split 后 blockDim 增加时启用 | fwd_h 单算子通过；融合矩阵仍有失败 | 1705.298 → 7783 µs（组合版本） | 待逐 kernel profiling | 固定开销及 W/K 重复装载增加；门控后正式 case 恢复 valueSplit=1 |
 | 训练 case 1 | half-head / 严重负收益，增加适用门控后待复测 | 原 64 个 head task 已超过 28 核仍切为 128 个 half-head | 同上 | 同上 | 2707.735 → 10765 µs（组合版本） | 待逐 kernel profiling | 门控后正式 case 恢复 valueSplit=1；组合值不作为单候选独立收益 |
+| 推理 case 0 | 编译期 VF 列宽 / 本地实现，待上机 | packed 回退且 valueSplit=1 后仍退化，运行时 valueSize 留在热循环 | VF 调用前一次分派；模板常量确定 64/128 列循环、stride 和寄存器分支 | c15adc11 正式融合精度通过；本修改待回归 | 1705.298 → 3518 µs（c15adc11）；本修改待测 | 目标是恢复原 128 列常量展开与地址优化 | half-head 保留；不能将待测修改写成收益 |
 
 ## 必测覆盖
 

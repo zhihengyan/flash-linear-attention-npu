@@ -181,13 +181,14 @@ __simd_vf__ inline void FwdHPrepareScalarGateArch35Vf(__ubuf__ float *gateScale,
     }
 }
 
-template <bool HAS_P, bool SCALAR_G, bool WRITE_RIGHT, bool ZERO_STATE, typename PType>
+template <bool HAS_P, bool SCALAR_G, bool WRITE_RIGHT, bool ZERO_STATE, typename PType,
+          uint16_t VALUE_SIZE>
 __simd_vf__ inline void FwdHStage1Arch35Vf(__ubuf__ bfloat16_t *uAndVNew,
                                            __ubuf__ PType *p,
                                            __ubuf__ float *gateScale,
                                            __ubuf__ bfloat16_t *right,
                                            __ubuf__ bfloat16_t *state,
-                                           uint16_t validTokens, uint16_t valueSize)
+                                           uint16_t validTokens)
 {
     // Stage1:
     //   V_new_fp32[i,:] = fp32(U[i,:]) - fp32(P[i,:])，HAS_P=false 时 P=0；
@@ -195,7 +196,7 @@ __simd_vf__ inline void FwdHStage1Arch35Vf(__ubuf__ bfloat16_t *uAndVNew,
     //   g-only: right[i,:] = cast_BF16(E(g_last-g_i) * V_new_fp32[i,:])，alpha=E(g_last)；
     //   gk-only: right=V_new。E 由 USE_EXP2 在编译期选择。
     constexpr uint16_t BF16_PER_REG = AscendC::VECTOR_REG_WIDTH / sizeof(bfloat16_t);
-    const uint16_t stateRows = FWD_H_K * valueSize / BF16_PER_REG;
+    constexpr uint16_t stateRows = FWD_H_K * VALUE_SIZE / BF16_PER_REG;
     MaskReg mask16 = CreateMask<bfloat16_t, MaskPattern::ALL>();
     MaskReg mask32 = CreateMask<float, MaskPattern::ALL>();
 
@@ -215,15 +216,15 @@ __simd_vf__ inline void FwdHStage1Arch35Vf(__ubuf__ bfloat16_t *uAndVNew,
     RegTensor<float> scaleReg;
     #pragma unroll 2
     for (uint16_t row = 0; row < validTokens; ++row) {
-        const uint32_t rowBf16Offset = static_cast<uint32_t>(row) * valueSize;
-        const uint32_t rowFp32Offset = static_cast<uint32_t>(row) * valueSize;
+        const uint32_t rowBf16Offset = static_cast<uint32_t>(row) * VALUE_SIZE;
+        const uint32_t rowFp32Offset = static_cast<uint32_t>(row) * VALUE_SIZE;
         if constexpr (SCALAR_G && WRITE_RIGHT) {
             LoadAlign<float, LoadDist::DIST_BRC_B32>(scaleReg, gateScale + row);
         }
-        for (uint16_t col = 0; col < valueSize; col += BF16_PER_REG) {
+        for (uint16_t col = 0; col < VALUE_SIZE; col += BF16_PER_REG) {
             const uint32_t bf16Offset = rowBf16Offset + col;
             const uint32_t fp32Offset = rowFp32Offset + col;
-            if (valueSize == FWD_H_V / 2) {
+            if constexpr (VALUE_SIZE == FWD_H_V / 2) {
                 FwdHLoad64AsFloat<bfloat16_t>(u0, uAndVNew + bf16Offset, mask32);
                 if constexpr (HAS_P) {
                     FwdHLoad64AsFloat<PType>(p0, p + fp32Offset, mask32);
@@ -267,14 +268,13 @@ __simd_vf__ inline void FwdHStage1Arch35Vf(__ubuf__ bfloat16_t *uAndVNew,
 }
 
 template <bool STATE_FP32, bool SCALAR_G, bool STATE_V_FIRST, bool WRITE_H,
-          bool ZERO_STATE, bool USE_EXP2, typename GateT>
+          bool ZERO_STATE, bool USE_EXP2, typename GateT, uint16_t VALUE_SIZE>
 __simd_vf__ inline void FwdHStage3Arch35Vf(__ubuf__ bfloat16_t *stateBf16,
                                            __ubuf__ float *stateFp32,
                                            __ubuf__ float *d,
                                            __ubuf__ GateT *gkLast,
                                            __ubuf__ float *alpha,
-                                           __ubuf__ bfloat16_t *hNext,
-                                           uint16_t valueSize)
+                                           __ubuf__ bfloat16_t *hNext)
 {
     // Stage3:
     //   g-only: R_next = alpha * R + D，alpha=E(g_last)；
@@ -313,10 +313,10 @@ __simd_vf__ inline void FwdHStage3Arch35Vf(__ubuf__ bfloat16_t *stateBf16,
 
     #pragma unroll 2
     for (uint16_t row = 0; row < ROWS; ++row) {
-        for (uint16_t col = 0; col < valueSize; col += BF16_PER_REG) {
-            const uint32_t bf16Offset = static_cast<uint32_t>(row) * valueSize + col;
-            const uint32_t fp32Offset = static_cast<uint32_t>(row) * valueSize + col;
-            if (valueSize == FWD_H_V / 2) {
+        for (uint16_t col = 0; col < VALUE_SIZE; col += BF16_PER_REG) {
+            const uint32_t bf16Offset = static_cast<uint32_t>(row) * VALUE_SIZE + col;
+            const uint32_t fp32Offset = static_cast<uint32_t>(row) * VALUE_SIZE + col;
+            if constexpr (VALUE_SIZE == FWD_H_V / 2) {
                 if constexpr (STATE_FP32) {
                     if constexpr (ZERO_STATE) {
                         Duplicate(state0, 0.0f, mask32);
@@ -384,9 +384,9 @@ __simd_vf__ inline void FwdHStage3Arch35Vf(__ubuf__ bfloat16_t *stateBf16,
     }
 }
 
+template <uint16_t VALUE_SIZE>
 __simd_vf__ inline void FwdHSMinusOneArch35Vf(__ubuf__ float *state,
-                                               __ubuf__ bfloat16_t *h,
-                                               uint16_t valueSize)
+                                               __ubuf__ bfloat16_t *h)
 {
     // S-1: H0 = cast_BF16(initial_state)。输入和输出保持 state_v_first 指定的同一物理顺序。
     constexpr uint16_t BF16_PER_REG = AscendC::VECTOR_REG_WIDTH / sizeof(bfloat16_t);
@@ -396,10 +396,10 @@ __simd_vf__ inline void FwdHSMinusOneArch35Vf(__ubuf__ float *state,
     RegTensor<float> state1;
     #pragma unroll 2
     for (uint16_t row = 0; row < 128; ++row) {
-        for (uint16_t col = 0; col < valueSize; col += BF16_PER_REG) {
-            const uint32_t fp32Offset = static_cast<uint32_t>(row) * valueSize + col;
-            const uint32_t bf16Offset = static_cast<uint32_t>(row) * valueSize + col;
-            if (valueSize == FWD_H_V / 2) {
+        for (uint16_t col = 0; col < VALUE_SIZE; col += BF16_PER_REG) {
+            const uint32_t fp32Offset = static_cast<uint32_t>(row) * VALUE_SIZE + col;
+            const uint32_t bf16Offset = static_cast<uint32_t>(row) * VALUE_SIZE + col;
+            if constexpr (VALUE_SIZE == FWD_H_V / 2) {
                 FwdHLoad64AsFloat<float>(state0, state + fp32Offset, mask32);
                 FwdHStore64Bf16(h + bf16Offset, state0, mask32);
             } else {
@@ -702,10 +702,15 @@ private:
         // S-1：H0=cast_BF16(initial_state)。输入输出保持 state_v_first 指定的物理顺序。
         const uint32_t slot = head.localSlot;
         AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(IoReadyEvent(slot));
-        AscendC::VF_CALL<FwdHSMinusOneArch35Vf>(
-            reinterpret_cast<__ubuf__ float *>(SminusStateSlot(slot).GetPhyAddr()),
-            reinterpret_cast<__ubuf__ bfloat16_t *>(SminusHSlot(slot).GetPhyAddr()),
-            static_cast<uint16_t>(head.vSize));
+        if (head.vSize == FWD_H_V) {
+            AscendC::VF_CALL<FwdHSMinusOneArch35Vf<FWD_H_V>>(
+                reinterpret_cast<__ubuf__ float *>(SminusStateSlot(slot).GetPhyAddr()),
+                reinterpret_cast<__ubuf__ bfloat16_t *>(SminusHSlot(slot).GetPhyAddr()));
+        } else {
+            AscendC::VF_CALL<FwdHSMinusOneArch35Vf<FWD_H_V / 2>>(
+                reinterpret_cast<__ubuf__ float *>(SminusStateSlot(slot).GetPhyAddr()),
+                reinterpret_cast<__ubuf__ bfloat16_t *>(SminusHSlot(slot).GetPhyAddr()));
+        }
         AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(IoDoneEvent(slot));
         AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(IoDoneEvent(slot));
         AscendC::GlobalTensor<bfloat16_t> h;
@@ -784,15 +789,33 @@ private:
                 FwdHAivLocalFlag(FWD_H_P_READY_FLAG, head.localSlot));
         }
         if constexpr (CompilePolicy::GATE_MODE == FwdHGateMode::SCALAR_G) {
-            AscendC::VF_CALL<FwdHStage1Arch35Vf<HAS_P, true, WRITE_RIGHT, ZERO_STATE, PType>>(
-                reinterpret_cast<__ubuf__ bfloat16_t *>(WorkBf16Slot(inputSlot).GetPhyAddr()), p,
-                reinterpret_cast<__ubuf__ float *>(GateScaleSlot(inputSlot).GetPhyAddr()), right, state,
-                static_cast<uint16_t>(chunk.validTokens), static_cast<uint16_t>(head.vSize));
+            if (head.vSize == FWD_H_V) {
+                AscendC::VF_CALL<FwdHStage1Arch35Vf<HAS_P, true, WRITE_RIGHT, ZERO_STATE, PType,
+                                                    FWD_H_V>>(
+                    reinterpret_cast<__ubuf__ bfloat16_t *>(WorkBf16Slot(inputSlot).GetPhyAddr()), p,
+                    reinterpret_cast<__ubuf__ float *>(GateScaleSlot(inputSlot).GetPhyAddr()), right, state,
+                    static_cast<uint16_t>(chunk.validTokens));
+            } else {
+                AscendC::VF_CALL<FwdHStage1Arch35Vf<HAS_P, true, WRITE_RIGHT, ZERO_STATE, PType,
+                                                    FWD_H_V / 2>>(
+                    reinterpret_cast<__ubuf__ bfloat16_t *>(WorkBf16Slot(inputSlot).GetPhyAddr()), p,
+                    reinterpret_cast<__ubuf__ float *>(GateScaleSlot(inputSlot).GetPhyAddr()), right, state,
+                    static_cast<uint16_t>(chunk.validTokens));
+            }
         } else {
-            AscendC::VF_CALL<FwdHStage1Arch35Vf<HAS_P, false, WRITE_RIGHT, ZERO_STATE, PType>>(
-                reinterpret_cast<__ubuf__ bfloat16_t *>(WorkBf16Slot(inputSlot).GetPhyAddr()), p,
-                reinterpret_cast<__ubuf__ float *>(GateScaleSlot(inputSlot).GetPhyAddr()), right, state,
-                static_cast<uint16_t>(chunk.validTokens), static_cast<uint16_t>(head.vSize));
+            if (head.vSize == FWD_H_V) {
+                AscendC::VF_CALL<FwdHStage1Arch35Vf<HAS_P, false, WRITE_RIGHT, ZERO_STATE, PType,
+                                                    FWD_H_V>>(
+                    reinterpret_cast<__ubuf__ bfloat16_t *>(WorkBf16Slot(inputSlot).GetPhyAddr()), p,
+                    reinterpret_cast<__ubuf__ float *>(GateScaleSlot(inputSlot).GetPhyAddr()), right, state,
+                    static_cast<uint16_t>(chunk.validTokens));
+            } else {
+                AscendC::VF_CALL<FwdHStage1Arch35Vf<HAS_P, false, WRITE_RIGHT, ZERO_STATE, PType,
+                                                    FWD_H_V / 2>>(
+                    reinterpret_cast<__ubuf__ bfloat16_t *>(WorkBf16Slot(inputSlot).GetPhyAddr()), p,
+                    reinterpret_cast<__ubuf__ float *>(GateScaleSlot(inputSlot).GetPhyAddr()), right, state,
+                    static_cast<uint16_t>(chunk.validTokens));
+            }
         }
         if constexpr (HAS_P) {
             AscendC::CrossCoreSetFlag<0x4, PIPE_V>(
@@ -1000,21 +1023,41 @@ private:
             hNext = reinterpret_cast<__ubuf__ bfloat16_t *>(StateBf16Slot(slot).GetPhyAddr());
         }
         if constexpr (CompilePolicy::GATE_MODE == FwdHGateMode::SCALAR_G) {
-            AscendC::VF_CALL<FwdHStage3Arch35Vf<CompilePolicy::STATE_FP32, true, STATE_V_FIRST,
-                                                WRITE_H, ZERO_INIT, CompilePolicy::USE_EXP2, GateT>>(
-                reinterpret_cast<__ubuf__ bfloat16_t *>(StateBf16Slot(slot).GetPhyAddr()),
-                reinterpret_cast<__ubuf__ float *>(StateFp32(stateSlot).GetPhyAddr()), d,
-                reinterpret_cast<__ubuf__ GateT *>(GateSlot(gateSlot).GetPhyAddr()),
-                reinterpret_cast<__ubuf__ float *>(AlphaSlot(gateSlot).GetPhyAddr()), hNext,
-                static_cast<uint16_t>(head.vSize));
+            if (head.vSize == FWD_H_V) {
+                AscendC::VF_CALL<FwdHStage3Arch35Vf<CompilePolicy::STATE_FP32, true, STATE_V_FIRST,
+                                                    WRITE_H, ZERO_INIT, CompilePolicy::USE_EXP2, GateT,
+                                                    FWD_H_V>>(
+                    reinterpret_cast<__ubuf__ bfloat16_t *>(StateBf16Slot(slot).GetPhyAddr()),
+                    reinterpret_cast<__ubuf__ float *>(StateFp32(stateSlot).GetPhyAddr()), d,
+                    reinterpret_cast<__ubuf__ GateT *>(GateSlot(gateSlot).GetPhyAddr()),
+                    reinterpret_cast<__ubuf__ float *>(AlphaSlot(gateSlot).GetPhyAddr()), hNext);
+            } else {
+                AscendC::VF_CALL<FwdHStage3Arch35Vf<CompilePolicy::STATE_FP32, true, STATE_V_FIRST,
+                                                    WRITE_H, ZERO_INIT, CompilePolicy::USE_EXP2, GateT,
+                                                    FWD_H_V / 2>>(
+                    reinterpret_cast<__ubuf__ bfloat16_t *>(StateBf16Slot(slot).GetPhyAddr()),
+                    reinterpret_cast<__ubuf__ float *>(StateFp32(stateSlot).GetPhyAddr()), d,
+                    reinterpret_cast<__ubuf__ GateT *>(GateSlot(gateSlot).GetPhyAddr()),
+                    reinterpret_cast<__ubuf__ float *>(AlphaSlot(gateSlot).GetPhyAddr()), hNext);
+            }
         } else {
-            AscendC::VF_CALL<FwdHStage3Arch35Vf<CompilePolicy::STATE_FP32, false, STATE_V_FIRST,
-                                                WRITE_H, ZERO_INIT, CompilePolicy::USE_EXP2, GateT>>(
-                reinterpret_cast<__ubuf__ bfloat16_t *>(StateBf16Slot(slot).GetPhyAddr()),
-                reinterpret_cast<__ubuf__ float *>(StateFp32(stateSlot).GetPhyAddr()), d,
-                reinterpret_cast<__ubuf__ GateT *>(GateSlot(gateSlot).GetPhyAddr()),
-                reinterpret_cast<__ubuf__ float *>(AlphaSlot(gateSlot).GetPhyAddr()), hNext,
-                static_cast<uint16_t>(head.vSize));
+            if (head.vSize == FWD_H_V) {
+                AscendC::VF_CALL<FwdHStage3Arch35Vf<CompilePolicy::STATE_FP32, false, STATE_V_FIRST,
+                                                    WRITE_H, ZERO_INIT, CompilePolicy::USE_EXP2, GateT,
+                                                    FWD_H_V>>(
+                    reinterpret_cast<__ubuf__ bfloat16_t *>(StateBf16Slot(slot).GetPhyAddr()),
+                    reinterpret_cast<__ubuf__ float *>(StateFp32(stateSlot).GetPhyAddr()), d,
+                    reinterpret_cast<__ubuf__ GateT *>(GateSlot(gateSlot).GetPhyAddr()),
+                    reinterpret_cast<__ubuf__ float *>(AlphaSlot(gateSlot).GetPhyAddr()), hNext);
+            } else {
+                AscendC::VF_CALL<FwdHStage3Arch35Vf<CompilePolicy::STATE_FP32, false, STATE_V_FIRST,
+                                                    WRITE_H, ZERO_INIT, CompilePolicy::USE_EXP2, GateT,
+                                                    FWD_H_V / 2>>(
+                    reinterpret_cast<__ubuf__ bfloat16_t *>(StateBf16Slot(slot).GetPhyAddr()),
+                    reinterpret_cast<__ubuf__ float *>(StateFp32(stateSlot).GetPhyAddr()), d,
+                    reinterpret_cast<__ubuf__ GateT *>(GateSlot(gateSlot).GetPhyAddr()),
+                    reinterpret_cast<__ubuf__ float *>(AlphaSlot(gateSlot).GetPhyAddr()), hNext);
+            }
         }
         if constexpr (RELEASE_GATE_BANK) {
             static_assert(CompilePolicy::GATE_MODE == FwdHGateMode::SCALAR_G,
