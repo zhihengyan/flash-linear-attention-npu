@@ -153,7 +153,7 @@ ge::graphStatus Tiling4ChunkFwdH(gert::TilingContext *context)
     tilingCtx.chunkSize = chunkSize;
     tilingCtx.enableValueSplit =
         ascendcPlatform.GetSocVersion() == platform_ascendc::SocVersion::ASCEND950 &&
-        useG && stateDtypeToken == GDN::CHUNK_FWD_H_TPL_FP32 && !stateVFirst;
+        useG && stateDtypeToken == CHUNK_FWD_H_TPL_FP32 && !stateVFirst;
     tilingCtx.aicCoreNum = ascendcPlatform.GetCoreNumAic();
     tilingCtx.libApiWorkSpaceSize = ascendcPlatform.GetLibApiWorkSpaceSize();
 
