@@ -282,6 +282,11 @@ min/max、P50/P90/P99；完整样本、原始行和 CSV 来源保存在 `OUT/rgd
 执行与完成响应，不应称为纯算术时间。未知列名/单位、无目标记录、缺样本、重复导致超数、
 多个 OPPROF 运行目录或多设备都会失败，并保留 inventory/error，不能把缺失数据当作成功。
 
+已适配用户实际 A5 导出：`Op Type=vector` 表示计算类型，此时通过完整的
+`RecurrentGatedDeltaRule_<32位hash>_<数字key>` kernel 名识别 RGDR，不将所有 vector 算子计入。
+同时兼容 `Device Id` 与 `Device ID` 列名。原始行、匹配来源、总行数、类型计数及最多 3 条未匹配
+行示例保留在报告中。汇总失败修复后只需替换脚本、重解析原 `$OUT`，无需重新编译或重新采集。
+
 官方参数和字段依据：
 [msOpProf 26.0 参数说明](https://github.com/Ascend/msopprof/blob/26.0.0/docs/en/user_guide/msopprof_user_guide.md)、
 [OpBasicInfo 字段](https://github.com/Ascend/msopprof/blob/master/docs/en/user_guide/msopprof_performance_data.md#opbasicinfo-basic-operator-information)。

@@ -154,14 +154,25 @@ def run_application(args):
     print("Timing comes from msprof op, not Python wall clock. Run --summarize after msprof exits.")
 
 
-def is_rgdr(row):
-    kind = row.get("Op Type", row.get("OP Type", "")).strip()
+def rgdr_match_source(row):
+    kind = (row.get("Op Type", row.get("OP Type", "")) or "").strip()
+    name = (row.get("Op Name") or "").strip()
     if kind.lower().replace("_", "") == "recurrentgateddeltarule":
-        return True
-    if kind.upper() not in MISSING_TYPES:
-        return False
-    name = row.get("Op Name", "").strip()
-    return name in {"RecurrentGatedDeltaRule", "recurrent_gated_delta_rule", TASK_NAME} or bool(KERNEL_NAME.fullmatch(name))
+        return "op_type"
+    # Real A5 msprof op export: Op Type=vector describes the compute kind,
+    # not the semantic operator type. Require the complete generated RGDR
+    # kernel name; never count other vector operators or suffix/substring hits.
+    if kind.lower() == "vector" and KERNEL_NAME.fullmatch(name):
+        return "vector_kernel_name"
+    if kind.upper() in MISSING_TYPES and (
+            name in {"RecurrentGatedDeltaRule", "recurrent_gated_delta_rule", TASK_NAME}
+            or KERNEL_NAME.fullmatch(name)):
+        return "exact_op_name"
+    return None
+
+
+def is_rgdr(row):
+    return rgdr_match_source(row) is not None
 
 
 def statistics_us(values):
@@ -198,15 +209,22 @@ def summarize_msprof(directory, expected_count, output):
         for path in files:
             with path.open(encoding="utf-8-sig", newline="") as file:
                 reader = csv.DictReader(file)
-                entry = {"file": str(path), "columns": reader.fieldnames, "rgdr_count": 0}
+                entry = {"file": str(path), "columns": reader.fieldnames, "rgdr_count": 0,
+                         "row_count": 0, "unmatched_row_examples": [], "rgdr_match_sources": {}}
                 report["inventory"].append(entry)
                 if not reader.fieldnames or "Task Duration(us)" not in reader.fieldnames or "Op Name" not in reader.fieldnames:
                     raise ValueError(f"unsupported OpBasicInfo schema/units: {path}")
                 kinds = Counter()
                 for line, row in enumerate(reader, start=2):
+                    entry["row_count"] += 1
                     kinds[row.get("Op Type", row.get("OP Type", ""))] += 1
-                    if not is_rgdr(row):
+                    match_source = rgdr_match_source(row)
+                    if match_source is None:
+                        if len(entry["unmatched_row_examples"]) < 3:
+                            entry["unmatched_row_examples"].append({"line": line, "row": row})
                         continue
+                    sources = entry["rgdr_match_sources"]
+                    sources[match_source] = sources.get(match_source, 0) + 1
                     try:
                         duration = float(row["Task Duration(us)"])
                     except (TypeError, ValueError) as error:
@@ -214,15 +232,19 @@ def summarize_msprof(directory, expected_count, output):
                     if not math.isfinite(duration) or duration <= 0:
                         raise ValueError(f"nonpositive/nonfinite Task Duration(us): {path}:{line}")
                     report["samples"].append({"file": str(path), "line": line, "duration_us": duration,
-                                              "op_name": row["Op Name"], "row": row})
+                                              "op_name": row["Op Name"], "match_source": match_source, "row": row})
                     entry["rgdr_count"] += 1
                 entry["type_counts"] = dict(kinds)
         count = len(report["samples"])
         if count != expected_count:
-            raise ValueError(f"expected {expected_count} RGDR rows, got {count}; do not pool partial/duplicate runs")
-        devices = {sample["row"].get("Device ID", "") for sample in report["samples"]} - {"", "N/A"}
+            raise ValueError(f"expected {expected_count} RGDR rows, got {count}; "
+                             f"inspect row_count/type_counts/unmatched_row_examples in {output}; "
+                             "do not pool partial/duplicate runs")
+        devices = {(sample["row"].get(column) or "").strip() for sample in report["samples"]
+                   for column in ("Device ID", "Device Id")} - MISSING_TYPES
         if len(devices) > 1:
             raise ValueError("multiple devices found; summarize one device at a time")
+        report["devices"] = sorted(devices)
         report["statistics"] = statistics_us([sample["duration_us"] for sample in report["samples"]])
         report["status"] = "complete"
         return report

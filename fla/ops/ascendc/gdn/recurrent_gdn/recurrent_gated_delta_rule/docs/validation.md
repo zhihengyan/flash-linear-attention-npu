@@ -2,6 +2,20 @@
 
 ## 2026-11-03：msprof op 公开入口直调诊断
 
+### 实测 vector 类型导出匹配修复
+
+用户回传原始 OpBasicInfo 行：完整 RGDR BF16 single-work `_85669048..._266` kernel 名，
+`Op Type=vector`，`Task Duration(us)=5.125000`，`Device Id=1`，频率 1650/1650。
+原脚本将非空 Op Type 当成语义算子类型，提前拒绝 vector，导致 rgdr_count=0；另只识别
+`Device ID`，未识别真实的 `Device Id` 列名。本次针对该证据：vector 只在完整生成 kernel 名
+匹配时接受，仍拒绝其它 vector 算子、Profile 后缀、名称子串及明确其它语义类型；设备列兼容
+两种拼写，并在跨文件/跨拼写出现多个设备时拒绝。保留原 us 数据和匹配来源。
+失败 inventory 增加 row_count/unmatched_row_examples，期望样本数仍严格校验。
+用户提供的一条记录只证明单条耗时为 5.125 us，不推算整轮 20 条均值；已有采集可离线重解析。
+修复后 9/9 离线检查通过：包含上述原始 CSV（保留尾部空列）经实际离线 CLI 识别、原 CSV 字节
+不变、单行不能充当 20 条样本、Device Id/ID 混合拼写下的多设备拒绝及原有匹配/单位/计数回归。
+本次仅改汇总和报告，不改变采集命令、算子或输入；用户完整 20 条采集的重解析结果待回传。
+
 按用户要求新增独立 `msprof_op_rgdr.py`；只复用原 perf case 0 和 `build_inputs`，调用已安装的
 公开 Python RGDR。设备采集由外部 `msprof op --application="python ..."` 完成；以 RGDR 名前缀
 过滤，`BasicInfo` 模式，仅统计 `OpBasicInfo*.csv` 的 `Task Duration(us)`，不混入准备/检查任务。
