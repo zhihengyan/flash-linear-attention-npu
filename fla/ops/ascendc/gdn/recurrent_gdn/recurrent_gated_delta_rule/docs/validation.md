@@ -1,5 +1,24 @@
 # A5 单 work 与尾部 scratch 实验开发记录
 
+## 2026-11-03：msprof op 公开入口直调诊断
+
+按用户要求新增独立 `msprof_op_rgdr.py`；只复用原 perf case 0 和 `build_inputs`，调用已安装的
+公开 Python RGDR。设备采集由外部 `msprof op --application="python ..."` 完成；以 RGDR 名前缀
+过滤，`BasicInfo` 模式，仅统计 `OpBasicInfo*.csv` 的 `Task Duration(us)`，不混入准备/检查任务。
+参数、输入种子和值域不变。全部独立 state 在第一条 RGDR 前克隆，Python 不另做 RGDR 预热，
+避免 profiler 选中 Python 预热任务；调用数、launch-count 和期望行数均为 20，工具预热 20 次。
+记录安装产物与源码来源，不假装已核验 build/run 包一致性。输出不作为精度验收，msprof 内部
+可能重放原地更新的 state。此诊断不替代经 ATK 发起的正式性能/精度验收。
+
+离线汇总支持一份聚合 OpBasicInfo 或同一 OPPROF 下的逐调用文件。保留各行/文件来源，
+有限正数、us 单位、精确目标匹配及样本数必须成立；未知 schema、缺样本、重复导致超数、
+多轮 OPPROF、多设备拒绝，不以逐核 PMU 时间推算任务耗时。kernel/host/runtime、JSON/YAML、
+executor、生成器、CPU 标杆和原有诊断入口均未改动。本机无 CANN/NPU，不声称完成 A5 实测。
+
+本地 6/6 离线检查通过，覆盖同一轮逐调用文件聚合、N/A 类型精确识别、其它任务排除、
+缺样本/重复超数/多轮/多设备拒绝、非法耗时和单位拒绝，以及无 torch 的离线 CLI 和原 CSV 保留。
+AST、--help、原始 7 份 ATK 资产与 scratch 一致性、kernel/host/runtime 无差异检查通过。
+
 ## 2026-11-02：独立公开入口延迟诊断（不改算子）
 
 ### profile 导出兼容性修复

@@ -243,6 +243,64 @@ python -B tests/atk/recurrent_gated_delta_rule/scripts/test_measure_public_laten
 1 项因无 C++ 编译器跳过。
 这些检查使用录制回调/文件 fixture，不执行 torch/NPU，也不模拟硬件计时或验收设备精度。
 
+## msprof op 直调与设备任务耗时统计
+
+独立脚本 [msprof_op_rgdr.py](scripts/msprof_op_rgdr.py) 复用原 `_perf.json` case 0 和
+executor 的 `build_inputs`，通过公开 Python 入口直接调用 RGDR，不经过 ATK `FunctionApi`。
+用例、随机种子、值域、CPU 标杆和容差不变。本入口是单算子性能诊断，不替代 ATK 正式验收。
+
+在 Linux A5 上激活原 ATK/PyTorch 环境、加载 CANN 9.1 环境，先安装待测分支构建的产物。
+脚本使用已安装的 `fla_npu`，不自动编译或安装；`application.json` 记录实际包、opapi、RGDR `.o`
+哈希及源码版本，但不承担当前 build/run 包与安装产物的等价校验。两分支对比前分别重建安装。
+
+在仓根目录执行（设备 1 可按需替换；不要和其它采集任务共用同一设备）：
+
+```bash
+SCRIPT="$PWD/tests/atk/recurrent_gated_delta_rule/scripts/msprof_op_rgdr.py"
+OUT="$PWD/tests/atk/recurrent_gated_delta_rule/runs/msprof_op/scratch_$(date +%Y%m%d_%H%M%S)"
+mkdir -p "$OUT"
+
+msprof op \
+  --application="python $SCRIPT --repo-root $PWD --device 1 --case-id 0 --calls 20 --label scratch --metadata $OUT/application.json" \
+  --kernel-name=RecurrentGatedDeltaRule \
+  --launch-count=20 --warm-up=20 --aic-metrics=BasicInfo \
+  --output="$OUT"
+
+python "$SCRIPT" --summarize "$OUT" --expected-count 20
+```
+
+`--kernel-name` 使用 RGDR kernel 名前缀过滤，避免选中输入生成产生的 Neg 等任务。
+`BasicInfo` 只采集算子基本信息；预热由 msprof 的 `--warm-up` 控制，Python 不额外下发 RGDR
+预热任务，避免将 Python 预热误计为正式样本。`--calls`、`--launch-count` 和汇总期望数量保持一致。
+输入只构造一次，每次调用使用预先克隆好的独立 state；全部克隆在第一条 RGDR 之前完成。
+调用间只同步，不生成输入、恢复 state、运行 CPU 标杆或有限性检查。保留输出至任务完成。
+工具可能对原地更新 state 的 kernel 预热/重放，因此本脚本不对其输出进行精度验收。
+
+汇总只读 `OpBasicInfo*.csv` 的 `Task Duration(us)`，输出均值、中位数、整体标准差、CV、
+min/max、P50/P90/P99；完整样本、原始行和 CSV 来源保存在 `OUT/rgdr_task_summary.json`。
+不将 Python 墙钟、Event、逐核时间或其它算子耗时混入该统计。Task Duration 包含设备任务调度、
+执行与完成响应，不应称为纯算术时间。未知列名/单位、无目标记录、缺样本、重复导致超数、
+多个 OPPROF 运行目录或多设备都会失败，并保留 inventory/error，不能把缺失数据当作成功。
+
+官方参数和字段依据：
+[msOpProf 26.0 参数说明](https://github.com/Ascend/msopprof/blob/26.0.0/docs/en/user_guide/msopprof_user_guide.md)、
+[OpBasicInfo 字段](https://github.com/Ascend/msopprof/blob/master/docs/en/user_guide/msopprof_performance_data.md#opbasicinfo-basic-operator-information)。
+msprof op 和此前 torch_npu profiler 的采集协议不同；只在相同工具、选项、设备和安装条件下做
+main/scratch 对比，不把新结果与历史 ATK/torch_npu profile 直接拼接比较。
+
+对比 main 时先复制这一份脚本，再切分支重建安装，在 main 仓根目录重复上述命令；将 `SCRIPT`
+改为 `/tmp/msprof_op_rgdr.py`、输出目录和 `--label` 改为 main。脚本不依赖本分支的其它诊断脚本。
+
+```bash
+cp tests/atk/recurrent_gated_delta_rule/scripts/msprof_op_rgdr.py /tmp/msprof_op_rgdr.py
+```
+
+离线检查（不加载 torch/NPU）：
+
+```bash
+python -B tests/atk/recurrent_gated_delta_rule/scripts/test_msprof_op_rgdr.py -v
+```
+
 ## 执行方式
 
 ```bash
