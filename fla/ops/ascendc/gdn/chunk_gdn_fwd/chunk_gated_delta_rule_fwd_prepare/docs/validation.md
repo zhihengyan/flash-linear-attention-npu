@@ -2,8 +2,8 @@
 
 ## 固定验收口径
 
-- 代码分支：`feat/gdn-opt`，本轮基线 `ea1f61a1`；当前提交 `62728f0d`。
-- 当前验证：九算子 wheel 构建后，正式 500 条双标杆全部执行成功，450 条精度通过、50 条失败；失败全部为 BF16、V=128、chunk=64。可用混合容差环境中 Prepare slim 精度全部通过；fwd_h 单算子出现 NaN/Inf，并已定位其 64/128 列 VF 分支条件选反。Prepare 无需修改，待 fwd_h 修复后重跑正式融合矩阵。
+- 代码分支：`feat/gdn-opt`，本轮基线 `ea1f61a1`；当前提交 `ec611538`。
+- 当前验证：Prepare slim 与 `ec611538` 的 fwd_h 单算子精度均通过；当前融合矩阵仍有 435、380、277、279、280 等上一轮失败用例，完整集合待汇总。组合版本性能为 7783/10765 µs，严重低于 1705.298/2707.735 µs 基线。短 pack 原成本模型会在大任务中因极小 task 差选择 pack=1，本地已限制为 fullPacks<numCore 才评估；fwd_h 同步增加 half-head 适用门控，待重新构建和复测。
 - 硬件与设备：Ascend 950，device 2。
 - 精度：正式 500 条双标杆矩阵，每 25 条自动分片；最大相对误差比例 5、平均相对误差比例 1.5、均方根误差比例 1.5，沿用 ATK 判定。
 - 性能：固定两条正式 case，每项至少两轮，与正式中位数比较；不以 ACL event、理论核利用率或单 Stage timer 替代端到端结论。
@@ -36,8 +36,8 @@ python scripts/verify_libcust_opapi_md5.py
 | 推理 case 0 | 基线 | Prepare Stage3/7 | 原始实现 | 用户给定稳定基线 | 1705.298 µs；范围 1703.162～1710.482 µs | 待本轮 profiling | 三轮波动 7.321 µs |
 | 训练 case 1 | 基线 | Prepare Stage3/7 | 原始实现 | 用户给定稳定基线 | 2707.735 µs；范围 2704.416～2709.092 µs | 待本轮 profiling | 三轮波动 4.676 µs |
 | 两条 case | Stage3 / 负收益，放弃并回退 | 原实现对 4096 个元素执行 Mul/Store；候选只减少有效 lane | 候选仅将 Mul/Store 改为 lower mask，Load、打包、VCS、同步不变 | 正式 500 条未完整跑通 | 用户报告两次均值约 1710／2715 µs，基线为 1705.298／2707.735 µs | 无有效收益 | 循环、Load、Mul 和 Store 调用次数均未减少，却新增 UpdateMask 和 masked Store 开销；训练慢约 7.265 µs，超过基线波动，不能保留 |
-| 两条 case | Stage7 packed W/U / 独立 slim 通过，待融合回归 | 原路径重复 LoadA，K=V=128 有两个 N=128 MMAD | 仅 K=V=128 合并 packed N=256；V=256 原路径 | Prepare slim 全部通过；正式融合矩阵待 fwd_h 修复后重跑 | 未测试 | 未测试 | 构建与独立精度通过；不得预写收益 |
-| 小 case | 短 pack / 独立 slim 通过，待融合回归 | 大 pack 造成核间尾波和空闲核 | G=1/2 按最忙核 task 数选择 pack；平局保留大 pack | Prepare slim 全部通过；正式融合矩阵待 fwd_h 修复后重跑 | 未测试 | 未测试 | 构建与独立精度通过；性能仍需选择确实出现空闲核或尾波的 shape |
+| 两条 case | Stage7 packed W/U / 独立 slim 通过，待融合回归 | 原路径重复 LoadA，K=V=128 有两个 N=128 MMAD | 仅 K=V=128 合并 packed N=256；V=256 原路径 | Prepare slim 通过；当前融合矩阵仍有失败 | 组合版本 7783/10765 µs，不能作为单候选独立值 | 待逐 kernel profiling | 构建与独立精度通过；待并行门控修复后复测，不预写收益 |
+| 小 case | 短 pack / 独立 slim 通过，增加大任务门控后待复测 | 原模型只看最忙核 task 数，case 1 会从 pack=4 错选 pack=1，case 0 平局仍选 4 | 仅 fullPacks<numCore 时评估短 pack，平局保留大 pack | Prepare slim 通过；当前融合矩阵仍有失败 | 组合版本 7783/10765 µs，不能作为单候选独立值 | pack 固定开销及流水粒度可能增加 | 两条正式 case 均恢复 pack=4；后续只选择存在空闲核的 shape |
 
 ## 待验证矩阵
 

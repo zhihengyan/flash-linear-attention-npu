@@ -31,11 +31,12 @@ Stage7 候选减少 A 的重复 LoadA 并合并 W/U MMAD，直接作用于现有
 ### 任务域与资源
 
 task 是 `(sequence-chunk, hv)`，工作总量为 `chunkCount*HV`，`hk=hv/(HV/HK)`。
-固定 `BT=64`。`G=1/2` 的候选 pack 从 `G` 到原 pack 大小按 `G` 递增，选择使
+固定 `BT=64`。只有 `G=1/2` 且原 full-pack 数量 `fullPacks<numCore`、原调度存在空闲
+AIC 时才评估短 pack；`fullPacks>=numCore` 直接保持原 pack，避免在大任务中以极小的最忙核
+task 差换取成倍 pack 固定开销。候选 pack 从 `G` 到原 pack 大小按 `G` 递增，选择使
 `ceil(ceil(totalTasks/pack)/numCore)*pack` 最小者，平局保留较大 pack。该式表示最忙核的
-task 数；它只在确实存在核间负载差时缩短 pack，不减少总计算量，也不把“增加 pack 数”
-本身视为收益。所有 AIC/AIV 循环均按实际 `cur.nThis` 执行，初始 Stage4 credit 也按实际
-pack 大小发布。
+task 数；缩短 pack 不减少总计算量，也不把“增加 pack 数”本身视为收益。所有 AIC/AIV
+循环均按实际 `cur.nThis` 执行，初始 Stage4 credit 也按实际 pack 大小发布。
 
 Stage4 Y 使用每核 64 KiB GM workspace，四个 16 KiB slot，除此之外不新增 workspace。
 L1 可用 512 KiB，当前最高使用地址 496 KiB；每 AIV UB 可用 248 KiB，V=128 当前最高使用

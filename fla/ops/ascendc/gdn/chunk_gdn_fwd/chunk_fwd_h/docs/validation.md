@@ -2,9 +2,9 @@
 
 ## 当前状态
 
-- 分支与基线：`feat/gdn-opt`，基线 `ea1f61a1`；当前提交 `62728f0d`，half-head、Prepare 与 fwd_h 编译修复均已提交并推送。
-- 实现范围：仅 Ascend 950、scalar-g、FP32 state、`state_v_first=false` 启用 `valueSplit=2`。
-- 当前证据：`62728f0d` 的九算子 wheel 构建后，正式 500 条双标杆全部执行成功，450 条精度通过、50 条失败，失败全部为 BF16、V=128、chunk=64。可用混合容差环境中 Prepare slim 精度全部通过；fwd_h 在 case 139 等用例出现 NaN/Inf且该次汇总不完整。已定位 Stage1、Stage3、S-1 错把 `BF16_PER_REG` 当作 64 列条件，导致 64/128 列路径选反；本地改为 `valueSize == FWD_H_V / 2`，待重新构建和完整精度回归。性能测试未执行。
+- 分支与基线：`feat/gdn-opt`，基线 `ea1f61a1`；当前提交 `ec611538`，half-head、Prepare 与 fwd_h 修复均已提交并推送。
+- 实现范围：仅在 Ascend 950、scalar-g、FP32 state、`state_v_first=false`，原任务少于物理 AIC 核且切分后 blockDim 增加时启用 `valueSplit=2`。
+- 当前证据：Prepare slim 与 `ec611538` 的 fwd_h 单算子精度均通过。当前融合矩阵仍有 435、380、277、279、280 等上一轮失败用例，完整失败集合待汇总；组合版本性能为 7783/10765 µs，相对 1705.298/2707.735 µs 基线严重负收益。原实现未限制 half-head 的适用任务规模，本地已增加空闲核及 blockDim 增长门控，待重新构建、精度与性能复测。
 - 不得将任务数增加、理论核利用率或静态检查写成精度通过或性能收益。
 
 ## 固定验收环境
@@ -33,11 +33,18 @@ ATK_OUTPUT_ROOT="tests/atk/chunk_gated_delta_rule_fwd/atk_output/perf_$(git rev-
 验证顺序固定为 `chunk_fwd_h` 单算子精度 → 正式 500 条双标杆矩阵 → 两条正式性能 case。
 性能 case 至少复测两轮并保存逐轮原始值，与上述中位数及波动范围比较。
 
+## 性能追踪
+
+| 模型 case | 轮次 / 状态 | 触发证据或预计关键路径 | 结构决策或候选与唯一主要变量 | 精度结果 | 性能前后值 | 瓶颈变化 | 依据或结论 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 推理 case 0 | half-head / 严重负收益，增加适用门控后待复测 | 原 32 个 head task 已超过 28 核仍切为 64 个 half-head | 仅当原任务少于物理核且 split 后 blockDim 增加时启用 | fwd_h 单算子通过；融合矩阵仍有失败 | 1705.298 → 7783 µs（组合版本） | 待逐 kernel profiling | 固定开销及 W/K 重复装载增加；门控后正式 case 恢复 valueSplit=1 |
+| 训练 case 1 | half-head / 严重负收益，增加适用门控后待复测 | 原 64 个 head task 已超过 28 核仍切为 128 个 half-head | 同上 | 同上 | 2707.735 → 10765 µs（组合版本） | 待逐 kernel profiling | 门控后正式 case 恢复 valueSplit=1；组合值不作为单候选独立收益 |
+
 ## 必测覆盖
 
 | 类别 | 必测内容 | 重点检查 |
 | --- | --- | --- |
-| 模板选择 | scalar-g + FP32 state + `state_v_first=false` 在 A5 选择 `valueSplit=2`；BF16 state、key-gk、`state_v_first=true` 和 A2/A3 选择 1 | 未改动路径保持原行为，host/kernel tiling 字段一致 |
+| 模板选择 | A5 scalar-g + FP32 state + `state_v_first=false`，且原任务少于物理核、split 后 blockDim 增加时选择 `valueSplit=2`；其余路径选择 1 | 未改动路径保持原行为，host/kernel tiling 字段一致 |
 | 调度 | `N*HV` 小于、等于和大于物理核数；连续区间跨 sequence；奇偶 half-head；最后一个核不满 | AIC/AIV 解码一致，每个 `(sequence,hv,vPart)` 恰好执行一次，无游标跳过 |
 | 初态与零态 | 无 initial state、有 FP32 initial state；S-1 H0 转换和首 chunk ZERO_STATE | 两个 64 列半区不串扰，不错误读取第二组向量寄存器 |
 | 状态输出 | 无 final state、有 FP32 final state；最后一个 chunk 的 Stage2/Stage3 裁剪 | final state 两个半列均写回，右半列基址和行 stride 正确 |
@@ -58,7 +65,8 @@ ATK_OUTPUT_ROOT="tests/atk/chunk_gated_delta_rule_fwd/atk_output/perf_$(git rev-
   `[K,64]` tile；GM 行 stride 保持 128，同时命中既有 `TileCopyTla` 特化。通用动态 layout
   导致的 GM→L1 拷贝编译错误已修复，并已通过上机构建。
 - Stage1、Stage3、S-1 以 `valueSize == FWD_H_V / 2` 明确选择 64 列单 FP32 寄存器路径，
-  128 列走原双寄存器实现；本地已修正此前使用 `BF16_PER_REG` 导致的分支选反，待上机回归。
+  128 列走原双寄存器实现；`ec611538` 已修正此前使用 `BF16_PER_REG` 导致的分支选反，fwd_h
+  单算子精度全部通过，正式融合矩阵待重跑。
 - V 维切分不需要跨核归约；K/raw-K 保持完整。每个 half-head 的 FP32 rolling state 独立于
   另一 half-head，原单 head ready/free 与 round 握手保持不变。
 

@@ -82,10 +82,25 @@ public:
         }
 
         const uint64_t effectiveSequenceCount = static_cast<uint64_t>(batch);
-        const uint64_t valueSplit = ctx_.enableValueSplit ? 2U : 1U;
-        const uint64_t totalHeadTasks =
-            effectiveSequenceCount * static_cast<uint64_t>(ctx_.vNumHead) * valueSplit;
+        const uint64_t originalHeadTasks =
+            effectiveSequenceCount * static_cast<uint64_t>(ctx_.vNumHead);
         const uint64_t physicalAicCores = static_cast<uint64_t>(ctx_.aicCoreNum);
+        uint64_t valueSplit = 1;
+        if (ctx_.enableValueSplit && originalHeadTasks < physicalAicCores) {
+            const uint64_t originalHeadsPerCore =
+                (originalHeadTasks + physicalAicCores - 1) / physicalAicCores;
+            const uint64_t originalBlocks =
+                (originalHeadTasks + originalHeadsPerCore - 1) / originalHeadsPerCore;
+            const uint64_t splitHeadTasks = originalHeadTasks * 2;
+            const uint64_t splitHeadsPerCore =
+                (splitHeadTasks + physicalAicCores - 1) / physicalAicCores;
+            const uint64_t splitBlocks =
+                (splitHeadTasks + splitHeadsPerCore - 1) / splitHeadsPerCore;
+            if (splitBlocks > originalBlocks) {
+                valueSplit = 2;
+            }
+        }
+        const uint64_t totalHeadTasks = originalHeadTasks * valueSplit;
         const uint64_t headsPerCore =
             (totalHeadTasks + physicalAicCores - 1) / physicalAicCores;
         blockDim = static_cast<uint32_t>(

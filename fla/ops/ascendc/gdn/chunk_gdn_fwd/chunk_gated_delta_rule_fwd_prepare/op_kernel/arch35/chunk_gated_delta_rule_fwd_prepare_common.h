@@ -320,11 +320,12 @@ struct PrepareState {
     __aicore__ inline int64_t TasksPerPack() const
     {
         const int64_t fullPack = (HRatio == 3) ? 3 : kTasksPerRound;
-        if (HRatio > 2 || numCore <= 0 || totalChunks <= 0) {
+        const int64_t fullPacks = CeilDiv(totalChunks, fullPack);
+        if (HRatio > 2 || numCore <= 0 || totalChunks <= 0 || fullPacks >= numCore) {
             return fullPack;
         }
         int64_t bestPack = fullPack;
-        int64_t bestCost = CeilDiv(CeilDiv(totalChunks, fullPack), numCore) * fullPack;
+        int64_t bestCost = CeilDiv(fullPacks, numCore) * fullPack;
         for (int64_t pack = HRatio; pack < fullPack; pack += HRatio) {
             const int64_t cost = CeilDiv(CeilDiv(totalChunks, pack), numCore) * pack;
             if (cost < bestCost) {

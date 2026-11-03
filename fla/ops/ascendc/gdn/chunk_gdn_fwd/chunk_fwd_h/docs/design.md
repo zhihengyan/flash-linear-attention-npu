@@ -214,7 +214,7 @@ head round 的展开数组。kernel 在进入 chunk 循环前，按 `kNumHead/vN
 | `isVariedLen` | 是否启用 varlen 调度 |
 | `shapeBatch` | dense 的物理 batch；varlen 固定为 1 |
 | `tokenBatch` | varlen 的 sequence 数；dense 固定为 1 |
-| `valueSplit` | V 维任务切分数；A5 的 scalar-g、FP32 state、`state_v_first=false` 路径为 2，其余为 1 |
+| `valueSplit` | V 维任务切分数；仅在 A5 scalar-g、FP32 state、`state_v_first=false`，原任务数少于物理 AIC 核数且切分后 blockDim 增加时为 2，其余为 1 |
 | `vWorkspaceOffset` | A2/A3 P 的 GM scratch，按 FP32 slot stride 预留 `[blockDim,4,64,128]`；实际元素为 PType |
 | `vUpdateWorkspaceOffset` | Stage1 BF16 right 的 GM workspace，形状为 `[blockDim,4,64,128]` |
 | `kDecayWorkspaceOffset` | FP32 rolling state 的 GM workspace，形状为 `[blockDim,4,128,128]`；A5 使用每 AIV 两份常驻 state，不访问该段 |
@@ -251,10 +251,12 @@ state dtype 的模板选择保持运行语义优先级：存在 `initial_state` 
 
 ## 10. A5 half-head 并行实现
 
-仅在 Ascend 950、`SCALAR_G && STATE_FP32 && !STATE_V_FIRST` 时由 host 设置 `valueSplit=2`；
-其他模板和 A2/A3 始终保持 1。选择 V 维切半是因为不同 V 列的递推完全独立，两个 half-head
-可直接写回原输出的不同半列。K 维不能采用同样的无归约切分：`P=W@H` 与 `D=k^T@right`
-都需要完整 K 维，跨核切 K 会引入部分和与新的同步，因此不在本轮范围内。
+仅在 Ascend 950、`SCALAR_G && STATE_FP32 && !STATE_V_FIRST`，且原 `(sequence,value_head)`
+任务数小于物理 AIC 核数时评估 half-head；切分后按同一公式得到的 `blockDim` 必须大于原
+`blockDim`，否则保持 `valueSplit=1`。其他模板和 A2/A3 始终保持 1。选择 V 维切半是因为不同
+V 列的递推完全独立，两个 half-head 可直接写回原输出的不同半列。K 维不能采用同样的无归约
+切分：`P=W@H` 与 `D=k^T@right` 都需要完整 K 维，跨核切 K 会引入部分和与新的同步，因此不在
+本轮范围内。
 
 half-head 的公开 GM 布局不变，H/U/V_new/initial_state/final_state 的每行 stride 仍为 128，
 只在基址上加 `vBegin`，通过多行 DataCopy 或带 stride 的 TLA GM layout 读取/写入对应 64 列。
@@ -268,6 +270,6 @@ FP32 rolling state 在每个 half-head work unit 内继续驻留所属 AIV 的 U
 原协议；没有本地 head 的 AIV1 仍参与 round 握手，但不访问数据。64 列 VF 的 Load/Cast/Store
 只操作 `u0/p0/state0/d0`，128 列原双寄存器路径不变。
 
-该优化增加可调度任务并改善尾波，但 half-head 会重复装载 W/K，且每任务固定控制与同步开销
-不会减半。因此“任务数翻倍”不等于“性能翻倍”；最终是否保留必须由同 shape 的精度和端到端
-性能实测决定。当前实现尚未构建或上机验证。
+该优化只在能实际增加工作核时尝试改善尾波，但 half-head 会重复装载 W/K，且每任务固定控制与
+同步开销不会减半。因此“任务数翻倍”不等于“性能翻倍”；最终是否保留必须由同 shape 的精度
+和端到端性能实测决定。
