@@ -213,7 +213,8 @@ __aicore__ inline void WuPackedMatmulToUb(AscendC::LocalTensor<InDtype> l1A,
     WaitFlag<AscendC::HardEvent::MTE1_M>(evt);
     WaitFlag<AscendC::HardEvent::FIX_M>(evt);
     TileMmad mmad;
-    mmad(tileL0C, tileL0A, tileL0B, m, packedN, kDim, true, 0);
+    // Use the shape-based overload so the bias overload cannot participate.
+    mmad(tileL0C, tileL0A, tileL0B, true, evt);
     SetFlag<AscendC::HardEvent::M_MTE1>(evt);
     SetFlag<AscendC::HardEvent::M_FIX>(evt);
     WaitFlag<AscendC::HardEvent::M_FIX>(evt);
