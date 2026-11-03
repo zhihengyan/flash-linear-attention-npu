@@ -371,9 +371,7 @@ private:
             CopyGmToL1BS0<decltype(blockH)> copyH;
             copyH(tensorL1H, blockH);
         } else {
-            auto gmHLayout = tla::MakeLayout(
-                tla::MakeShape(FWD_H_K, head.vSize),
-                tla::MakeStride(FWD_H_V, tla::Int<1>{}));
+            auto gmHLayout = tla::MakeLayout<bfloat16_t, LayoutH>(FWD_H_K, FWD_H_V);
             auto tensorH = tla::MakeTensor(gmH, gmHLayout, Catlass::Arch::PositionGM{});
             auto blockH = tla::GetTile(tensorH, tla::MakeCoord(0, 0),
                                        tla::MakeShape(FWD_H_K, head.vSize));

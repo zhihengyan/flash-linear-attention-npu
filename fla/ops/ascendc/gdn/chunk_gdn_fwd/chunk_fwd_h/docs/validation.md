@@ -2,9 +2,9 @@
 
 ## 当前状态
 
-- 分支与基线：`feat/gdn-opt`，基线 `ea1f61a1`；half-head 改动尚未提交。
+- 分支与基线：`feat/gdn-opt`，基线 `ea1f61a1`；half-head 与 Prepare 编译修复已提交至 `c7aadaad`，本次 fwd_h 编译修复尚未提交。
 - 实现范围：仅 Ascend 950、scalar-g、FP32 state、`state_v_first=false` 启用 `valueSplit=2`。
-- 当前证据：代码与静态地址/协议复核完成；尚未进行 CANN 构建、NPU 精度或性能测试。
+- 当前证据：`c7aadaad` 的 CANN 全量构建在 `ChunkFwdH::LoadStage0H` 的 GM→L1 `TileCopyTla` 特化处失败；本地已完成编译修复和静态复核，修复版本尚待上机重新构建，NPU 精度与性能测试均未执行。
 - 不得将任务数增加、理论核利用率或静态检查写成精度通过或性能收益。
 
 ## 固定验收环境
@@ -54,6 +54,9 @@ ATK_OUTPUT_ROOT="tests/atk/chunk_gated_delta_rule_fwd/atk_output/perf_$(git rev-
   `vBegin=(taskInSequence&1)*64`，两侧一致。
 - H/U/V_new/state 的 GM 基址包含 `vBegin`，半列 copy 的源/目的 gap 均为 64 列；right 和
   非驻留 state 的 workspace 两侧均使用 `head.vSize` 计算 slot 元素数。
+- `LoadStage0H` 的 half-head GM tensor 使用带 `LayoutH` 标签的完整 `[K,128]` layout，再取
+  `[K,64]` tile；GM 行 stride 保持 128，同时命中既有 `TileCopyTla` 特化。通用动态 layout
+  导致的 GM→L1 拷贝编译错误已做本地修复，待上机重新构建确认。
 - 64 列 VF 使用单 FP32 寄存器 Load/Store；BF16 采用 UNPACK/PACK，Stage1、Stage3、S-1 不再
   访问未初始化的 `*1` 寄存器。128 列路径仍走原双寄存器实现。
 - V 维切分不需要跨核归约；K/raw-K 保持完整。每个 half-head 的 FP32 rolling state 独立于
