@@ -12,7 +12,8 @@
 1. A5 每个序列/每个 V 分片的末 token 调用不保存 updated FP32 scratch 的 VF 实例。
 2. 为 case 1 所属的单序列、单 token、多头场景直接分配 head，省去 ComputeAvgload 和 head 归属扫描。
 
-没有设备基线或数值性能目标，暂不宣称收益。以同设备、相同安装与预热条件下的
+编码时没有设备基线或数值性能目标；首次用户反馈为 main 6.60 us、两项优化 6.71 us，
+当前未显示收益，待拆分测量与重复轮次统计，详见 validation.md。以同设备、相同安装与预热条件下的
 msprof op / OpBasicInfo 的 Task Duration(us) 比较 f918240b、仅改动 1、改动 1+2。
 Python 默认调用 20 次，各次独立 state 在首个 RGDR 前克隆；msprof warm-up=20、launch-count=20，
 统计均值、中位数、标准差、P90/P99。输入构造与校验不计入目标 kernel。

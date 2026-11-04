@@ -44,6 +44,25 @@ UB/搬运与公开接口/A2A3 源码保持。尚未执行 CANN 编译或设备�
 本分支最新提交（再加多头直接分发）。case 1 需从实际 host 日志确认 vStep=128 和 blockDim，
 同一 TilingKey 不能证明命中了新运行时分支。
 
+## 2026-11-04：首次性能反馈
+
+用户通过本分支 msprof op 脚本测量并报告：main 平均 6.60 us，当前两项优化版本平均 6.71 us。
+差值为 +0.11 us，约 +1.67%；当前观察没有显示收益。用户说明收益见效前尚未进行精度验证。
+设备侧实际 commit、安装产物哈希、count、median/std/CV、频率及重复轮次未提供，
+用户随后确认两次使用同一 msprof_op_rgdr.py、相同命令行参数且均为 --case-id 1。
+具体 JSON/产物哈希尚未提供；不能将均值差直接归因为某一项改动或认定为随机波动。
+
+源码复核：VF 数学、InitLocalBuffers、CopyInGamaBeta、CopyInQKV、LoadPrefetchedState 保持基线。
+额外调度路径增加了运行时条件判断与 V_S 完成等待，该等待位于 state Cast 之后；
+其同步代价及对 Scalar/Vector 重叠的影响是待测假设，不能在缺少精度与时序证据时直接删除。
+2 MiB UB Store 是 32 个 head 的累计量；若每核一个 head，则每核省 64 KiB，
+多个核并行执行，累计流量不等价于主 kernel 时延按相同比例下降。
+
+下一轮优先测中间提交 93f5c70a（仅末 token 省写），与 main、9a515a70（两项优化）交错比较。
+保持 JSON、脚本、设备、calls/warm-up/launch-count、安装校验流程一致，保存每轮 summary 和 application。
+若 93f5c70a 改善而 9a515a70 退化，先定位调度分支；若 93f5c70a 也退化或无收益，
+再检查 Store 是否在关键路径及编译分派代价。本轮记录反馈，不继续叠加未经验证的 kernel 改动。
+
 ## 内网执行
 
 先为相应提交编译并安装单算子 run 包，并使用新 Python 进程：
