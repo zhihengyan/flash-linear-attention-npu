@@ -78,6 +78,7 @@ static void ChunkFwdHTilingDataPrint(gert::TilingContext *context, ChunkFwdHTili
     OP_LOGD(nodeName, "=== isVariedLen: %ld", tiling.get_isVariedLen());
     OP_LOGD(nodeName, "=== shapeBatch: %ld", tiling.get_shapeBatch());
     OP_LOGD(nodeName, "=== tokenBatch: %ld", tiling.get_tokenBatch());
+    OP_LOGD(nodeName, "=== valueSplit: %ld", tiling.get_valueSplit());
     OP_LOGD(nodeName, ">>>>>>>>>>>>>>> Print ChunkFwdH tiling data end <<<<<<<<<<<<<<<<");
 }
 
@@ -151,6 +152,9 @@ ge::graphStatus Tiling4ChunkFwdH(gert::TilingContext *context)
     tilingCtx.useInitialState = useInitialState;
     tilingCtx.storeFinalState = storeFinalState;
     tilingCtx.chunkSize = chunkSize;
+    tilingCtx.enableValueSplit =
+        ascendcPlatform.GetSocVersion() == platform_ascendc::SocVersion::ASCEND950 &&
+        useG && stateDtypeToken == CHUNK_FWD_H_TPL_FP32 && !stateVFirst;
     tilingCtx.aicCoreNum = ascendcPlatform.GetCoreNumAic();
     // gated 复用 eligible（与 kernel 谓词 FwdHGatedReusable 同条件）；仅 DAV_2201
     // ——其余芯片 kernel 无 gated 分支，置 eligible 反致 blockDim/workspace 偏差。
@@ -250,6 +254,7 @@ ge::graphStatus Tiling4ChunkFwdH(gert::TilingContext *context)
     tiling.set_isVariedLen(plainTiling.isVariedLen);
     tiling.set_shapeBatch(plainTiling.shapeBatch);
     tiling.set_tokenBatch(plainTiling.tokenBatch);
+    tiling.set_valueSplit(plainTiling.valueSplit);
     tiling.set_vWorkspaceOffset(plainTiling.vWorkspaceOffset);
     tiling.set_vUpdateWorkspaceOffset(plainTiling.vUpdateWorkspaceOffset);
     tiling.set_kDecayWorkspaceOffset(plainTiling.kDecayWorkspaceOffset);

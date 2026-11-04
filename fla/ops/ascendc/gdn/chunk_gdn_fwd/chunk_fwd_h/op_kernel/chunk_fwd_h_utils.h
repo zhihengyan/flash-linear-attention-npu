@@ -92,7 +92,7 @@ __aicore__ inline uint32_t FwdHHeadRoundsPerSequence(const FwdHRuntimeTiling &ti
 
 template <FwdHGateMode GATE_MODE>
 __aicore__ inline FwdHHeadRoundPlan FwdHBuildHeadRange(const FwdHRuntimeTiling &tiling,
-    uint32_t hvBegin, uint32_t headCount)
+    uint32_t hvBegin, uint32_t headCount, uint32_t vBegin = 0, uint32_t vSize = FWD_H_V)
 {
     FwdHHeadRoundPlan plan{};
     const uint32_t hv = static_cast<uint32_t>(tiling.vNumHead);
@@ -109,6 +109,8 @@ __aicore__ inline FwdHHeadRoundPlan FwdHBuildHeadRange(const FwdHRuntimeTiling &
         head.roundHead = roundHead;
         head.hv = hvBegin + roundHead;
         head.kh = GATE_MODE == FwdHGateMode::SCALAR_G ? head.hv / groupSize : head.hv;
+        head.vBegin = vBegin;
+        head.vSize = vSize;
         head.aiv = roundHead & 1U;
         head.localSlot = roundHead >> 1U;
 
@@ -223,7 +225,7 @@ __aicore__ inline uint32_t FwdHSequenceCount(const FwdHRuntimeTiling &tiling)
 
 __aicore__ inline uint32_t FwdHTotalHeadTasks(const FwdHRuntimeTiling &tiling)
 {
-    return FwdHSequenceCount(tiling) * static_cast<uint32_t>(tiling.vNumHead);
+    return FwdHSequenceCount(tiling) * static_cast<uint32_t>(tiling.vNumHead) * tiling.valueSplit;
 }
 
 __aicore__ inline FwdHCoreHeadRange FwdHResolveCoreHeadRange(const FwdHRuntimeTiling &tiling,

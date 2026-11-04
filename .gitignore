@@ -16,6 +16,9 @@ cmake-build-*
 # Visual Studio Code
 .vscode
 
+# Kimi local workspace
+/.kimi/
+
 # vim cache
 *.swp
 

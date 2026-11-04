@@ -5,7 +5,8 @@
  * Fused GDN prepare (arch35 MIX AIC:AIV 1:2). Helpers in *_common/vf/datacopy/matmul.
  * Memory map: design/chunk_gated_delta_rule_fwd_prepare_ascendc-design.md.
  *
- * Pack: TG = 3 if G=3 else 4. AIV0 tasks 0,2; AIV1 1,3. kkt once per HK (OwnsHk).
+ * Pack: G=3 uses 3, G=4 uses 4; G=1/2 may shorten packs for load balance.
+ * AIV0 tasks 0,2; AIV1 1,3. kkt once per HK (OwnsHk).
  * L1: Y [0,64); k' aliases NegL [64,128). Pack N+1 Stage1 waits pack N Stage4
  * before the k' L1 write so Stage5/6/7 of N can overlap next Stage1.
  * Do not gate Stage1 on Stage7: that kills the overlap and regresses G=1.

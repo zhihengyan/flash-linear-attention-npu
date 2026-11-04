@@ -30,6 +30,12 @@ constexpr CastTrait FWD_H_B16_TO_F32_ZERO = {
     MaskMergeMode::ZEROING,
     AscendC::RoundMode::UNKNOWN,
 };
+constexpr CastTrait FWD_H_F32_TO_B16_ZERO = {
+    RegLayout::ZERO,
+    SatMode::NO_SAT,
+    MaskMergeMode::ZEROING,
+    AscendC::RoundMode::CAST_ROUND,
+};
 
 __simd_callee__ inline void FwdHLoadFloatPair(RegTensor<float> &zero, RegTensor<float> &one,
                                                __ubuf__ float *src)
@@ -51,6 +57,27 @@ __simd_callee__ inline void FwdHLoadAsFloat(RegTensor<float> &zero, RegTensor<fl
     RegTensor<T> raw;
     LoadIn<T, false>(raw, src);
     CastHalf2Float<T>(zero, one, raw, mask16);
+}
+
+template <typename T>
+__simd_callee__ inline void FwdHLoad64AsFloat(RegTensor<float> &dst, __ubuf__ T *src,
+                                               MaskReg &mask32)
+{
+    if constexpr (std::is_same<T, float>::value) {
+        LoadAlign(dst, src);
+    } else {
+        RegTensor<T> raw;
+        DataCopy<T, LoadDist::DIST_UNPACK_B16>(raw, src);
+        Cast<float, T, FWD_H_B16_TO_F32_ZERO>(dst, raw, mask32);
+    }
+}
+
+__simd_callee__ inline void FwdHStore64Bf16(__ubuf__ bfloat16_t *dst,
+                                             RegTensor<float> &src, MaskReg &mask32)
+{
+    RegTensor<bfloat16_t> output;
+    Cast<bfloat16_t, float, FWD_H_F32_TO_B16_ZERO>(output, src, mask32);
+    StoreAlign<bfloat16_t, StoreDist::DIST_PACK_B32>(dst, output, mask32);
 }
 
 template <typename T>
@@ -154,7 +181,8 @@ __simd_vf__ inline void FwdHPrepareScalarGateArch35Vf(__ubuf__ float *gateScale,
     }
 }
 
-template <bool HAS_P, bool SCALAR_G, bool WRITE_RIGHT, bool ZERO_STATE, typename PType>
+template <bool HAS_P, bool SCALAR_G, bool WRITE_RIGHT, bool ZERO_STATE, typename PType,
+          uint16_t VALUE_SIZE>
 __simd_vf__ inline void FwdHStage1Arch35Vf(__ubuf__ bfloat16_t *uAndVNew,
                                            __ubuf__ PType *p,
                                            __ubuf__ float *gateScale,
@@ -167,9 +195,8 @@ __simd_vf__ inline void FwdHStage1Arch35Vf(__ubuf__ bfloat16_t *uAndVNew,
     //   V_new[i,:] = cast_BF16(V_new_fp32[i,:])；
     //   g-only: right[i,:] = cast_BF16(E(g_last-g_i) * V_new_fp32[i,:])，alpha=E(g_last)；
     //   gk-only: right=V_new。E 由 USE_EXP2 在编译期选择。
-    // 本 VF 覆盖当前 head 的全部 MTE2 后向量计算，内部没有运行期分支。
     constexpr uint16_t BF16_PER_REG = AscendC::VECTOR_REG_WIDTH / sizeof(bfloat16_t);
-    constexpr uint16_t STATE_ROWS = FWD_H_STATE_BF16_BYTES / sizeof(bfloat16_t) / BF16_PER_REG;
+    constexpr uint16_t stateRows = FWD_H_K * VALUE_SIZE / BF16_PER_REG;
     MaskReg mask16 = CreateMask<bfloat16_t, MaskPattern::ALL>();
     MaskReg mask32 = CreateMask<float, MaskPattern::ALL>();
 
@@ -177,7 +204,7 @@ __simd_vf__ inline void FwdHStage1Arch35Vf(__ubuf__ bfloat16_t *uAndVNew,
         RegTensor<bfloat16_t> zeroState;
         Duplicate(zeroState, static_cast<bfloat16_t>(0), mask16);
         #pragma unroll 2
-        for (uint16_t row = 0; row < STATE_ROWS; ++row) {
+        for (uint16_t row = 0; row < stateRows; ++row) {
             StoreAlign(state + static_cast<uint32_t>(row) * BF16_PER_REG, zeroState, mask16);
         }
     }
@@ -189,42 +216,59 @@ __simd_vf__ inline void FwdHStage1Arch35Vf(__ubuf__ bfloat16_t *uAndVNew,
     RegTensor<float> scaleReg;
     #pragma unroll 2
     for (uint16_t row = 0; row < validTokens; ++row) {
-        const uint32_t rowBf16Offset = static_cast<uint32_t>(row) * FWD_H_V;
-        const uint32_t rowFp32Offset = static_cast<uint32_t>(row) * FWD_H_V;
+        const uint32_t rowBf16Offset = static_cast<uint32_t>(row) * VALUE_SIZE;
+        const uint32_t rowFp32Offset = static_cast<uint32_t>(row) * VALUE_SIZE;
         if constexpr (SCALAR_G && WRITE_RIGHT) {
             LoadAlign<float, LoadDist::DIST_BRC_B32>(scaleReg, gateScale + row);
         }
-        for (uint16_t col = 0; col < FWD_H_V; col += BF16_PER_REG) {
+        for (uint16_t col = 0; col < VALUE_SIZE; col += BF16_PER_REG) {
             const uint32_t bf16Offset = rowBf16Offset + col;
             const uint32_t fp32Offset = rowFp32Offset + col;
-            FwdHLoadAsFloat<bfloat16_t>(u0, u1, uAndVNew + bf16Offset, mask16);
-            if constexpr (HAS_P) {
-                if constexpr (std::is_same<PType, float>::value) {
-                    FwdHLoadFloatPair(p0, p1, p + fp32Offset);
+            if constexpr (VALUE_SIZE == FWD_H_V / 2) {
+                FwdHLoad64AsFloat<bfloat16_t>(u0, uAndVNew + bf16Offset, mask32);
+                if constexpr (HAS_P) {
+                    FwdHLoad64AsFloat<PType>(p0, p + fp32Offset, mask32);
                 } else {
-                    FwdHLoadAsFloat<PType>(p0, p1, p + bf16Offset, mask16);
+                    Duplicate(p0, 0.0f, mask32);
+                }
+                Sub(u0, u0, p0, mask32);
+                FwdHStore64Bf16(uAndVNew + bf16Offset, u0, mask32);
+                if constexpr (WRITE_RIGHT) {
+                    if constexpr (SCALAR_G) {
+                        Mul(u0, u0, scaleReg, mask32);
+                    }
+                    FwdHStore64Bf16(right + bf16Offset, u0, mask32);
                 }
             } else {
-                Duplicate(p0, 0.0f, mask32);
-                Duplicate(p1, 0.0f, mask32);
-            }
-            Sub(u0, u0, p0, mask32);
-            Sub(u1, u1, p1, mask32);
-            FwdHStoreBf16(uAndVNew + bf16Offset, u0, u1, mask32, mask16);
-
-            if constexpr (WRITE_RIGHT) {
-                if constexpr (SCALAR_G) {
-                    Mul(u0, u0, scaleReg, mask32);
-                    Mul(u1, u1, scaleReg, mask32);
+                FwdHLoadAsFloat<bfloat16_t>(u0, u1, uAndVNew + bf16Offset, mask16);
+                if constexpr (HAS_P) {
+                    if constexpr (std::is_same<PType, float>::value) {
+                        FwdHLoadFloatPair(p0, p1, p + fp32Offset);
+                    } else {
+                        FwdHLoadAsFloat<PType>(p0, p1, p + bf16Offset, mask16);
+                    }
+                } else {
+                    Duplicate(p0, 0.0f, mask32);
+                    Duplicate(p1, 0.0f, mask32);
                 }
-                FwdHStoreBf16(right + bf16Offset, u0, u1, mask32, mask16);
+                Sub(u0, u0, p0, mask32);
+                Sub(u1, u1, p1, mask32);
+                FwdHStoreBf16(uAndVNew + bf16Offset, u0, u1, mask32, mask16);
+
+                if constexpr (WRITE_RIGHT) {
+                    if constexpr (SCALAR_G) {
+                        Mul(u0, u0, scaleReg, mask32);
+                        Mul(u1, u1, scaleReg, mask32);
+                    }
+                    FwdHStoreBf16(right + bf16Offset, u0, u1, mask32, mask16);
+                }
             }
         }
     }
 }
 
 template <bool STATE_FP32, bool SCALAR_G, bool STATE_V_FIRST, bool WRITE_H,
-          bool ZERO_STATE, bool USE_EXP2, typename GateT>
+          bool ZERO_STATE, bool USE_EXP2, typename GateT, uint16_t VALUE_SIZE>
 __simd_vf__ inline void FwdHStage3Arch35Vf(__ubuf__ bfloat16_t *stateBf16,
                                            __ubuf__ float *stateFp32,
                                            __ubuf__ float *d,
@@ -269,23 +313,51 @@ __simd_vf__ inline void FwdHStage3Arch35Vf(__ubuf__ bfloat16_t *stateBf16,
 
     #pragma unroll 2
     for (uint16_t row = 0; row < ROWS; ++row) {
-        for (uint16_t col = 0; col < FWD_H_V; col += BF16_PER_REG) {
-            const uint32_t bf16Offset = static_cast<uint32_t>(row) * FWD_H_V + col;
-            const uint32_t fp32Offset = static_cast<uint32_t>(row) * FWD_H_V + col;
-            if constexpr (STATE_FP32) {
-                if constexpr (ZERO_STATE) {
-                    Duplicate(state0, 0.0f, mask32);
-                    Duplicate(state1, 0.0f, mask32);
+        for (uint16_t col = 0; col < VALUE_SIZE; col += BF16_PER_REG) {
+            const uint32_t bf16Offset = static_cast<uint32_t>(row) * VALUE_SIZE + col;
+            const uint32_t fp32Offset = static_cast<uint32_t>(row) * VALUE_SIZE + col;
+            if constexpr (VALUE_SIZE == FWD_H_V / 2) {
+                if constexpr (STATE_FP32) {
+                    if constexpr (ZERO_STATE) {
+                        Duplicate(state0, 0.0f, mask32);
+                    } else {
+                        FwdHLoad64AsFloat<float>(state0, stateFp32 + fp32Offset, mask32);
+                    }
                 } else {
-                    FwdHLoadFloatPair(state0, state1, stateFp32 + fp32Offset);
+                    FwdHLoad64AsFloat<bfloat16_t>(state0, stateBf16 + bf16Offset, mask32);
+                }
+                FwdHLoad64AsFloat<float>(d0, d + fp32Offset, mask32);
+                if constexpr (!SCALAR_G && !STATE_V_FIRST) {
+                    FwdHLoadScalar<GateT>(gate0, gkLast + row, mask16, mask32);
+                    if constexpr (USE_EXP2) {
+                        Muls(gate0, gate0, FWD_H_LN2, mask32);
+                    }
+                    Exp(gate0, gate0, mask32);
+                }
+                Mul(state0, state0, gate0, mask32);
+                Add(state0, state0, d0, mask32);
+                if constexpr (STATE_FP32) {
+                    StoreAlign(stateFp32 + fp32Offset, state0, mask32);
+                } else {
+                    FwdHStore64Bf16(stateBf16 + bf16Offset, state0, mask32);
+                }
+                if constexpr (WRITE_H && STATE_FP32) {
+                    FwdHStore64Bf16(hNext + bf16Offset, state0, mask32);
                 }
             } else {
-                FwdHLoadAsFloat<bfloat16_t>(state0, state1, stateBf16 + bf16Offset, mask16);
-            }
-            FwdHLoadFloatPair(d0, d1, d + fp32Offset);
+                if constexpr (STATE_FP32) {
+                    if constexpr (ZERO_STATE) {
+                        Duplicate(state0, 0.0f, mask32);
+                        Duplicate(state1, 0.0f, mask32);
+                    } else {
+                        FwdHLoadFloatPair(state0, state1, stateFp32 + fp32Offset);
+                    }
+                } else {
+                    FwdHLoadAsFloat<bfloat16_t>(state0, state1, stateBf16 + bf16Offset, mask16);
+                }
+                FwdHLoadFloatPair(d0, d1, d + fp32Offset);
 
-            if constexpr (!SCALAR_G) {
-                if constexpr (!STATE_V_FIRST) {
+                if constexpr (!SCALAR_G && !STATE_V_FIRST) {
                     FwdHLoadScalar<GateT>(gate0, gkLast + row, mask16, mask32);
                     if constexpr (USE_EXP2) {
                         Muls(gate0, gate0, FWD_H_LN2, mask32);
@@ -293,26 +365,26 @@ __simd_vf__ inline void FwdHStage3Arch35Vf(__ubuf__ bfloat16_t *stateBf16,
                     Exp(gate0, gate0, mask32);
                     Adds(gate1, gate0, 0.0f, mask32);
                 }
-            }
-            Mul(state0, state0, gate0, mask32);
-            Mul(state1, state1, gate1, mask32);
-            Add(state0, state0, d0, mask32);
-            Add(state1, state1, d1, mask32);
+                Mul(state0, state0, gate0, mask32);
+                Mul(state1, state1, gate1, mask32);
+                Add(state0, state0, d0, mask32);
+                Add(state1, state1, d1, mask32);
 
-            if constexpr (STATE_FP32) {
-                FwdHStoreFloatPair(stateFp32 + fp32Offset, state0, state1, mask32);
-            } else {
-                FwdHStoreBf16(stateBf16 + bf16Offset, state0, state1, mask32, mask16);
-            }
-            if constexpr (WRITE_H && STATE_FP32) {
-                // FP32 state 没有独立的 32 KiB H bank。当前 D 行读入寄存器后，允许把
-                // BF16 H 原位写到 D slot 的低半区；写地址只覆盖已经消费的 D 行。
-                FwdHStoreBf16(hNext + bf16Offset, state0, state1, mask32, mask16);
+                if constexpr (STATE_FP32) {
+                    FwdHStoreFloatPair(stateFp32 + fp32Offset, state0, state1, mask32);
+                } else {
+                    FwdHStoreBf16(stateBf16 + bf16Offset, state0, state1, mask32, mask16);
+                }
+                if constexpr (WRITE_H && STATE_FP32) {
+                    // 当前 D 行读入寄存器后，BF16 H 可以原位复用已消费的 D 行。
+                    FwdHStoreBf16(hNext + bf16Offset, state0, state1, mask32, mask16);
+                }
             }
         }
     }
 }
 
+template <uint16_t VALUE_SIZE>
 __simd_vf__ inline void FwdHSMinusOneArch35Vf(__ubuf__ float *state,
                                                __ubuf__ bfloat16_t *h)
 {
@@ -324,11 +396,16 @@ __simd_vf__ inline void FwdHSMinusOneArch35Vf(__ubuf__ float *state,
     RegTensor<float> state1;
     #pragma unroll 2
     for (uint16_t row = 0; row < 128; ++row) {
-        for (uint16_t col = 0; col < FWD_H_V; col += BF16_PER_REG) {
-            const uint32_t fp32Offset = static_cast<uint32_t>(row) * FWD_H_V + col;
-            const uint32_t bf16Offset = static_cast<uint32_t>(row) * FWD_H_V + col;
-            FwdHLoadFloatPair(state0, state1, state + fp32Offset);
-            FwdHStoreBf16(h + bf16Offset, state0, state1, mask32, mask16);
+        for (uint16_t col = 0; col < VALUE_SIZE; col += BF16_PER_REG) {
+            const uint32_t fp32Offset = static_cast<uint32_t>(row) * VALUE_SIZE + col;
+            const uint32_t bf16Offset = static_cast<uint32_t>(row) * VALUE_SIZE + col;
+            if constexpr (VALUE_SIZE == FWD_H_V / 2) {
+                FwdHLoad64AsFloat<float>(state0, state + fp32Offset, mask32);
+                FwdHStore64Bf16(h + bf16Offset, state0, mask32);
+            } else {
+                FwdHLoadFloatPair(state0, state1, state + fp32Offset);
+                FwdHStoreBf16(h + bf16Offset, state0, state1, mask32, mask16);
+            }
         }
     }
 }
@@ -352,20 +429,27 @@ public:
     {
         const FwdHCoreHeadRange range =
             FwdHResolveCoreHeadRange(args_.tiling, coreIdx_, coreNum_);
-        const uint32_t headsPerSequence = static_cast<uint32_t>(args_.tiling.vNumHead);
+        const uint32_t tasksPerSequence =
+            static_cast<uint32_t>(args_.tiling.vNumHead) * args_.tiling.valueSplit;
         uint32_t cachedSequence = FwdHSequenceCount(args_.tiling);
         FwdHSequenceSpan sequenceSpan{};
         FwdHSequenceCursor sequenceCursor{};
         for (uint32_t cursor = range.begin; cursor < range.end;) {
-            const uint32_t sequence = cursor / headsPerSequence;
-            const uint32_t hvBegin = cursor - sequence * headsPerSequence;
-            uint32_t unitHeads = range.end - cursor;
-            const uint32_t sequenceRemain = headsPerSequence - hvBegin;
-            if (unitHeads > sequenceRemain) {
-                unitHeads = sequenceRemain;
-            }
-            if (unitHeads > FWD_H_AIC_HEAD_SLOTS) {
-                unitHeads = FWD_H_AIC_HEAD_SLOTS;
+            const uint32_t sequence = cursor / tasksPerSequence;
+            const uint32_t taskInSequence = cursor - sequence * tasksPerSequence;
+            const bool splitValue = args_.tiling.valueSplit == 2;
+            const uint32_t hvBegin = splitValue ? taskInSequence / 2 : taskInSequence;
+            const uint32_t vBegin = splitValue ? (taskInSequence & 1U) * (FWD_H_V / 2) : 0;
+            const uint32_t vSize = splitValue ? FWD_H_V / 2 : FWD_H_V;
+            uint32_t unitHeads = splitValue ? 1 : range.end - cursor;
+            if (!splitValue) {
+                const uint32_t sequenceRemain = tasksPerSequence - hvBegin;
+                if (unitHeads > sequenceRemain) {
+                    unitHeads = sequenceRemain;
+                }
+                if (unitHeads > FWD_H_AIC_HEAD_SLOTS) {
+                    unitHeads = FWD_H_AIC_HEAD_SLOTS;
+                }
             }
             if (sequence != cachedSequence) {
                 sequenceSpan = FwdHResolveSequence(args_, sequence, sequenceCursor);
@@ -373,7 +457,8 @@ public:
             }
             const FwdHWorkUnit unit{
                 sequenceSpan,
-                FwdHBuildHeadRange<CompilePolicy::GATE_MODE>(args_.tiling, hvBegin, unitHeads)};
+                FwdHBuildHeadRange<CompilePolicy::GATE_MODE>(
+                    args_.tiling, hvBegin, unitHeads, vBegin, vSize)};
             cursor += unitHeads;
             if (unit.sequence.chunkCount != 0 && unit.headRound.activeHeadCount != 0) {
                 ProcessWorkUnit(unit, cursor < range.end);
@@ -527,14 +612,44 @@ private:
     __aicore__ inline uint64_t HOffset(const FwdHWorkUnit &unit, const FwdHChunkSpan &chunk,
                                        const FwdHHeadBinding &head) const
     {
-        return FwdHHOffset(args_.tiling, unit.sequence, head.hv, chunk.globalChunk);
+        return FwdHHOffset(args_.tiling, unit.sequence, head.hv, chunk.globalChunk) + head.vBegin;
     }
 
     __aicore__ inline uint64_t UOffset(const FwdHWorkUnit &unit, const FwdHChunkSpan &chunk,
                                        const FwdHHeadBinding &head) const
     {
         return FwdHInputOffset(args_.tiling, unit.sequence.physicalBatch, head.hv,
-                               chunk.tokenBegin, FWD_H_V);
+                               chunk.tokenBegin, FWD_H_V) + head.vBegin;
+    }
+
+    template <typename T>
+    __aicore__ inline void CopyGmRowsToUb(AscendC::LocalTensor<T> dst, AscendC::GlobalTensor<T> src,
+                                          uint64_t offset, uint32_t rows,
+                                          const FwdHHeadBinding &head) const
+    {
+        if (head.vSize == FWD_H_V) {
+            AscendC::DataCopy(dst, src[offset], rows * FWD_H_V);
+            return;
+        }
+        const uint16_t blockLen = static_cast<uint16_t>(head.vSize * sizeof(T) / 32);
+        const uint16_t srcGap = static_cast<uint16_t>((FWD_H_V - head.vSize) * sizeof(T) / 32);
+        AscendC::DataCopy(dst, src[offset],
+                          AscendC::DataCopyParams(static_cast<uint16_t>(rows), blockLen, srcGap, 0));
+    }
+
+    template <typename T>
+    __aicore__ inline void CopyUbRowsToGm(AscendC::GlobalTensor<T> dst, uint64_t offset,
+                                          AscendC::LocalTensor<T> src, uint32_t rows,
+                                          const FwdHHeadBinding &head) const
+    {
+        if (head.vSize == FWD_H_V) {
+            AscendC::DataCopy(dst[offset], src, rows * FWD_H_V);
+            return;
+        }
+        const uint16_t blockLen = static_cast<uint16_t>(head.vSize * sizeof(T) / 32);
+        const uint16_t dstGap = static_cast<uint16_t>((FWD_H_V - head.vSize) * sizeof(T) / 32);
+        AscendC::DataCopy(dst[offset], src,
+                          AscendC::DataCopyParams(static_cast<uint16_t>(rows), blockLen, 0, dstGap));
     }
 
     __aicore__ inline uint64_t GateOffset(const FwdHWorkUnit &unit, const FwdHChunkSpan &chunk,
@@ -577,8 +692,8 @@ private:
         AscendC::GlobalTensor<float> initial;
         initial.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(args_.initialState));
         const uint64_t stateBase = FwdHStateOffset<STATE_V_FIRST>(
-            args_.tiling, unit.sequence.sequence, head.hv, 0, 0);
-        AscendC::DataCopy(SminusStateSlot(slot), initial[stateBase], FWD_H_K * FWD_H_V);
+            args_.tiling, unit.sequence.sequence, head.hv, 0, 0) + head.vBegin;
+        CopyGmRowsToUb(SminusStateSlot(slot), initial, stateBase, FWD_H_K, head);
         AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(IoReadyEvent(slot));
     }
 
@@ -588,16 +703,21 @@ private:
         // S-1：H0=cast_BF16(initial_state)。输入输出保持 state_v_first 指定的物理顺序。
         const uint32_t slot = head.localSlot;
         AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(IoReadyEvent(slot));
-        AscendC::VF_CALL<FwdHSMinusOneArch35Vf>(
-            reinterpret_cast<__ubuf__ float *>(SminusStateSlot(slot).GetPhyAddr()),
-            reinterpret_cast<__ubuf__ bfloat16_t *>(SminusHSlot(slot).GetPhyAddr()));
+        if (head.vSize == FWD_H_V) {
+            AscendC::VF_CALL<FwdHSMinusOneArch35Vf<FWD_H_V>>(
+                reinterpret_cast<__ubuf__ float *>(SminusStateSlot(slot).GetPhyAddr()),
+                reinterpret_cast<__ubuf__ bfloat16_t *>(SminusHSlot(slot).GetPhyAddr()));
+        } else {
+            AscendC::VF_CALL<FwdHSMinusOneArch35Vf<FWD_H_V / 2>>(
+                reinterpret_cast<__ubuf__ float *>(SminusStateSlot(slot).GetPhyAddr()),
+                reinterpret_cast<__ubuf__ bfloat16_t *>(SminusHSlot(slot).GetPhyAddr()));
+        }
         AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(IoDoneEvent(slot));
         AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(IoDoneEvent(slot));
         AscendC::GlobalTensor<bfloat16_t> h;
         h.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(args_.h));
         const FwdHChunkSpan firstChunk = FwdHBuildChunk(unit.sequence, 0);
-        AscendC::DataCopy(h[HOffset(unit, firstChunk, head)], SminusHSlot(slot),
-                          FWD_H_K * FWD_H_V);
+        CopyUbRowsToGm(h, HOffset(unit, firstChunk, head), SminusHSlot(slot), FWD_H_K, head);
         AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(IoFreeEvent(slot));
     }
 
@@ -670,15 +790,33 @@ private:
                 FwdHAivLocalFlag(FWD_H_P_READY_FLAG, head.localSlot));
         }
         if constexpr (CompilePolicy::GATE_MODE == FwdHGateMode::SCALAR_G) {
-            AscendC::VF_CALL<FwdHStage1Arch35Vf<HAS_P, true, WRITE_RIGHT, ZERO_STATE, PType>>(
-                reinterpret_cast<__ubuf__ bfloat16_t *>(WorkBf16Slot(inputSlot).GetPhyAddr()), p,
-                reinterpret_cast<__ubuf__ float *>(GateScaleSlot(inputSlot).GetPhyAddr()), right, state,
-                static_cast<uint16_t>(chunk.validTokens));
+            if (head.vSize == FWD_H_V) {
+                AscendC::VF_CALL<FwdHStage1Arch35Vf<HAS_P, true, WRITE_RIGHT, ZERO_STATE, PType,
+                                                    FWD_H_V>>(
+                    reinterpret_cast<__ubuf__ bfloat16_t *>(WorkBf16Slot(inputSlot).GetPhyAddr()), p,
+                    reinterpret_cast<__ubuf__ float *>(GateScaleSlot(inputSlot).GetPhyAddr()), right, state,
+                    static_cast<uint16_t>(chunk.validTokens));
+            } else {
+                AscendC::VF_CALL<FwdHStage1Arch35Vf<HAS_P, true, WRITE_RIGHT, ZERO_STATE, PType,
+                                                    FWD_H_V / 2>>(
+                    reinterpret_cast<__ubuf__ bfloat16_t *>(WorkBf16Slot(inputSlot).GetPhyAddr()), p,
+                    reinterpret_cast<__ubuf__ float *>(GateScaleSlot(inputSlot).GetPhyAddr()), right, state,
+                    static_cast<uint16_t>(chunk.validTokens));
+            }
         } else {
-            AscendC::VF_CALL<FwdHStage1Arch35Vf<HAS_P, false, WRITE_RIGHT, ZERO_STATE, PType>>(
-                reinterpret_cast<__ubuf__ bfloat16_t *>(WorkBf16Slot(inputSlot).GetPhyAddr()), p,
-                reinterpret_cast<__ubuf__ float *>(GateScaleSlot(inputSlot).GetPhyAddr()), right, state,
-                static_cast<uint16_t>(chunk.validTokens));
+            if (head.vSize == FWD_H_V) {
+                AscendC::VF_CALL<FwdHStage1Arch35Vf<HAS_P, false, WRITE_RIGHT, ZERO_STATE, PType,
+                                                    FWD_H_V>>(
+                    reinterpret_cast<__ubuf__ bfloat16_t *>(WorkBf16Slot(inputSlot).GetPhyAddr()), p,
+                    reinterpret_cast<__ubuf__ float *>(GateScaleSlot(inputSlot).GetPhyAddr()), right, state,
+                    static_cast<uint16_t>(chunk.validTokens));
+            } else {
+                AscendC::VF_CALL<FwdHStage1Arch35Vf<HAS_P, false, WRITE_RIGHT, ZERO_STATE, PType,
+                                                    FWD_H_V / 2>>(
+                    reinterpret_cast<__ubuf__ bfloat16_t *>(WorkBf16Slot(inputSlot).GetPhyAddr()), p,
+                    reinterpret_cast<__ubuf__ float *>(GateScaleSlot(inputSlot).GetPhyAddr()), right, state,
+                    static_cast<uint16_t>(chunk.validTokens));
+            }
         }
         if constexpr (HAS_P) {
             AscendC::CrossCoreSetFlag<0x4, PIPE_V>(
@@ -699,12 +837,12 @@ private:
             AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(IoDoneEvent(slot));
             AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(IoDoneEvent(slot));
         }
-        AscendC::DataCopy(vNew[UOffset(unit, chunk, head)], WorkBf16Slot(inputSlot),
-                          chunk.validTokens * FWD_H_V);
+        CopyUbRowsToGm(vNew, UOffset(unit, chunk, head), WorkBf16Slot(inputSlot),
+                       chunk.validTokens, head);
         if constexpr (WRITE_RIGHT) {
             const uint64_t rightOffset = FwdHCoreSlotOffset(coreIdx_, head.roundHead,
-                                                            FWD_H_CHUNK * FWD_H_V);
-            AscendC::DataCopy(rightGm[rightOffset], RightSlot(slot), chunk.validTokens * FWD_H_V);
+                                                            FWD_H_CHUNK * head.vSize);
+            AscendC::DataCopy(rightGm[rightOffset], RightSlot(slot), chunk.validTokens * head.vSize);
             if constexpr (!CompilePolicy::STATE_FP32) {
                 AscendC::CrossCoreSetFlag<0x4, PIPE_MTE3>(
                     FwdHAivLocalFlag(FWD_H_RIGHT_READY_FLAG, head.localSlot));
@@ -712,12 +850,12 @@ private:
         }
         if constexpr (!CompilePolicy::STATE_FP32) {
             if (chunk.first) {
-                AscendC::DataCopy(h[HOffset(unit, chunk, head)], StateBf16Slot(slot), FWD_H_K * FWD_H_V);
+                CopyUbRowsToGm(h, HOffset(unit, chunk, head), StateBf16Slot(slot), FWD_H_K, head);
                 // Stage3 reads and updates the same BF16 state bank on PIPE_V.
                 WaitStateWritebackBeforeVectorReuse(slot);
             }
         } else if constexpr (ZERO_STATE) {
-            AscendC::DataCopy(h[HOffset(unit, chunk, head)], StateBf16Slot(slot), FWD_H_K * FWD_H_V);
+            CopyUbRowsToGm(h, HOffset(unit, chunk, head), StateBf16Slot(slot), FWD_H_K, head);
             // H0 临时区只在首 chunk 使用；对应 FP32 state 在 Stage3 以 ZERO_INIT 生成。
             WaitStateWritebackBeforeVectorReuse(slot);
         }
@@ -740,8 +878,8 @@ private:
         AscendC::GlobalTensor<bfloat16_t> u;
         u.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(args_.u));
         u.SetL2CacheHint(AscendC::CacheMode::CACHE_MODE_DISABLE);
-        AscendC::DataCopy(WorkBf16Slot(inputSlot), u[UOffset(unit, chunk, head)],
-                          chunk.validTokens * FWD_H_V);
+        CopyGmRowsToUb(WorkBf16Slot(inputSlot), u, UOffset(unit, chunk, head),
+                       chunk.validTokens, head);
         if constexpr (CompilePolicy::GATE_MODE == FwdHGateMode::SCALAR_G) {
             if (writeRight) {
                 CopyGateToUb(unit, chunk, head, inputSlot);
@@ -798,8 +936,8 @@ private:
                 AscendC::GlobalTensor<bfloat16_t> u;
                 u.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(args_.u));
                 u.SetL2CacheHint(AscendC::CacheMode::CACHE_MODE_DISABLE);
-                AscendC::DataCopy(WorkBf16Slot(slot), u[UOffset(unit, chunk, head)],
-                                  chunk.validTokens * FWD_H_V);
+                CopyGmRowsToUb(WorkBf16Slot(slot), u, UOffset(unit, chunk, head),
+                               chunk.validTokens, head);
                 if constexpr (CompilePolicy::GATE_MODE == FwdHGateMode::SCALAR_G) {
                     if (writeRight) {
                         CopyGateToUb(unit, chunk, head, slot);
@@ -809,8 +947,8 @@ private:
                     AscendC::GlobalTensor<bfloat16_t> initial;
                     initial.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(args_.initialState));
                     const uint64_t stateOffset = FwdHStateOffset<STATE_V_FIRST>(
-                        args_.tiling, unit.sequence.sequence, head.hv, 0, 0);
-                    AscendC::DataCopy(StateBf16Slot(slot), initial[stateOffset], FWD_H_K * FWD_H_V);
+                        args_.tiling, unit.sequence.sequence, head.hv, 0, 0) + head.vBegin;
+                    CopyGmRowsToUb(StateBf16Slot(slot), initial, stateOffset, FWD_H_K, head);
                 }
                 AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(IoReadyEvent(slot));
                 if (coreHeadId > 0) {
@@ -886,19 +1024,41 @@ private:
             hNext = reinterpret_cast<__ubuf__ bfloat16_t *>(StateBf16Slot(slot).GetPhyAddr());
         }
         if constexpr (CompilePolicy::GATE_MODE == FwdHGateMode::SCALAR_G) {
-            AscendC::VF_CALL<FwdHStage3Arch35Vf<CompilePolicy::STATE_FP32, true, STATE_V_FIRST,
-                                                WRITE_H, ZERO_INIT, CompilePolicy::USE_EXP2, GateT>>(
-                reinterpret_cast<__ubuf__ bfloat16_t *>(StateBf16Slot(slot).GetPhyAddr()),
-                reinterpret_cast<__ubuf__ float *>(StateFp32(stateSlot).GetPhyAddr()), d,
-                reinterpret_cast<__ubuf__ GateT *>(GateSlot(gateSlot).GetPhyAddr()),
-                reinterpret_cast<__ubuf__ float *>(AlphaSlot(gateSlot).GetPhyAddr()), hNext);
+            if (head.vSize == FWD_H_V) {
+                AscendC::VF_CALL<FwdHStage3Arch35Vf<CompilePolicy::STATE_FP32, true, STATE_V_FIRST,
+                                                    WRITE_H, ZERO_INIT, CompilePolicy::USE_EXP2, GateT,
+                                                    FWD_H_V>>(
+                    reinterpret_cast<__ubuf__ bfloat16_t *>(StateBf16Slot(slot).GetPhyAddr()),
+                    reinterpret_cast<__ubuf__ float *>(StateFp32(stateSlot).GetPhyAddr()), d,
+                    reinterpret_cast<__ubuf__ GateT *>(GateSlot(gateSlot).GetPhyAddr()),
+                    reinterpret_cast<__ubuf__ float *>(AlphaSlot(gateSlot).GetPhyAddr()), hNext);
+            } else {
+                AscendC::VF_CALL<FwdHStage3Arch35Vf<CompilePolicy::STATE_FP32, true, STATE_V_FIRST,
+                                                    WRITE_H, ZERO_INIT, CompilePolicy::USE_EXP2, GateT,
+                                                    FWD_H_V / 2>>(
+                    reinterpret_cast<__ubuf__ bfloat16_t *>(StateBf16Slot(slot).GetPhyAddr()),
+                    reinterpret_cast<__ubuf__ float *>(StateFp32(stateSlot).GetPhyAddr()), d,
+                    reinterpret_cast<__ubuf__ GateT *>(GateSlot(gateSlot).GetPhyAddr()),
+                    reinterpret_cast<__ubuf__ float *>(AlphaSlot(gateSlot).GetPhyAddr()), hNext);
+            }
         } else {
-            AscendC::VF_CALL<FwdHStage3Arch35Vf<CompilePolicy::STATE_FP32, false, STATE_V_FIRST,
-                                                WRITE_H, ZERO_INIT, CompilePolicy::USE_EXP2, GateT>>(
-                reinterpret_cast<__ubuf__ bfloat16_t *>(StateBf16Slot(slot).GetPhyAddr()),
-                reinterpret_cast<__ubuf__ float *>(StateFp32(stateSlot).GetPhyAddr()), d,
-                reinterpret_cast<__ubuf__ GateT *>(GateSlot(gateSlot).GetPhyAddr()),
-                reinterpret_cast<__ubuf__ float *>(AlphaSlot(gateSlot).GetPhyAddr()), hNext);
+            if (head.vSize == FWD_H_V) {
+                AscendC::VF_CALL<FwdHStage3Arch35Vf<CompilePolicy::STATE_FP32, false, STATE_V_FIRST,
+                                                    WRITE_H, ZERO_INIT, CompilePolicy::USE_EXP2, GateT,
+                                                    FWD_H_V>>(
+                    reinterpret_cast<__ubuf__ bfloat16_t *>(StateBf16Slot(slot).GetPhyAddr()),
+                    reinterpret_cast<__ubuf__ float *>(StateFp32(stateSlot).GetPhyAddr()), d,
+                    reinterpret_cast<__ubuf__ GateT *>(GateSlot(gateSlot).GetPhyAddr()),
+                    reinterpret_cast<__ubuf__ float *>(AlphaSlot(gateSlot).GetPhyAddr()), hNext);
+            } else {
+                AscendC::VF_CALL<FwdHStage3Arch35Vf<CompilePolicy::STATE_FP32, false, STATE_V_FIRST,
+                                                    WRITE_H, ZERO_INIT, CompilePolicy::USE_EXP2, GateT,
+                                                    FWD_H_V / 2>>(
+                    reinterpret_cast<__ubuf__ bfloat16_t *>(StateBf16Slot(slot).GetPhyAddr()),
+                    reinterpret_cast<__ubuf__ float *>(StateFp32(stateSlot).GetPhyAddr()), d,
+                    reinterpret_cast<__ubuf__ GateT *>(GateSlot(gateSlot).GetPhyAddr()),
+                    reinterpret_cast<__ubuf__ float *>(AlphaSlot(gateSlot).GetPhyAddr()), hNext);
+            }
         }
         if constexpr (RELEASE_GATE_BANK) {
             static_assert(CompilePolicy::GATE_MODE == FwdHGateMode::SCALAR_G,
@@ -922,8 +1082,8 @@ private:
                     AscendC::GlobalTensor<float> state;
                     state.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(args_.workspace));
                     const uint64_t stateOffset = args_.tiling.kDecayWorkspaceOffset / sizeof(float) +
-                        FwdHCoreSlotOffset(coreIdx_, head.roundHead, FWD_H_K * FWD_H_V);
-                    AscendC::DataCopy(state[stateOffset], StateFp32(stateSlot), FWD_H_K * FWD_H_V);
+                        FwdHCoreSlotOffset(coreIdx_, head.roundHead, FWD_H_K * head.vSize);
+                    AscendC::DataCopy(state[stateOffset], StateFp32(stateSlot), FWD_H_K * head.vSize);
                     if constexpr (ZERO_INIT) {
                         // Zero-init skips the next head's MTE2 state load, so it needs a
                         // direct MTE3->V fence before reusing the shared FP32 bank.
@@ -935,14 +1095,13 @@ private:
             if constexpr (CompilePolicy::STATE_FP32) {
                 AscendC::LocalTensor<bfloat16_t> hLocal =
                     LocalSlot(slot).template ReinterpretCast<bfloat16_t>();
-                AscendC::DataCopy(h[HOffset(unit, next, head)], hLocal, FWD_H_K * FWD_H_V);
+                CopyUbRowsToGm(h, HOffset(unit, next, head), hLocal, FWD_H_K, head);
                 // PIPE_MTE3 的跨核通知排在 H 写回之后；AIC 收到 D_FREE 时，D slot
                 // 已不再作为 MTE3 输入，可以安全进入下一次 Stage0/Stage2。
                 AscendC::CrossCoreSetFlag<0x4, PIPE_MTE3>(
                     FwdHAivLocalFlag(FWD_H_D_FREE_FLAG, head.localSlot));
             } else {
-                AscendC::DataCopy(h[HOffset(unit, next, head)], StateBf16Slot(slot),
-                                  FWD_H_K * FWD_H_V);
+                CopyUbRowsToGm(h, HOffset(unit, next, head), StateBf16Slot(slot), FWD_H_K, head);
             }
             AscendC::CrossCoreSetFlag<0x4, PIPE_MTE3>(
                 FwdHAivLocalFlag(FWD_H_H_READY_FLAG, head.localSlot));
@@ -952,8 +1111,8 @@ private:
                     AscendC::GlobalTensor<float> finalState;
                     finalState.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(args_.finalState));
                     const uint64_t offset = FwdHStateOffset<STATE_V_FIRST>(
-                        args_.tiling, unit.sequence.sequence, head.hv, 0, 0);
-                    AscendC::DataCopy(finalState[offset], StateFp32(stateSlot), FWD_H_K * FWD_H_V);
+                        args_.tiling, unit.sequence.sequence, head.hv, 0, 0) + head.vBegin;
+                    CopyUbRowsToGm(finalState, offset, StateFp32(stateSlot), FWD_H_K, head);
                     if constexpr (ZERO_INIT && !RESIDENT_FP32_STATE) {
                         WaitStateWritebackBeforeVectorReuse(slot);
                     }
@@ -961,8 +1120,8 @@ private:
                     AscendC::GlobalTensor<bfloat16_t> finalState;
                     finalState.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(args_.finalState));
                     const uint64_t offset = FwdHStateOffset<STATE_V_FIRST>(
-                        args_.tiling, unit.sequence.sequence, head.hv, 0, 0);
-                    AscendC::DataCopy(finalState[offset], StateBf16Slot(slot), FWD_H_K * FWD_H_V);
+                        args_.tiling, unit.sequence.sequence, head.hv, 0, 0) + head.vBegin;
+                    CopyUbRowsToGm(finalState, offset, StateBf16Slot(slot), FWD_H_K, head);
                 }
             }
         }
@@ -1006,17 +1165,16 @@ private:
                         AscendC::GlobalTensor<float> initial;
                         initial.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(args_.initialState));
                         const uint64_t initialOffset = FwdHStateOffset<STATE_V_FIRST>(
-                            args_.tiling, unit.sequence.sequence, head.hv, 0, 0);
-                        AscendC::DataCopy(StateFp32(head.localSlot), initial[initialOffset],
-                                          FWD_H_K * FWD_H_V);
+                            args_.tiling, unit.sequence.sequence, head.hv, 0, 0) + head.vBegin;
+                        CopyGmRowsToUb(StateFp32(head.localSlot), initial, initialOffset, FWD_H_K, head);
                     }
                 } else if constexpr (!RESIDENT_FP32_STATE) {
                     AscendC::GlobalTensor<float> state;
                     const uint64_t workspaceBase = args_.tiling.kDecayWorkspaceOffset / sizeof(float);
                     state.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(args_.workspace));
                     const uint64_t offset = workspaceBase +
-                        FwdHCoreSlotOffset(coreIdx_, head.roundHead, FWD_H_K * FWD_H_V);
-                    AscendC::DataCopy(StateFp32(head.localSlot), state[offset], FWD_H_K * FWD_H_V);
+                        FwdHCoreSlotOffset(coreIdx_, head.roundHead, FWD_H_K * head.vSize);
+                    AscendC::DataCopy(StateFp32(head.localSlot), state[offset], FWD_H_K * head.vSize);
                 }
             }
             if constexpr (CompilePolicy::GATE_MODE == FwdHGateMode::KEY_GK) {

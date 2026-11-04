@@ -110,6 +110,8 @@ struct FwdHChunkSpan {
 struct FwdHHeadBinding {
     uint32_t hv = 0;
     uint32_t kh = 0;
+    uint32_t vBegin = 0;
+    uint32_t vSize = FWD_H_V;
     uint8_t roundHead = 0;
     uint8_t kgSlot = 0;
     uint8_t aiv = 0;
@@ -159,6 +161,7 @@ struct FwdHRuntimeTiling {
     uint32_t chunkSize = 0;
     uint32_t shapeBatch = 0;
     uint32_t tokenBatch = 0;
+    uint32_t valueSplit = 1;
     uint64_t vWorkspaceOffset = 0;
     uint64_t vUpdateWorkspaceOffset = 0;
     uint64_t kDecayWorkspaceOffset = 0;
