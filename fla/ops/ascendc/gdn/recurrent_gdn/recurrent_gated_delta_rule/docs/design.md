@@ -13,7 +13,8 @@
 2. 为 case 1 所属的单序列、单 token、多头场景直接分配 head，省去 ComputeAvgload 和 head 归属扫描。
 
 编码时没有设备基线或数值性能目标；首次用户反馈为 main 6.60 us、两项优化 6.71 us，
-当前未显示收益，待拆分测量与重复轮次统计，详见 validation.md。以同设备、相同安装与预热条件下的
+仅末 token 版本 93f5c70a 为 6.55 us，用户认为接近持平。新增调度当前未显示收益，
+同步与运行时分派成本尚未分离，详见 validation.md。以同设备、相同安装与预热条件下的
 msprof op / OpBasicInfo 的 Task Duration(us) 比较 f918240b、仅改动 1、改动 1+2。
 Python 默认调用 20 次，各次独立 state 在首个 RGDR 前克隆；msprof warm-up=20、launch-count=20，
 统计均值、中位数、标准差、P90/P99。输入构造与校验不计入目标 kernel。
@@ -39,6 +40,8 @@ case 1 的 Nwork=32；若可用核数>=32，则 blockDim=32、每核一个 head�
 ### Stage 0：Vector，准备输入与分发
 
 新增调度在原单 work 分支之后判断 api.md 中条件。先判断空核、prefix 和 length，再读取一次 state index。
+head 整除关系已由 host 的 CheckShapeValueRangeAndRule 校验，AiCore 分派条件不重复执行 NV%NK。
+该变体只去掉额外取余，保留后续 head 偏移中的必要除法和所有同步，不预设其性能收益。
 每核调用原 CopyInGamaBeta(0,1)，沿用完整 head gate/beta 准备，不引入 Q/K 复用或缓冲调整。
 每个本核 head 调用原 CopyInQKV、PrefetchState、LoadPrefetchedState。
 在 UB 标量读取前发出一对 V_S Set/Wait，覆盖 gate Exp、beta/QKV Cast、query scale 和 state Cast。

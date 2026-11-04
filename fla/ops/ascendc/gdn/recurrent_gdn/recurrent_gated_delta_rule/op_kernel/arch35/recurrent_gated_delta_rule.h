@@ -375,8 +375,9 @@ public:
 private:
     __aicore__ inline bool CanUseSingleTokenHeads() const
     {
+        // Host CheckShapeValueRangeAndRule already validates NV % NK == 0.
         return std::is_same<stateType, bfloat16_t>::value && B_ == 1 && T_ == 1 &&
-               NK_ > 0 && NV_ > 1 && NV_ % NK_ == 0 &&
+               NK_ > 0 && NV_ > 1 &&
                realK_ == 128 && realV_ == 128 && vStep_ == 128 && stateStride2_ == 128 &&
                hasGama_ && !hasGamaK_ && !hasAcceptedTokens_;
     }

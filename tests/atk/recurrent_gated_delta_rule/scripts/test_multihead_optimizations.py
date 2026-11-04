@@ -96,9 +96,16 @@ int main() {
     assert(!Harness<float>().CanUseSingleTokenHeads());
     using Field = uint32_t Harness<>::*;
     for (Field f : {&Harness<>::B_, &Harness<>::T_, &Harness<>::realK_, &Harness<>::realV_,
-                    &Harness<>::vStep_, &Harness<>::stateStride2_, &Harness<>::NK_, &Harness<>::NV_}) {
+                    &Harness<>::vStep_, &Harness<>::stateStride2_}) {
         Harness<> h; h.*f=0; assert(!h.CanUseSingleTokenHeads());
         Harness<> other; other.*f+=1; assert(!other.CanUseSingleTokenHeads());
+    }
+    { Harness<> h; h.NK_=0; assert(!h.CanUseSingleTokenHeads()); }
+    { Harness<> h; h.NV_=1; assert(!h.CanUseSingleTokenHeads()); }
+    // Invalid divisibility never reaches this kernel: test host-valid pairs.
+    for (unsigned nk : {1u,2u,4u,8u,16u,32u}) for (unsigned group : {1u,2u,3u,4u}) {
+        Harness<> h; h.NK_=nk; h.NV_=nk*group;
+        if (h.NV_>1) assert(h.CanUseSingleTokenHeads());
     }
     { Harness<> h; h.hasGama_=false; assert(!h.CanUseSingleTokenHeads()); }
     { Harness<> h; h.hasGamaK_=true; assert(!h.CanUseSingleTokenHeads()); }
@@ -133,7 +140,7 @@ class MultiheadSourceTest(unittest.TestCase):
     def test_fast_path_guard_and_general_fallback(self):
         source = KERNEL.read_text(encoding="utf-8")
         expected = '''return std::is_same<stateType, bfloat16_t>::value && B_ == 1 && T_ == 1 &&
-            NK_ > 0 && NV_ > 1 && NV_ % NK_ == 0 &&
+            NK_ > 0 && NV_ > 1 &&
             realK_ == 128 && realV_ == 128 && vStep_ == 128 && stateStride2_ == 128 &&
             hasGama_ && !hasGamaK_ && !hasAcceptedTokens_;'''
         self.assertEqual(normalize(body(source, "CanUseSingleTokenHeads")), normalize(expected))
@@ -141,6 +148,20 @@ class MultiheadSourceTest(unittest.TestCase):
             if constexpr (singleWork) { ProcessSingleWork(); }
             else if (CanUseSingleTokenHeads()) { ProcessSingleTokenHeads(); }
             else { ProcessGeneral(); }'''))
+
+    def test_head_divisibility_is_checked_on_host_not_repeated_in_dispatch(self):
+        host_path = OP / "op_host/recurrent_gated_delta_rule_tiling_processor.h"
+        host = host_path.read_text(encoding="utf-8")
+        self.assertEqual(host, baseline(host_path))
+        check = body(host, "CheckShapeValueRangeAndRule")
+        self.assertIn("tiling.nk == 0", check)
+        self.assertIn("tiling.nv % tiling.nk != 0", check)
+        source = KERNEL.read_text(encoding="utf-8")
+        self.assertNotIn("%", normalize(body(source, "CanUseSingleTokenHeads")))
+        self.assertEqual(body(source, "ProcessSingleTokenHeads"),
+                         body(subprocess.check_output([
+                             "git", "show", "9a515a70:" + KERNEL.relative_to(ROOT).as_posix()],
+                             text=True, encoding="utf-8"), "ProcessSingleTokenHeads"))
 
     def test_direct_dispatch_offsets_and_vector_to_scalar_completion(self):
         source = body(KERNEL.read_text(encoding="utf-8"), "ProcessSingleTokenHeads")
