@@ -53,7 +53,7 @@ struct RGDRInitParams {
     GM_ADDR finalState;
 };
 
-template <typename stateType, typename outType, bool hasGama, bool hasGamaK>
+template <typename stateType, typename outType, bool hasGama, bool hasGamaK, bool writeUpdatedScratch = true>
 __simd_vf__ inline void ComputeRecurrentGatedDeltaRuleVF(
     __ubuf__ float *state, __ubuf__ float *key, __ubuf__ float *query, __ubuf__ float *value,
     __ubuf__ float *gamaK, __ubuf__ stateType *stateOut, __ubuf__ outType *attnOut,
@@ -153,11 +153,14 @@ __simd_vf__ inline void ComputeRecurrentGatedDeltaRuleVF(
         Mul(update1, delta, key1, fullFp32Mask);
         Add(state0, state0, update0, fullFp32Mask);
         Add(state1, state1, update1, fullFp32Mask);
-        if constexpr (std::is_same<stateType, float32_t>()) {
-            DataCopy(state + rowOffset, state0, fullFp32Mask);
-            DataCopy(state + rowOffset + FP32_PER_REG, state1, fullFp32Mask);
-        } else {
-            DataCopy<float, StoreDist::DIST_INTLV_B32>(state + rowOffset, state0, state1, fullFp32Mask);
+        if constexpr (writeUpdatedScratch) {
+            // A following token consumes this update; the one-token path has no consumer.
+            if constexpr (std::is_same<stateType, float32_t>()) {
+                DataCopy(state + rowOffset, state0, fullFp32Mask);
+                DataCopy(state + rowOffset + FP32_PER_REG, state1, fullFp32Mask);
+            } else {
+                DataCopy<float, StoreDist::DIST_INTLV_B32>(state + rowOffset, state0, state1, fullFp32Mask);
+            }
         }
 
         RegTensor<float> out0;
@@ -206,7 +209,7 @@ __simd_vf__ inline void ComputeRecurrentGatedDeltaRuleVF(
     }
 }
 
-template <typename inType, typename outType, typename stateType>
+template <typename inType, typename outType, typename stateType, bool singleWork = false>
 class RGDR {
 public:
     __aicore__ inline RGDR(const RecurrentGatedDeltaRuleTilingData *tilingData)
@@ -232,6 +235,14 @@ public:
         alignV_ = Ceil(tilingData->dv, BF16_NUM_PER_BLOCK) * BF16_NUM_PER_BLOCK;
         load = 0;
         usedblk = 0;
+        if constexpr (singleWork) {
+            static_assert(std::is_same<stateType, bfloat16_t>::value, "single work requires BF16 state");
+            B_ = T_ = NK_ = NV_ = 1;
+            realK_ = realV_ = alignK_ = alignV_ = vStep_ = 128;
+            hasAcceptedTokens_ = false;
+            hasGama_ = true;
+            hasGamaK_ = false;
+        }
     }
 
     __aicore__ inline void Init(const RGDRInitParams &initParams, TPipe *pipe)
@@ -311,6 +322,15 @@ public:
 
     __aicore__ inline void Process()
     {
+        if constexpr (singleWork) {
+            ProcessSingleWork();
+        } else {
+            ProcessGeneral();
+        }
+    }
+
+    __aicore__ inline void ProcessGeneral()
+    {
         ComputeAvgload();
         int32_t seq1 = cuSeqlensGm_.GetValue(0);
         for (uint64_t batch_i = 0; batch_i < B_; batch_i++) {
@@ -351,6 +371,34 @@ public:
     }
 
 private:
+    __aicore__ inline void ProcessSingleWork()
+    {
+        // T=B=1 does not prove that the device sequence has an active token.
+        const int32_t prefix = cuSeqlensGm_.GetValue(0);
+        const int32_t length = cuSeqlensGm_.GetValue(1);
+        if (prefix != 0 || length != 1) {
+            return;
+        }
+        // With one active token and no accepted-token input, both state slots
+        // come from this same device index. Keep the original block stride.
+        const uint64_t stateIndex = ssmStateIndicesGm_.GetValue(0);
+        const uint64_t stateOffset = stateStride0_ * stateIndex;
+        CopyInGamaBeta(0, 1);
+        CopyInQKV(0, 0, 1);
+        PrefetchState(stateOffset, 128);
+        LoadPrefetchedState(128);
+        // Complete the preceding Vector producers before reading their UB scalars.
+        TEventID vToS = GetTPipePtr()->FetchEventID(HardEvent::V_S);
+        SetFlag<HardEvent::V_S>(vToS);
+        WaitFlag<HardEvent::V_S>(vToS);
+        gama_ = gamaInUb.GetValue(0);
+        beta_ = betaInUb.GetValue(0);
+        Compute(128, 0, 0);
+        // Same order as the one-token general path, including its pending flush.
+        CopyOutAttn(0, 128);
+        CopyOutState(stateOffset, 128);
+    }
+
     __aicore__ inline void CopyInQKV(uint64_t vOffset, uint64_t qkOffset, int32_t seqLen)
     {
         LocalTensor<inType> qLocal = qInQueue_.AllocTensor<inType>();
@@ -451,23 +499,23 @@ private:
         __ubuf__ float *attnTmpAddr = reinterpret_cast<__ubuf__ float *>(attnInUb.GetPhyAddr());
         if (hasGama_) {
             if (hasGamaK_) {
-                ComputeRecurrentGatedDeltaRuleVF<stateType, outType, true, true>(
+                ComputeRecurrentGatedDeltaRuleVF<stateType, outType, true, true, !singleWork>(
                     stateAddr, keyAddr, queryAddr, valueAddr, gamaKAddr, stateOutAddr, attnOutAddr,
                     attnTmpAddr, static_cast<uint16_t>(curSingleV), static_cast<uint16_t>(alignK_),
                     gama_, beta_);
             } else {
-                ComputeRecurrentGatedDeltaRuleVF<stateType, outType, true, false>(
+                ComputeRecurrentGatedDeltaRuleVF<stateType, outType, true, false, !singleWork>(
                     stateAddr, keyAddr, queryAddr, valueAddr, gamaKAddr, stateOutAddr, attnOutAddr,
                     attnTmpAddr, static_cast<uint16_t>(curSingleV), static_cast<uint16_t>(alignK_),
                     gama_, beta_);
             }
         } else if (hasGamaK_) {
-            ComputeRecurrentGatedDeltaRuleVF<stateType, outType, false, true>(
+            ComputeRecurrentGatedDeltaRuleVF<stateType, outType, false, true, !singleWork>(
                 stateAddr, keyAddr, queryAddr, valueAddr, gamaKAddr, stateOutAddr, attnOutAddr,
                 attnTmpAddr, static_cast<uint16_t>(curSingleV), static_cast<uint16_t>(alignK_),
                 gama_, beta_);
         } else {
-            ComputeRecurrentGatedDeltaRuleVF<stateType, outType, false, false>(
+            ComputeRecurrentGatedDeltaRuleVF<stateType, outType, false, false, !singleWork>(
                 stateAddr, keyAddr, queryAddr, valueAddr, gamaKAddr, stateOutAddr, attnOutAddr,
                 attnTmpAddr, static_cast<uint16_t>(curSingleV), static_cast<uint16_t>(alignK_),
                 gama_, beta_);
