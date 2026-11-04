@@ -84,6 +84,49 @@ PERFORMANCE_START=1 PERFORMANCE_END=2 \
 
 ## 执行方式
 
+### msprof op：直接测量性能 case 1
+
+[msprof_op_rgdr.py](scripts/msprof_op_rgdr.py) 基于
+`codex/gdn-a5-public-latency-diagnostic` 的同名脚本适配，默认 `--case-id=1`，
+直接读取本目录性能 JSON 并复用 executor 的 `build_inputs`。可用 `--case-id=0` 测最小用例。
+离线运行 `python scripts/msprof_op_rgdr.py --dry-run` 可核对输入配置，不加载 torch/NPU。
+
+先在 Linux A5 上构建、安装并核对目标 run 包。激活 ATK/PyTorch 环境并加载 CANN 后，在仓根执行：
+
+```bash
+SCRIPT="$PWD/tests/atk/recurrent_gated_delta_rule/scripts/msprof_op_rgdr.py"
+OUT="$PWD/tests/atk/recurrent_gated_delta_rule/runs/msprof_op/multihead_$(date +%Y%m%d_%H%M%S)"
+mkdir -p "$OUT"
+msprof op \
+  --application="python $SCRIPT --repo-root $PWD --device 0 --case-id 1 --calls 20 --metadata $OUT/application.json" \
+  --kernel-name=RecurrentGatedDeltaRule \
+  --launch-count=20 --warm-up=20 --aic-metrics=BasicInfo --output="$OUT"
+python "$SCRIPT" --summarize "$OUT" --expected-count 20
+```
+
+`--calls`、`--launch-count` 和汇总期望样本数保持一致。脚本在首条目标调用前构造全部独立 state，
+调用间只同步，不生成输入或重置 state。仅汇总 RGDR 的 `Task Duration(us)`；输入准备产生的
+Cast/Neg 等任务不计入。汇总保留原始行，样本数不符或混入多个 run/device 时拒绝通过。
+`application.json` 记录 case、源码提交、实际安装包、全部 OPP opapi 候选和 RGDR `.o` 哈希；
+这些信息不能替代 `verify_libcust_opapi_md5.py` 对待测构建产物的核对。
+
+先验证未被 profiler 重放的 case 1 精度，再进行计时。可在本算子目录运行原生 ATK：
+
+```bash
+cd tests/atk/recurrent_gated_delta_rule
+atk node --name npu_dut --backend npu --devices 0 \
+  node --name cpu_golden --backend cpu \
+  task -c atk_recurrent_gated_delta_rule_perf.json --task accuracy --bm_device cpu \
+  -p executor_recurrent_gated_delta_rule.py -s 1 -e 2
+```
+
+msprof 可能预热/重放原地更新 state 的 kernel，采集输出不用于精度验收。
+基线为 `f918240b`，保留对应 run 包，以同一脚本、JSON、设备和采集参数交错安装比较。
+msprof 参数依据：[msOpProf 26.0 参数说明](https://github.com/Ascend/msopprof/blob/26.0.0/docs/en/user_guide/msopprof_user_guide.md)。
+本地离线测试见 `scripts/test_msprof_op_rgdr.py`；设计和待验证记录见
+[design.md](../../../fla/ops/ascendc/gdn/recurrent_gdn/recurrent_gated_delta_rule/docs/design.md)、
+[validation.md](../../../fla/ops/ascendc/gdn/recurrent_gdn/recurrent_gated_delta_rule/docs/validation.md)。
+
 ```bash
 bash tests/atk/run_test_cpu.sh -op=recurrent_gated_delta_rule -npu_device_id=0
 bash tests/atk/run_test_cpu.sh -op=recurrent_gated_delta_rule -npu_device_id=0 -scope=accuracy
