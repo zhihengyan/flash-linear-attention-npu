@@ -75,6 +75,16 @@ case 1 保留原用例的随机种子、输入生成方式、值域、状态索�
 抓取记录。原 200 条精度用例保持不变；case 1 的 NPU 运行、精度及性能尚未验证。
 原 single-work 模板仍要求 `Hk=Hv=1`。本分支把末 token scratch 省写推广到 A5 通用路径，
 因此 case 1 的所有 head 也可以省去最后一次 updated FP32 scratch 写入。
+case 1 在 host 选择 `vStep=128` 时可进入新增直接 head 分发；其他 dtype/gate/多序列输入保持原调度。
+
+| A5 运行时分支 | 预期输入代表 | 已有精度/MSS 映射 | 实际选择与验收 |
+|---|---|---|---|
+| 原 single-work | perf 0 / 精度 0 / MSS 0 | 原文件保留 | 待本轮设备回归 |
+| 多头单 token 直接分发 | perf 1 | perf 1 可用下文 ATK accuracy 单独检查；MSS 代表待补 | 待设备确认 |
+| BF16 general，非末/末 token | 原精度 2 等两 token 输入 | 原精度文件保留；MSS 代表待补 | 待设备确认 |
+| FP32 general，非末/末 token | 原精度 1 等 FP32 输入 | 原精度文件保留；MSS 代表待补 | 待设备确认 |
+
+这次没有新增 TilingKey，host/入口/packed tiling struct 保持基线；表中是同一 key 内的运行时分支。
 
 只运行新增用例（范围为 `[1,2)`）：
 
@@ -122,7 +132,8 @@ atk node --name npu_dut --backend npu --devices 0 \
 ```
 
 msprof 可能预热/重放原地更新 state 的 kernel，采集输出不用于精度验收。
-基线为 `f918240b`，保留对应 run 包，以同一脚本、JSON、设备和采集参数交错安装比较。
+`7acfe2e1` 含本脚本且 kernel 与 `f918240b` 一致，可作为测评基线；`93f5c70a` 仅增加末 token
+scratch 省写，最新提交另含多头调度。保留各自 run 包，以同一脚本、JSON、设备和采集参数交错安装比较。
 msprof 参数依据：[msOpProf 26.0 参数说明](https://github.com/Ascend/msopprof/blob/26.0.0/docs/en/user_guide/msopprof_user_guide.md)。
 本地离线测试见 `scripts/test_msprof_op_rgdr.py`；设计和待验证记录见
 [design.md](../../../fla/ops/ascendc/gdn/recurrent_gdn/recurrent_gated_delta_rule/docs/design.md)、

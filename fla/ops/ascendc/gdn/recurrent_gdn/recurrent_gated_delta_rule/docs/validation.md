@@ -26,6 +26,24 @@
 末 token 改动的 4 项源码检查通过：VF 数学保持、四个 gate 分支参数、仅末 token 分派变化、
 UB/搬运与公开接口/A2A3 源码保持。尚未执行 CANN 编译或设备精度/性能测试。
 
+最终编码后的检查：
+
+- `python -B -m unittest discover -s tests/atk/recurrent_gated_delta_rule/scripts -p 'test_*.py' -v`：
+  共 20 项，19 通过，1 项生产控制函数 C++ harness 因缺少编译器跳过。
+- 源码检查能拒绝错误保留尾部 Store、遗漏 V_S Wait、head 归属重叠、错误 Q/K 分组四种变体。
+- 原分支仍为 f918240b；三份 ATK JSON 的 Git blob 和 prefill K32 实现均与该基线一致。
+- `check_issue_coverage.py`：188 个 completed issue、21 条规则映射通过。
+- 四层静态检视脚本仍返回 42 条 DFX-MESSAGE error，0 warning；逐条确认所在 host/API 文件与
+  f918240b 完全一致。这不是“检视零告警”。代表位置为 aclnn 实现 118 行、tiling 45 行及
+  tiling_processor 86 行的旧 guard/通用 OP_LOGE；本轮不修改其公开参数报错。
+- #362 的 stride/state 路径按原地址公式核对，#640 的设备精度/非有限值回归待执行，
+  #641 的公开异常校验仍由未修改的 host/API 负责。
+- `git diff --check` 与新增文档本地链接检查通过。以上均不代表硬件同步、机器码或性能已验收。
+
+独立测量版本：7acfe2e1（脚本与设计准备、kernel 同 f918240b）、93f5c70a（仅末 token 省写）、
+本分支最新提交（再加多头直接分发）。case 1 需从实际 host 日志确认 vStep=128 和 blockDim，
+同一 TilingKey 不能证明命中了新运行时分支。
+
 ## 内网执行
 
 先为相应提交编译并安装单算子 run 包，并使用新 Python 进程：

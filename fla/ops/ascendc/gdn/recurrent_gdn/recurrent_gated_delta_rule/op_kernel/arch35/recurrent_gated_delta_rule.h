@@ -324,6 +324,8 @@ public:
     {
         if constexpr (singleWork) {
             ProcessSingleWork();
+        } else if (CanUseSingleTokenHeads()) {
+            ProcessSingleTokenHeads();
         } else {
             ProcessGeneral();
         }
@@ -371,6 +373,46 @@ public:
     }
 
 private:
+    __aicore__ inline bool CanUseSingleTokenHeads() const
+    {
+        return std::is_same<stateType, bfloat16_t>::value && B_ == 1 && T_ == 1 &&
+               NK_ > 0 && NV_ > 1 && NV_ % NK_ == 0 &&
+               realK_ == 128 && realV_ == 128 && vStep_ == 128 && stateStride2_ == 128 &&
+               hasGama_ && !hasGamaK_ && !hasAcceptedTokens_;
+    }
+
+    __aicore__ inline void ProcessSingleTokenHeads()
+    {
+        const uint64_t coreCount = GetBlockNum();
+        if (coreCount == 0 || blockIdx >= NV_) {
+            return;
+        }
+        const int32_t prefix = cuSeqlensGm_.GetValue(0);
+        const int32_t length = cuSeqlensGm_.GetValue(1);
+        if (prefix != 0 || length != 1) {
+            return;
+        }
+        const uint64_t stateIndex = ssmStateIndicesGm_.GetValue(0);
+        CopyInGamaBeta(0, 1);
+        TEventID vToS = GetTPipePtr()->FetchEventID(HardEvent::V_S);
+        for (uint64_t head_i = blockIdx; head_i < NV_; head_i += coreCount) {
+            const uint64_t vOffset = head_i * realV_;
+            const uint64_t qkOffset = (head_i / (NV_ / NK_)) * realK_;
+            const uint64_t stateOffset = stateStride0_ * stateIndex + stateStride1_ * head_i;
+            CopyInQKV(vOffset, qkOffset, 1);
+            PrefetchState(stateOffset, 128);
+            LoadPrefetchedState(128);
+            // Reuse the consumed event for the next head, never an outstanding flag.
+            SetFlag<HardEvent::V_S>(vToS);
+            WaitFlag<HardEvent::V_S>(vToS);
+            gama_ = gamaInUb.GetValue(head_i);
+            beta_ = betaInUb.GetValue(head_i);
+            Compute<false>(128, 0, 0);
+            CopyOutAttn(vOffset, 128);
+            CopyOutState(stateOffset, 128);
+        }
+    }
+
     __aicore__ inline void ProcessSingleWork()
     {
         // T=B=1 does not prove that the device sequence has an active token.

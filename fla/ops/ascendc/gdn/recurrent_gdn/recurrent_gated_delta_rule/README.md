@@ -1,4 +1,13 @@
 # RecurrentGatedDeltaRule 算子说明
+
+## 本分支优化与支持范围
+
+公开输入约束和平台支持沿用下文接口说明。本分支仅调整 A5 内部实现：
+每个序列/V 分片的末 token 不再保存无后续读取者的 updated FP32 UB scratch；
+单序列、单 token、BF16 state、g-only 的多头输入另用直接 head 分发。
+原单 work 路径和其他输入的通用调度继续保留，详见 [api.md](docs/api.md)、
+[design.md](docs/design.md) 与 [待验证记录](docs/validation.md)。本轮尚未完成设备验收。
+
 `RecurrentGatedDeltaRule` 是用于循环门控 Delta 规则（Recurrent Gated Delta Rule，RGDR）的自定义算子，主要应用于线性注意力机制的推理场景。该算子在每个时间步根据当前输入 $q_t, k_t, v_t$ 和上一隐藏状态 $S_{t-1}$，计算当前输出 $o_t$ 并更新隐藏状态 $S_t$。
 
 ---

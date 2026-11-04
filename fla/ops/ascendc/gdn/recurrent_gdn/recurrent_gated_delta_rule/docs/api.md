@@ -1,10 +1,17 @@
 # RecurrentGatedDeltaRule 接口与本轮边界
 
+## 参数、返回和支持范围
+
 公开签名、输入输出和异常约束沿用当前 [算子说明](../README.md) 与
 [ACLNN 说明](aclnnRecurrentGatedDeltaRule.md)。本轮不改变接口、tiling 数据布局、SoC 支持或数学语义。
 query/key/value/beta/out 为 BF16，state 支持 BF16/FP32，K=V=128；Hv 为 Hk 的整数倍。
 T 是无效前缀与所有序列有效长度之和，每条有效序列长度在 [0,8] 内。
 state 原地更新，输出仍为 attention；g/gk 至少提供一个，accepted-token 和非连续视图保持原约束。
+Python 入口为 `fla_npu.ops.ascendc.recurrent_gated_delta_rule`，保持原参数顺序和默认值；
+ACLNN 保持 `aclnnRecurrentGatedDeltaRuleGetWorkspaceSize` / `aclnnRecurrentGatedDeltaRule` 两段调用。
+参数错误和返回码仍由原 ACLNN/tiling 校验负责，本轮不新增或改变公开错误语义。
+
+## 本轮优化的输入条件
 
 本轮用户指定性能输入为 `_perf.json` case 1：B=T=1、Hk=16、Hv=32、K=V=128、BF16 state、
 g-only、无 accepted-token 输入、连续布局、seed=20260826。JSON 从基线 f918240b 原样继承。
