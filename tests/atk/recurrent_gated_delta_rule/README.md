@@ -60,6 +60,28 @@ ATK DUT 统一通过 `fla_npu.ops.ascendc.recurrent_gated_delta_rule` 执行。`
 
 正向 JSON 只包含 `Dk=Dv=128` 的合法 shape。任何不等于 128 的维度属于非法输入，由 `fla_npu` wrapper 和 op_host tiling 共同拦截；对应拦截由 op_host UT 覆盖。
 
+## 性能用例
+
+`atk_recurrent_gated_delta_rule_perf.json` 保留最小用例，并新增一条 `Hk=16、Hv=32` 的单 token
+decode 用例。两条均使用 `K=V=128`、BF16 state、g-only、连续布局，不提供 accepted-token 输入。
+
+| 性能 Case ID | 详细设计 ID | B / T | Hk / Hv | 来源与用途 |
+|---:|---|---|---|---|
+| 0 | RGDR-P001 | 1 / 1 | 1 / 1 | 原精度 case 0，保留最小开销对照 |
+| 1 | RGDR-PERF001 | 1 / 1 | 16 / 32 | 从 case 0 派生，仅改变输入头数，用于观察多头 decode 性能 |
+
+case 1 保留原用例的随机种子、输入生成方式、值域、状态索引和 gate 配置；同时更新用例编号、
+名称和性能标签。它是用户指定头数的合成性能用例，不是现有精度用例的直接平移，也不是现网
+抓取记录。原 200 条精度用例保持不变；case 1 的 NPU 运行、精度及性能尚未验证。
+它走 A5 通用路径，不会命中要求 `Hk=Hv=1` 的 single-work / tail-scratch 特化。
+
+只运行新增用例（范围为 `[1,2)`）：
+
+```bash
+PERFORMANCE_START=1 PERFORMANCE_END=2 \
+  bash tests/atk/run_test_cpu.sh -op=recurrent_gated_delta_rule -soc=ascend950 -npu_device_id=0 -scope=performance
+```
+
 ## 执行方式
 
 ```bash
