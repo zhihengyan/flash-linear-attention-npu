@@ -398,6 +398,76 @@ class HeaderKindGateTest(unittest.TestCase):
             "param 0: header tensor != call site int_array"
         ])
 
+    def test_call_discovery_ignores_commented_examples(self) -> None:
+        tool = _load_tool("op_abi_validate.py")
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "stable_demo.cpp"
+            source.write_text(
+                '// FLA_STABLE_EXEC("aclnnExample", meta, stream, tensor(x));\n'
+                '/* FLA_STABLE_EXEC("aclnnOld", meta, stream, tensor(x));\n'
+                '   rt.symbol("aclnnOldGetWorkspaceSize");\n'
+                '   get_ws(old.get(), &workspace_size, &executor);\n'
+                '*/\n'
+                'void run_demo(double scale) {\n'
+                '  auto get_ws = rt.symbol("aclnnDemoGetWorkspaceSize");\n'
+                '  get_ws(x.get(), static_cast<float>(scale), '
+                '&workspace_size, &executor);\n'
+                '}\n',
+                encoding="utf-8",
+            )
+            self.assertEqual(tool.adapter_calls(Path(tmp)), {})
+            self.assertEqual(tool.hand_written_calls(Path(tmp)), {
+                "aclnnDemo": (source, [tool.WILDCARD, "float"]),
+            })
+
+    def test_comments_before_macro_symbol_do_not_hide_call(self) -> None:
+        tool = _load_tool("op_abi_validate.py")
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "stable_demo.cpp"
+            source.write_text(
+                'void run_demo(Tensor x, bool mode) {\n'
+                '  FLA_STABLE_EXEC(\n'
+                '      // Describe the descriptor layout before the symbol.\n'
+                '      /* Keep this comment too. */ "aclnnDemo", meta, stream,\n'
+                '      tensor(x), scalar(mode));\n'
+                '}\n',
+                encoding="utf-8",
+            )
+            self.assertEqual(tool.adapter_calls(Path(tmp)), {
+                "aclnnDemo": (source, [tool.TENSOR, "bool"]),
+            })
+            self.assertEqual(tool.hand_written_calls(Path(tmp)), {})
+
+    def test_scoped_recurrent_cli_checks_headers_and_rejects_drift(self) -> None:
+        for name, group, scale_type in (
+            ("recurrent_gated_delta_rule", "gdn/recurrent_gdn", "float"),
+            ("recurrent_kda", "kda", "double"),
+        ):
+            with self.subTest(op=name), tempfile.TemporaryDirectory() as tmp:
+                header = (REPO_ROOT / "fla/ops/ascendc" / group / name
+                          / "op_host/op_api" / f"aclnn_{name}.h")
+                copied_header = Path(tmp) / header.name
+                original = header.read_text(encoding="utf-8")
+                copied_header.write_text(original, encoding="utf-8")
+                argv = [
+                    sys.executable,
+                    str(SETUP_DIR / "tools/op_abi_validate.py"),
+                    "--opp-include", tmp,
+                    "--ops", name,
+                ]
+                result = subprocess.run(argv, capture_output=True, text=True)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn("1 call site(s) checked, 0 mismatch(es)", result.stdout)
+
+                changed_type = "double" if scale_type == "float" else "float"
+                changed = original.replace(f"{scale_type} scale", f"{changed_type} scale")
+                self.assertNotEqual(changed, original)
+                copied_header.write_text(changed, encoding="utf-8")
+                result = subprocess.run(argv, capture_output=True, text=True)
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertIn("1 call site(s) checked, 1 mismatch(es)", result.stdout)
+                self.assertIn(f"header {changed_type} != call site {scale_type}", result.stdout)
+
     def test_scoped_filter_checks_only_selected_adapter_sources(self) -> None:
         tool = _load_tool("op_abi_validate.py")
         adapters = {
