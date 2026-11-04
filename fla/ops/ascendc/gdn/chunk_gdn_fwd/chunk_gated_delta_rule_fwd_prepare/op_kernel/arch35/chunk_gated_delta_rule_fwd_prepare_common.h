@@ -315,8 +315,11 @@ struct PrepareState {
     }
 
     // Keep each HK sharing group inside one pack. Small G=1/2 cases may use
-    // shorter packs to engage otherwise idle cores; choose the lowest worst-case
-    // per-core task count and retain the larger pack when the cost ties.
+    // shorter packs to engage otherwise idle cores. Select the lowest worst-case
+    // per-core task count and retain fullPack unless a shorter pack lowers it.
+    // totalChunks is the total sequence-chunk/value-head task count. With 28
+    // AICs on Ascend 950, a shorter pack wins only at totalChunks<=84 for G=1
+    // or totalChunks<=56 for G=2; larger ties retain fullPack.
     __aicore__ inline int64_t TasksPerPack() const
     {
         const int64_t fullPack = (HRatio == 3) ? 3 : kTasksPerRound;

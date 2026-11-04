@@ -85,6 +85,9 @@ public:
         const uint64_t originalHeadTasks =
             effectiveSequenceCount * static_cast<uint64_t>(ctx_.vNumHead);
         const uint64_t physicalAicCores = static_cast<uint64_t>(ctx_.aicCoreNum);
+        // enableValueSplit is limited to Ascend 950, scalar-g, FP32 state and
+        // !state_v_first. With 28 AICs, half-head splitting increases blockDim
+        // only when sequenceCount*vNumHead<=14; token count is not a gate.
         uint64_t valueSplit = 1;
         if (ctx_.enableValueSplit && originalHeadTasks < physicalAicCores) {
             const uint64_t originalHeadsPerCore =

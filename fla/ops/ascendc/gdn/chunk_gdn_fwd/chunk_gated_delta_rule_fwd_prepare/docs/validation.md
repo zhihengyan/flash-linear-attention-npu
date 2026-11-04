@@ -2,8 +2,8 @@
 
 ## 固定验收口径
 
-- 代码分支：`feat/gdn-opt`，本轮基线 `ea1f61a1`；当前已推送提交 `a5ba454e`，本地新增六条小 case 性能用例。
-- 当前验证：`c15adc11` 完整回退 Stage7 packed MMAD 后，正式融合精度已通过，仅保留 fwd_h 和小 case 短 pack 并行优化。`a5ba454e` 将 fwd_h 的 VF 列宽改为调用前分派和编译期常量，Prepare 实现不再改动。用户报告三次性能约为 1710／2021 µs，但同时有其他程序运行，只作受干扰参考，不作为正式性能结论。
+- 代码分支：`feat/gdn-opt`，本轮基线 `ea1f61a1`；当前已推送提交 `11c963e8`，其中算子代码与 `a5ba454e` 一致，新增六条小 case 性能用例。
+- 当前验证：`c15adc11` 完整回退 Stage7 packed MMAD 后，正式融合精度已通过，仅保留 fwd_h 和小 case 短 pack 并行优化。`a5ba454e` 将 fwd_h 的 VF 列宽改为调用前分派和编译期常量，Prepare 实现不再改动。无干扰 A/B 中，正式 case 0/1 基本持平；小 case 2～6 降低 7.60%～15.62%，case 7 增加 1.99%，仍需独立复测确认波动。
 - 硬件与设备：Ascend 950，device 2。
 - 精度：正式 500 条双标杆矩阵，每 25 条自动分片；最大相对误差比例 5、平均相对误差比例 1.5、均方根误差比例 1.5，沿用 ATK 判定。
 - 性能：固定两条正式 case，每项至少两轮，与正式中位数比较；小 case 使用同一 JSON 做基线/优化 A/B。不以 ACL event、理论核利用率或单 Stage timer 替代端到端结论。
@@ -39,21 +39,21 @@ python scripts/verify_libcust_opapi_md5.py
 | 训练 case 1 | 基线 | Prepare Stage3/7 | 原始实现 | 用户给定稳定基线 | 2707.735 µs；范围 2704.416～2709.092 µs | 待本轮 profiling | 三轮波动 4.676 µs |
 | 两条 case | Stage3 / 负收益，放弃并回退 | 原实现对 4096 个元素执行 Mul/Store；候选只减少有效 lane | 候选仅将 Mul/Store 改为 lower mask，Load、打包、VCS、同步不变 | 正式 500 条未完整跑通 | 用户报告两次均值约 1710／2715 µs，基线为 1705.298／2707.735 µs | 无有效收益 | 循环、Load、Mul 和 Store 调用次数均未减少，却新增 UpdateMask 和 masked Store 开销；训练慢约 7.265 µs，超过基线波动，不能保留 |
 | 两条 case | Stage7 packed W/U / 精度失败，放弃并完整回退 | 原路径重复 LoadA，K=V=128 有两个 N=128 MMAD | 候选合并 packed N=256；当前恢复原 W/U 双 MMAD | Prepare slim 曾通过，但正式融合矩阵仍有 12/13/14、453/380/435 等失败 | 组合版本 7783/10765 µs，不作为单候选独立值 | 不再保留 packed 路径 | 用户决定完整回退；新增 TLA include、helper 和调用分支均删除 |
-| 小 case | 短 pack / 独立 slim 通过，增加大任务门控后待复测 | 原模型只看最忙核 task 数，case 1 会从 pack=4 错选 pack=1，case 0 平局仍选 4 | 仅 fullPacks<numCore 时评估短 pack，平局保留大 pack | Prepare slim 通过；Stage7 回退后正式融合精度通过 | 组合版本 7783/10765 µs，不能作为单候选独立值 | pack 固定开销及流水粒度可能增加 | 两条正式 case 均恢复 pack=4；小 case 2～7 待做同 shape A/B |
+| 小 case | 短 pack / 一轮无干扰 A/B | 原模型只看最忙核 task 数，case 1 会从 pack=4 错选 pack=1，case 0 平局仍选 4 | 仅 fullPacks<numCore 时评估短 pack，平局保留大 pack | Prepare slim 通过；Stage7 回退后正式融合精度通过 | case 4：52.88→47.70 µs | 仅 Prepare 路径耗时降低 9.80% | 两条正式 case 均恢复 pack=4；小 case 仍需独立复测 |
 
 ### 小 case A/B 矩阵
 
-完整 shape 见 `tests/atk/chunk_gated_delta_rule_fwd/README.md`。以下预期路径按 28 个 AIC
-静态计算，不代表已观察到的运行时选择；基线与优化值均为待上机验证。
+完整 shape 见 `tests/atk/chunk_gated_delta_rule_fwd/README.md`。预期路径按 28 个 AIC 静态计算，
+尚不代表已观察到的运行时选择。以下为一轮无干扰端到端数据，所有 case 仍需独立复测。
 
-| case id | 预期 pack / valueSplit | 归因目的 | ea1f61a1 基线 | 优化版本 | 状态 |
-| --- | --- | --- | --- | --- | --- |
-| 2 | 1 / 2 | G=1，两项联合 | 待测 | 待测 | 待上机验证 |
-| 3 | 2 / 2 | G=2，两项联合 | 待测 | 待测 | 待上机验证 |
-| 4 | 2 / 1 | 仅 Prepare | 待测 | 待测 | 待上机验证 |
-| 5 | 4 / 2 | 仅 fwd_h | 待测 | 待测 | 待上机验证 |
-| 6 | 2 / 2 | varlen 联合 | 待测 | 待测 | 待上机验证 |
-| 7 | 4 / 1 | 未触发对照 | 待测 | 待测 | 待上机验证 |
+| case id | 预期 pack / valueSplit | 归因目的 | ea1f61a1 基线 | 优化版本 | 耗时变化 |
+| --- | --- | --- | ---: | ---: | ---: |
+| 2 | 1 / 2 | G=1，两项联合 | 58.04 µs | 53.63 µs | **-7.60%** |
+| 3 | 2 / 2 | G=2，两项联合 | 57.99 µs | 48.93 µs | **-15.62%** |
+| 4 | 2 / 1 | 仅 Prepare | 52.88 µs | 47.70 µs | **-9.80%** |
+| 5 | 4 / 2 | 仅 fwd_h | 114.80 µs | 101.63 µs | **-11.47%** |
+| 6 | 2 / 2 | varlen 联合 | 56.00 µs | 48.00 µs | **-14.29%** |
+| 7 | 4 / 1 | 未触发对照 | 82.50 µs | 84.14 µs | **+1.99%**，待复测确认是否回退 |
 
 ## 待验证矩阵
 
