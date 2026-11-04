@@ -482,6 +482,7 @@ private:
         }
     }
 
+    template <bool writeUpdatedScratch = !singleWork>
     __aicore__ inline void Compute(uint32_t curSingleV, uint64_t curQKOffset, uint64_t curVOffset)
     {
         LocalTensor<stateType> stateOutLocal = stateOutQueue_.AllocTensor<stateType>();
@@ -499,23 +500,23 @@ private:
         __ubuf__ float *attnTmpAddr = reinterpret_cast<__ubuf__ float *>(attnInUb.GetPhyAddr());
         if (hasGama_) {
             if (hasGamaK_) {
-                ComputeRecurrentGatedDeltaRuleVF<stateType, outType, true, true, !singleWork>(
+                ComputeRecurrentGatedDeltaRuleVF<stateType, outType, true, true, writeUpdatedScratch>(
                     stateAddr, keyAddr, queryAddr, valueAddr, gamaKAddr, stateOutAddr, attnOutAddr,
                     attnTmpAddr, static_cast<uint16_t>(curSingleV), static_cast<uint16_t>(alignK_),
                     gama_, beta_);
             } else {
-                ComputeRecurrentGatedDeltaRuleVF<stateType, outType, true, false, !singleWork>(
+                ComputeRecurrentGatedDeltaRuleVF<stateType, outType, true, false, writeUpdatedScratch>(
                     stateAddr, keyAddr, queryAddr, valueAddr, gamaKAddr, stateOutAddr, attnOutAddr,
                     attnTmpAddr, static_cast<uint16_t>(curSingleV), static_cast<uint16_t>(alignK_),
                     gama_, beta_);
             }
         } else if (hasGamaK_) {
-            ComputeRecurrentGatedDeltaRuleVF<stateType, outType, false, true, !singleWork>(
+            ComputeRecurrentGatedDeltaRuleVF<stateType, outType, false, true, writeUpdatedScratch>(
                 stateAddr, keyAddr, queryAddr, valueAddr, gamaKAddr, stateOutAddr, attnOutAddr,
                 attnTmpAddr, static_cast<uint16_t>(curSingleV), static_cast<uint16_t>(alignK_),
                 gama_, beta_);
         } else {
-            ComputeRecurrentGatedDeltaRuleVF<stateType, outType, false, false, !singleWork>(
+            ComputeRecurrentGatedDeltaRuleVF<stateType, outType, false, false, writeUpdatedScratch>(
                 stateAddr, keyAddr, queryAddr, valueAddr, gamaKAddr, stateOutAddr, attnOutAddr,
                 attnTmpAddr, static_cast<uint16_t>(curSingleV), static_cast<uint16_t>(alignK_),
                 gama_, beta_);
@@ -601,7 +602,12 @@ private:
                     stateStride1_ * head_i + stateStride2_ * v_i;
                 gama_ = hasGama_ ? gamaInUb.GetValue(gbOffset) : 1;
                 beta_ = betaInUb.GetValue(gbOffset);
-                Compute(curSingleV, curQKOffset, curVOffset);
+                // Only a following token in this V tile consumes the updated scratch.
+                if (seq_i + 1 < static_cast<uint64_t>(seq1)) {
+                    Compute<true>(curSingleV, curQKOffset, curVOffset);
+                } else {
+                    Compute<false>(curSingleV, curQKOffset, curVOffset);
+                }
                 if (attnOutBufferNum_ == BUFFER_NUM) {
                     CopyOutAttn(attnOffset, curSingleV);
                 } else {

@@ -73,7 +73,8 @@ decode 用例。两条均使用 `K=V=128`、BF16 state、g-only、连续布局�
 case 1 保留原用例的随机种子、输入生成方式、值域、状态索引和 gate 配置；同时更新用例编号、
 名称和性能标签。它是用户指定头数的合成性能用例，不是现有精度用例的直接平移，也不是现网
 抓取记录。原 200 条精度用例保持不变；case 1 的 NPU 运行、精度及性能尚未验证。
-它走 A5 通用路径，不会命中要求 `Hk=Hv=1` 的 single-work / tail-scratch 特化。
+原 single-work 模板仍要求 `Hk=Hv=1`。本分支把末 token scratch 省写推广到 A5 通用路径，
+因此 case 1 的所有 head 也可以省去最后一次 updated FP32 scratch 写入。
 
 只运行新增用例（范围为 `[1,2)`）：
 
