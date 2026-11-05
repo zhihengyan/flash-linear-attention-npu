@@ -8,7 +8,7 @@
 | 版本 | 说明 |
 |---|---|
 | a6d33dbb | 对照基线，kernel 同 93f5c70a |
-| 当前 codex/gdn-a5-tail-pmu-profile | 元数据复用候选 |
+| c031ed24，及后续仅文档提交 | 当前 codex/gdn-a5-tail-pmu-profile 的元数据复用候选 |
 
 ComputeAvgload 返回已读到的最后一个序列长度；仅 B=1 时 ProcessGeneral 复用它。
 ProcessHead 在单 token 序列中复用已读的初始 state index，多 token 仍逐 token 读取输出索引。
@@ -105,3 +105,11 @@ python "$SCRIPT" --summarize "$OUT" --expected-count 20
 如需验证瓶颈变化，按 [指标说明](msprof-metrics.md) 另采 PMU 与 PipeTimeline，
 观察 Scalar 及计算前可见区间是否变化；诊断数据不与 BasicInfo 样本混合。
 本机无 CANN/NPU，尚未完成当前候选的设备编译、精度或性能验收。
+
+## 5. 当前回传状态
+
+已收到候选第 1 轮：20 条 BasicInfo，均值 6.583398 us，中位数 6.659074 us，CV 4.1759%。
+相对本环境历史基线，均值高 1.71%、中位数高 2.41%，目前未显示收益。
+用户确认没有紧邻重采基线；一轮非交错结果不足以认定稳定回退。
+候选保留供对照，不记录为已证实收益的优化。设备精度、候选 PMU/流水结果尚未回传，
+详细统计与二进制核对见 [开发记录](validation.md)。
