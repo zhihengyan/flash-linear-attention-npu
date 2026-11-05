@@ -311,16 +311,13 @@ public:
         gamaInUb = tmpBuff.GetWithOffset<float>(static_cast<uint32_t>(betaNumAlign), buffOffset);
     }
 
-    __aicore__ inline int32_t ComputeAvgload()
+    __aicore__ inline void ComputeAvgload()
     {
         uint64_t realT = 0;
-        int32_t lastSeqLen = 0;
         for (uint64_t batch_i = 1; batch_i < B_ + 1; batch_i++) {
-            lastSeqLen = cuSeqlensGm_.GetValue(batch_i);
-            realT += lastSeqLen;
+            realT += cuSeqlensGm_.GetValue(batch_i);
         }
         avgload = Ceil(realT * NV_, GetBlockNum());
-        return lastSeqLen;
     }
 
     __aicore__ inline void Process()
@@ -334,11 +331,10 @@ public:
 
     __aicore__ inline void ProcessGeneral()
     {
-        const int32_t lastSeqLen = ComputeAvgload();
+        ComputeAvgload();
         int32_t seq1 = cuSeqlensGm_.GetValue(0);
         for (uint64_t batch_i = 0; batch_i < B_; batch_i++) {
-            // With one sequence, its length is the final load-summation read.
-            int32_t seqLen = B_ == 1 ? lastSeqLen : cuSeqlensGm_.GetValue(batch_i+1);
+            int32_t seqLen = cuSeqlensGm_.GetValue(batch_i+1);
             if (seqLen <= 0) {
                 continue;
             }
@@ -350,9 +346,19 @@ public:
             }
             int32_t seq0 = seq1;
             seq1 += seqLen;
+            uint64_t headBegin = 0;
+            uint64_t headEnd = NV_;
+            if (B_ == 1 && seqLen == 1 && NV_ > 1) {
+                // Preserve the original contiguous ownership, including idle tail cores.
+                headBegin = blockIdx * static_cast<uint64_t>(avgload);
+                const uint64_t headLimit = headBegin + avgload;
+                headEnd = headLimit < NV_ ? headLimit : NV_;
+                load = 0;
+                usedblk = static_cast<uint32_t>(blockIdx);
+            }
             uint32_t copyFlag = 0;
             uint64_t stateOffset;
-            for (uint64_t head_i = 0; head_i < NV_; head_i++) {
+            for (uint64_t head_i = headBegin; head_i < headEnd; head_i++) {
                 if (!IsCurrentBlock(seq1 - seq0)) {
                     continue;
                 }
@@ -601,11 +607,8 @@ private:
                 uint64_t curQKOffset = (seq_i - seq0) * alignK_;
                 uint64_t curVOffset = (seq_i - seq0) * alignV_ + v_i;
                 uint64_t attnOffset = (seq_i * NV_ + head_i) * realV_ + v_i;
-                // For one token, validated accepted-token selection also points to seq0.
-                const uint64_t stateOutIndex = seq1 - seq0 == 1
-                    ? stateOffset : static_cast<uint64_t>(ssmStateIndicesGm_.GetValue(seq_i));
                 uint64_t curStateOutOffset =
-                    static_cast<uint64_t>(stateStride0_) * stateOutIndex +
+                    static_cast<uint64_t>(stateStride0_) * ssmStateIndicesGm_.GetValue(seq_i) +
                     stateStride1_ * head_i + stateStride2_ * v_i;
                 gama_ = hasGama_ ? gamaInUb.GetValue(gbOffset) : 1;
                 beta_ = betaInUb.GetValue(gbOffset);

@@ -1,14 +1,15 @@
 # A5 元数据复用实验
 
-本轮只实验整数元数据复用。原 head 扫描、VF 数学、末 token scratch 省写、缓冲与同步保持。
-先验证这一项，再决定是否实验缩小 head 遍历范围。
+本文归档 c031ed24 元数据复用实验及其反馈。当前内核已恢复 a6d33dbb 的元数据读取，
+新一轮只实验 [head 遍历范围](head-range-experiment.md)，不包含本文候选改动。
+该历史实验保持原 head 扫描、VF、末 token scratch 省写、缓冲与同步。
 
 ## 1. 实验版本和预期变化
 
 | 版本 | 说明 |
 |---|---|
 | a6d33dbb | 对照基线，kernel 同 93f5c70a |
-| c031ed24，及后续仅文档提交 | 当前 codex/gdn-a5-tail-pmu-profile 的元数据复用候选 |
+| c031ed24，及截至 f0c5c81a 的文档提交 | 元数据复用历史候选，保留提交供对照 |
 
 ComputeAvgload 返回已读到的最后一个序列长度；仅 B=1 时 ProcessGeneral 复用它。
 ProcessHead 在单 token 序列中复用已读的初始 state index，多 token 仍逐 token 读取输出索引。
@@ -106,7 +107,7 @@ python "$SCRIPT" --summarize "$OUT" --expected-count 20
 观察 Scalar 及计算前可见区间是否变化；诊断数据不与 BasicInfo 样本混合。
 本机无 CANN/NPU，设备侧回传进度见下节；未回传的验收项目不记为通过。
 
-## 5. 当前回传状态
+## 5. 该轮回传结果
 
 已收到候选第 1 轮及 a6d33dbb 的补采基线，各有 20 条 BasicInfo。
 

@@ -1,7 +1,8 @@
 # A5 decode：PipeUtilization、MemoryUB 采集方法
 
-当前采集分支为 `codex/gdn-a5-tail-pmu-profile`，实现基线为 `93f5c70a`。
-它保留 prefill K32 和末 token scratch 省写，case 1 仍走原通用调度。
+当前采集分支为 `codex/gdn-a5-tail-pmu-profile`，保留 prefill K32 和末 token scratch 省写。
+当前轮以内核同 93f5c70a 的 a6d33dbb 为基线实验 [head 遍历范围](head-range-experiment.md)，
+case 1 仍使用原通用计算流程和原 head 归属。每轮按源码提交与安装对象哈希区分版本。
 后续多头直接分发实验留在 `codex/gdn-a5-multihead-tail-scratch`，本分支没有该调度。
 
 本轮先回答两个问题：主要时间花在 Scalar、Vector 还是 GM 搬运；省掉的 UB Store 是否影响关键路径。
@@ -134,7 +135,7 @@ UB 写入字节数 ≈ aiv_ub_write_bw_vector(GB/s) × aiv_time(us) × 1000
 | 少数核明显更慢 | 实际 blockDim、head 归属、每核工作量和 vStep；不把核间差异混成均值 |
 | 各 Pipe 活动都少，但总任务仍约 6.5 us | 调度、同步或短任务固定开销；需要时序证据区分 |
 
-为隔离“末 token 省写”本身，优先用 `7acfe2e1`（脚本已就绪、未推广通用路径省写）
+若单独研究之前的“末 token 省写”，可用 `7acfe2e1`（脚本已就绪、未推广通用路径省写）
 与 `93f5c70a` 做相同条件的 BasicInfo 和 PMU 对照；main 可继续作总体性能参照。
 两者 kernel 的差异就是这项省写，更容易解释计数变化。
 case 1 理论每 head 少写 `128×128×4=64 KiB` UB，32 head 合计 2 MiB；
@@ -144,6 +145,7 @@ Block Dim 从 OpBasicInfo 确认，不能仅凭 TilingKey 推断。
 
 若 UB 写入量下降而 BasicInfo 时延持平，说明流量确实可能减少，但尚无证据表明它能缩短关键路径。
 也不能把少写 2 MiB 直接换算成若干微秒收益。
+当前 head 范围实验使用 a6d33dbb 对照，不用上述历史 Store 实验的版本替代。
 
 汇总指标仍无法区分计算和等待时，按下一节采集 PipeTimeline。
 
@@ -152,9 +154,9 @@ Block Dim 从 OpBasicInfo 确认，不能仅凭 TilingKey 推断。
 ### 是否需要改代码或重新编译
 
 现有 Python 脚本已支持 `--calls 1`，能够直接采集，不需要新增 kernel 打点、修改 ABI 或计时张量，
-也不需要为 PipeTimeline 添加 `-g`。本次仅更新采集说明，内核、JSON 和测评 Python 与 93f5c70a 一致。
-若继续使用上轮 BasicInfo/PMU 的环境和同一份已安装产物，可直接执行下面的命令。
-若源码、构建或安装产物已变化，先按第 1 节完成安装核对。
+也不需要为 PipeTimeline 添加 `-g`。这是工具采集能力，不表示后续优化版本可以跳过重新构建。
+当前 head 范围实验已修改 kernel，须先按第 1 节重新编译、安装并核对本轮产物。
+仅在采集同一份已验证安装对象且源码/构建没有变化时，才可直接复用产物。
 
 目标仍是同一环境下的 case 1：B=T=1、Hk=16、Hv=32、BF16 state、g-only。
 先采一条代表调用用于查看时序，`--calls` 和 `--launch-count` 都设为 1，工具预热仍为 20。

@@ -134,12 +134,14 @@ PipeTimeline 可直接复用此 Python 脚本，无需改 kernel：`--calls 1` �
 [design.md](../../../fla/ops/ascendc/gdn/recurrent_gdn/recurrent_gated_delta_rule/docs/design.md)、
 [validation.md](../../../fla/ops/ascendc/gdn/recurrent_gdn/recurrent_gated_delta_rule/docs/validation.md)。
 
-### 当前实验：A5 元数据复用
+### 当前实验：A5 单 token head 遍历范围
 
-对照基线为 `a6d33dbb`，当前候选仅复用单序列长度和单 token 输出 state index。
-性能 JSON、CPU 标杆、测评脚本与原 head 调度保持。候选尚待设备精度和同环境多轮性能验证，
-不能以源码读取次数替代性能结论。构建安装、case 1 精度、原 200 条回归和交错测量步骤见
-[元数据复用实验说明](../../../fla/ops/ascendc/gdn/recurrent_gdn/recurrent_gated_delta_rule/docs/metadata-reuse-experiment.md)。
+内核以 `a6d33dbb` 为基线，移除未见收益的元数据复用，只缩小 B=1、单 token、多头的遍历区间。
+head 归属和顺序、VF、元数据、搬运、同步、CPU 标杆、三份 JSON 与 msprof 脚本均沿基线。
+case 1 的源码级归属检查从 1024 次降至 32 次，收益仍需设备确认。
+构建安装、分支/精度回归和同环境 BasicInfo 步骤见
+[head 范围实验说明](../../../fla/ops/ascendc/gdn/recurrent_gdn/recurrent_gated_delta_rule/docs/head-range-experiment.md)。
+历史元数据实验结果见 [归档说明](../../../fla/ops/ascendc/gdn/recurrent_gdn/recurrent_gated_delta_rule/docs/metadata-reuse-experiment.md)。
 
 ```bash
 bash tests/atk/run_test_cpu.sh -op=recurrent_gated_delta_rule -npu_device_id=0

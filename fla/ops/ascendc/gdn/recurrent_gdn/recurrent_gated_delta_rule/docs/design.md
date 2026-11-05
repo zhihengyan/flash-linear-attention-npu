@@ -1,35 +1,40 @@
 # RecurrentGatedDeltaRule：A5 多头 decode
 
 方案设计规则版本：V2。接口见 [api.md](api.md)，待验证事项见 [validation.md](validation.md)。
-基线为 f918240b；参考 CHUNK_DEPENDENT/V1（a14961e9dfe8c8264768d67fb447101873da4ecf），
+用例来源为 f918240b，当前内核对照为 a6d33dbb；参考 CHUNK_DEPENDENT/V1（a14961e9dfe8c8264768d67fb447101873da4ecf），
 仅采用递推状态生命周期与事件核对方法。本算子沿用 AIV-only 实现，没有 Cube、CG 或跨核 workspace。
 
 ## 1. 目标
 
 目标输入为用户确认的性能 case 1。保留其生成器、随机种子、值域、CPU 标杆、容差和全部 JSON。
-当前实现以 93f5c70a 的末 token scratch 省写为基础。本轮相对 a6d33dbb 只实验设备元数据复用，
-保留原通用 head 扫描、负载分配、VF 数学和同步。原多头直接分发实验仍保留在另一分支。
+当前实现以 a6d33dbb（kernel 同 93f5c70a）为基线，只缩小单序列、单 token、多头的 head 遍历范围。
+元数据复用代码恢复为基线，历史提交和结果保留。本轮保留原 head 归属、VF、搬运和同步，
+不使用此前独立的多头直接分发计算路径。
 
-用户报告该版本 case 1 平均 6.55 us，与 main 的 6.60 us 接近持平，尚不宣称稳定收益。
 以同设备、相同安装与预热条件下的 msprof op / OpBasicInfo 的 Task Duration(us) 比较版本。
 Python 默认调用 20 次，各次独立 state 在首个 RGDR 前克隆；msprof warm-up=20、launch-count=20，
 统计均值、中位数、标准差、P90/P99。输入构造与校验不计入目标 kernel。
 case 1 理论每次少写 32*128*128*4=2 MiB UB，GM 读写量不减少；实际收益取决于 Store 是否在关键路径。
 
-本轮固定 Ascend950DT_9582、case 1、32 个任务块；同环境 BasicInfo 基线均值 6.472764 us、
-中位数 6.502314 us、CV 4.2365%。此前其他型号上的均值只保留作历史记录，不参与本轮判断。
-PipeTimeline 显示计算前约 1.27–1.55 us 的 Scalar 为主区间，没有源码标签，不能认定全是元数据读取。
-候选只减少重复整数元数据读取，不改变浮点计算量、tensor GM 读写或同步。
-目标是在同一环境重复对照中获得超过轮间波动的下降；目前无单次 GM GetValue 延迟或指令反汇编，
-不能给出确定的微秒收益，也不能将整个采样窗口作为收益上限。
+本轮固定 Ascend950DT_9582、case 1、32 个任务块；补采基线均值 6.530560 us、
+中位数 6.507823 us、CV 4.6646%。此前其他型号上的均值不参与本轮判断。
+PMU 的 Scalar 平均占比为 54.49%，PipeTimeline 存在计算前和输出后的 Scalar 区间；
+没有源码标签，不能将这些窗口全部归因于 head 扫描。
+候选将 case 1 的源码级 head 归属检查从 32*32=1024 次减少到 32 次，
+不改变浮点计算量、张量搬运或元数据读取次数，不新增除法或同步。
+目标是在同环境重复对照中获得超过轮间波动的下降；两个基线轮次均值相差约 0.058 us，
+这不是环境噪声上限。尚无单次归属检查成本，不能承诺收益或将整个采样窗口作为可回收时间。
 
 ## 2. Stage 完整详设
 
 令 L 为当前序列有效 token 数、hv 为 V head、G=Hv/Hk、hk=floor(hv/G)。
 V 分片起点为 vi，有效行数 r=min(vStep,V-vi)。输入偏移为 (token*Hk+hk)*K 和
 (token*Hv+hv)*V+vi；state 偏移为 index*stateStride0+hv*stateStride1+vi*stateStride2。
-一般路径继续采用原 ComputeAvgload / IsCurrentBlock 按 L 加权的任务分配和 head 扫描。
-case 1 的 blockDim=min(Hv,可用 AIV 核数)，按原扫描分配 head，不使用直接下标分发。
+一般路径继续采用原 ComputeAvgload / IsCurrentBlock 按 L 加权的任务分配。
+仅 B=1、L=1、Hv>1 时，以 a=avgload=ceil(Hv/blockDim) 计算本核连续区间
+[headBegin,headEnd)=[c*a,min(c*a+a,Hv))；headBegin>=Hv 时不进入 head 循环。
+它与原 IsCurrentBlock 每 a 个 head 推进一核的归属相同，不能改为 head=c+j*blockDim。
+case 1 的 blockDim=min(Hv,可用 AIV 核数)，仍为原连续分配；不增加新 TilingKey 或独立计算路径。
 case 1 的 Nwork=32；若可用核数>=32，则 blockDim=32、每核一个 head、一个 wave；
 否则每核最多 ceil(32/blockDim) 个 head，wave=ceil(32/blockDim)。Hk=16 时 hk=floor(hv/2)。
 
@@ -42,15 +47,15 @@ case 1 的 Nwork=32；若可用核数>=32，则 blockDim=32、每核一个 head�
 
 ### Stage 0：Vector，准备输入与分发
 
-ProcessGeneral 继续读取序列信息、扫描 head，并用 IsCurrentBlock 判断本核任务。
-ComputeAvgload 保留原求和顺序和分核公式，同时返回最后一次读取的序列长度。
-ProcessGeneral 仅在 B==1 时复用该值，多序列继续按原位置读取。
-B=0 时返回初始值 0，原序列循环不进入，也不新增长度索引 1 的访问。
+ComputeAvgload 和序列元数据读取与 a6d33dbb 完全一致，保留原前缀、长度和 accepted-token 校验。
+在长度/prefix 校验后，默认遍历 [0,Hv)，仅 B=1、seqLen=1、Hv>1 时使用上述本核区间。
+范围分支把 load=0、usedblk=c，等价于原扫描刚到 headBegin 前的私有游标；
+区间内仍调用原 IsCurrentBlock 和同一循环体，不增加每 head 的模式判断。
+该分支只有一个序列，区间结束后的私有游标没有后续消费者，不要求模拟尾部无工作扫描。
+多序列、空序列、多 token 和单 head 都保留原扫描，B=0 仍不进入序列循环。
 每个序列在本核首次有效 head 时读取 state index 并调用 CopyInGamaBeta。
-ProcessHead 对 seq1-seq0==1 复用传入的初始 state index 计算输出地址；多 token 仍逐 token 读取。
-单 token 无 accepted 输入时初始索引位置为 seq0；有 accepted 输入时，原校验要求 1<=accepted<=1，
-仍选择 seq0。因此两者输出索引均相同；prefix、非零 state index 和各级 stride 沿原地址公式处理。
-所有复用值仅在当前调用/序列的 Scalar 局部变量中存活，metadata 为只读输入，无跨调用缓存。
+ProcessHead、全部元数据读取和地址计算沿用 a6d33dbb，prefix、非零 state index、各级 stride、
+gate、BF16/FP32 state 及 V 分片不作额外假设；accepted-token 非法值仍在搬入前退出。
 每个本核 head 调用原 CopyInQKV、PrefetchState、LoadPrefetchedState，不引入 Q/K 复用或缓冲调整。
 通用路径沿用原队列和同步；原 Hk=Hv=1 的 ProcessSingleWork 及其 V_S Set/Wait 保持。
 当前 case 1 不进入 ProcessSingleWork，也没有新增多头调度的 V_S Set/Wait。
@@ -106,12 +111,12 @@ state 输出每 slot 32768 B，attention 输出每 slot 256 B，slot 数沿原 h
 -> 原 LocalMemBar -> 原输出 EnQue/DeQue -> GM 写回 -> Free -> 下一 head
 ```
 
-R01/R20：AIV-only 继承原 head 所有权、任务扫描与分核，不引入跨核归约。
+R01/R20：AIV-only 继承原 head 所有权与次序，只跳过不属于本核的单 token head 扫描，不引入跨核归约。
 R03/R08/R11：地址、缓冲和峰值分配不变，不持有跨 head 活跃输出。
 R10/R16：只删除无消费者 Store，未合并或新增 GM 数据流。
 R21：所有算术、Exp、Cast、mask 与顺序保持，末次 UB 结果不再读取；非有限值与精度仍需 NPU 验收。
 
-本轮只验证元数据复用，head 遍历范围保留为下一候选。
-Scalar 局部值可能延长寄存器生命周期，新增选择条件也可能改变机器码；复用收益须以编译结果和设备数据确认。
+本轮只验证 head 遍历范围，元数据复用已从实现中移除。
+新增范围计算和运行时条件可能抵消循环缩减收益，须以设备结果确认。
 先验收 case 1 和原有空序列、accepted、多 token、stride 场景，再按
 [采集说明](msprof-metrics.md) 重复比较 BasicInfo，必要时复采 PMU/PipeTimeline。

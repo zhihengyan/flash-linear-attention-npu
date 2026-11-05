@@ -170,6 +170,42 @@ ELF 可执行 .text 由 39104 B 增至 39360 B，但代码大小不等于动态�
 后续 head 遍历范围候选应以 a6d33dbb 独立对照，避免叠加这项未见收益的改动。
 本轮仅记录结果，内核、JSON 和测评 Python 保持；独立精度与候选 PMU/流水仍无回传结论。
 
+## 2026-11-05：单 token head 遍历范围实验计划
+
+用户要求基于 a6d33dbb 编码。本轮继续使用当前分支保留历史，将 kernel 中 c031ed24 的元数据复用移除，
+使本轮相对 a6d33dbb 的 C++ 差异仅限 ProcessGeneral 的 head 范围。
+沿用 CHUNK_DEPENDENT/V1（a14961e9dfe8c8264768d67fb447101873da4ecf）参考角色，
+只核对递推状态与 head 所有权，不移植其 Cube/workspace 架构。
+
+范围仅为 B=1、seqLen=1、Hv>1，并置于原长度和 prefix 校验之后。
+复用 avgload=ceil(Hv/blockDim)，核 c 只遍历 [c*avgload,min((c+1)*avgload,Hv))。
+load=0、usedblk=c 对应原扫描到该区间前的游标，仍执行原 IsCurrentBlock 和原循环体。
+区间后的游标只属于这一序列且无后续消费者。多序列、多 token、空序列和单 head 仍原扫描。
+case 1 从 1024 次总归属检查减至 32 次；Tensor/metadata GM 访问、VF、队列与同步沿基线，
+不增加除法、独立计算函数、TilingKey 或 V_S 事件。
+
+固定 Ascend950DT_9582、case 1、calls/warm-up/launch-count=20/20/20，对照补采基线 a6d33dbb：
+均值 6.530560 us、中位数 6.507823 us、CV 4.6646%。收益尚未测得，不把采样窗口当预期收益。
+检查重点：Hv 不整除核数、核数少于 head、无工作核、prefix、accepted、非零/padded state、
+BF16/FP32、gate、多 V 分片与多序列/多 token 回退。精度、MSS/确定性和性能仍需设备验证。
+
+本机离线结果：21 项中 20 项通过，1 项因缺少 C++17 编译器跳过。
+范围检查提取生产 C++ 的整数表达式，对照独立旧游标扫描，枚举 Hv=2..256、核数=1..96，
+共 1,187,280 个核范围，逐核归属和次序一致；case 1 的源级归属检查为总计 32 次。
+源码检查证明整个 arch35 头文件只有 ProcessGeneral 与 a6d33dbb 不同，
+移除范围块后该函数也与原扫描一致，原长度/prefix/accepted guard 和循环体保持。
+ComputeAvgload、ProcessHead 与基线相同，未残留元数据缓存。所有其他 C++、三份 JSON、CPU 标杆、
+msprof 脚本及 prefill K32 保持。27 个本地文档链接、采集命令参数和 git diff --check 通过。
+
+可选 C++ harness 已改为对照原/新生产控制函数的调用/地址、gate 参数及全部 metadata 访问，
+仅在该单序列范围分支允许无后续消费者的私有游标不同；本机未执行，不记为通过。
+188 个 completed issue、21 条规则覆盖检查通过。四层静态脚本仍为 42 条既有 DFX-MESSAGE error
+（对应 host/API 文件均与基线相同）和 1 条未改动算子 README 的“支持范围”提示，不是零告警检视。
+#362 的 stride/index/head 归属按原路径核对；#365/#429 的 runner/OPP 入口保持；
+#640 的浮点计算和同步源码保持，设备精度待验；#641 的 host 和原 device guard 保持。
+构建、case 1/原精度回归和 BasicInfo 对照命令见 [本轮实验步骤](head-range-experiment.md)。
+本机没有 CANN/NPU，当前不声称通过 CANN 编译、实际分支验证、NPU 精度、MSS 或性能验收。
+
 ## 内网执行
 
 先为相应提交编译并安装单算子 run 包，并使用新 Python 进程：
