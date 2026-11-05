@@ -128,7 +128,7 @@ msprof 参数依据：[msOpProf 26.0 参数说明](https://github.com/Ascend/mso
 基于 93f5c70a 的 PipeUtilization、MemoryUB 命令、字段和判读方法见
 [A5 指标采集说明](../../../fla/ops/ascendc/gdn/recurrent_gdn/recurrent_gated_delta_rule/docs/msprof-metrics.md)。
 PipeTimeline 可直接复用此 Python 脚本，无需改 kernel：`--calls 1` 配合 msprof 的
-`--launch-count=1 --warm-up=20 --aic-metrics=PipeTimeline`。完整命令、产物检查和 6 核采样限制见
+`--launch-count=1 --warm-up=20 --aic-metrics=PipeTimeline`。完整命令、产物检查和部分核采样限制见
 [PipeTimeline 采集步骤](../../../fla/ops/ascendc/gdn/recurrent_gdn/recurrent_gated_delta_rule/docs/msprof-metrics.md#6-pipetimeline采集并查看流水)。
 本地离线测试见 `scripts/test_msprof_op_rgdr.py`；设计和待验证记录见
 [design.md](../../../fla/ops/ascendc/gdn/recurrent_gdn/recurrent_gated_delta_rule/docs/design.md)、

@@ -207,13 +207,14 @@ find "$OUT" -type f \( \
 3. 比较实际展示核的计算段长度、搬运先后和流水空隙，判断下一轮应针对元数据/地址控制，
    还是输入准备与搬运重叠。没有自定义标记时，流水不会自动标出 ProcessHead 等 C++ 函数名。
 
-**该功能基于采样，官方说明只显示 6 个核，即使算子启用了全部核。**
-因此 Block Dim=32 而流水只展示 6 核，不表示丢失了 26 个核的计算；
-也不能保证这 6 核包含上一轮 PMU 中时长最大的 block，或据此恢复所有 32 核的全局尾部。
+**该功能基于采样，不保证覆盖所有任务块。** 26.0 官方文档以仅展示 6 核描述覆盖限制；
+本次 Ascend950DT_9582 的 AIV-only 结果实际导出 4 条 AIV 轨道，不能按固定 6 条验收。
+Block Dim=32 而流水仅展示部分轨道，不表示其余核没有计算；
+也不能保证采样包含上一轮 PMU 中时长最大的 block，或据此恢复所有 32 核的全局尾部。
 若确需把区间对应到具体源码阶段，再单独设计可选 MarkStamp 标记；当前先保留原二进制进行采样。
 
 PipeTimeline 属于诊断采集，其时延不替代第 2 节的 BasicInfo；原地更新 state 的重放输出不作精度验收。
-参数、6 核采样限制与可选 MarkStamp 的说明见官方
+参数、采样覆盖限制与可选 MarkStamp 的说明见官方
 [msOpProf 使用说明：Pipeline Chart](https://github.com/Ascend/msopprof/blob/26.0.0/docs/en/user_guide/msopprof_user_guide.md#pipeline-chart)，
 查看方式见 [MindStudio Insight 算子调优](https://gitcode.com/Ascend/msinsight/blob/26.0.0/docs/en/user_guide/operator_tuning.md)。
 本机无 A5，以上命令尚待在目标环境执行；当前提交不声称已经生成真实流水。

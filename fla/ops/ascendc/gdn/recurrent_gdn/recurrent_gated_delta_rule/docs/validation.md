@@ -57,12 +57,37 @@ UB/搬运与公开接口/A2A3 源码保持。以上为本机离线结果；随�
 原脚本支持 calls=1，工具直接采样流水，本轮仅更新文档，未增加内核标记、计时张量或 Python 参数。
 内核、性能 JSON 和测评脚本继续与 93f5c70a 一致；若沿用上一轮相同环境和安装对象，无需重新编译。
 固定 case 1、device 0、calls=launch-count=1、warm-up=20，输出新目录并保留完整原始结果。
-该模式按官方说明只显示 6 个采样核，不能据此宣称获得所有 32 核的完整时序。
+该模式只覆盖部分采样核，不能据此宣称获得所有 32 核的完整时序；实际轨道数见后续回传记录。
 
 本机已通过 case 1、calls=1 的 dry-run、3 份变更文档的 8 个本地链接（含锚点）、
 PipeTimeline 命令参数一致性和 git diff --check；确认 .h/.cpp/.py/.json 与 93f5c70a 无差异。
 没有本机 A5 或 msprof，不声称已经完成设备采集；需在上轮 Ascend950DT_9582 环境执行命令。
 真实流水待回传后分析，其耗时不与 BasicInfo 混为性能样本。
+
+## 2026-11-05：Ascend950DT_9582 的 PipeTimeline 回传
+
+输入为用户提供的 D:\result\msprof_op\rgdr_timeline_JcLct7oc，仅与本环境的前轮 PMU 核对身份，
+不与此前其他设备的均值比较。application_complete，case 1、calls=completed_calls=1、Block Dim=32。
+元数据记录源码 0a1417d2；case、executor、运行时和安装对象哈希与前轮一致，
+dump 二进制 SHA256 为 8c9dcb6cf4ab551713590de366e37f14047b6fda2aa25f4cf1ff7c3a3d343293。
+
+trace 共 65 个完整区间，SCALAR/VECTOR/MTE2/MTE3 分别为 40/12/9/4。
+实际有 core0.veccore0、core0.veccore1、core3.veccore0、core3.veccore1 四条 AIV 轨道，
+据此修正采集说明：不能按固定 6 条验收，也不能按逻辑 block_id 直接解释这些硬件轨道名。
+
+| 可见区间 | 四条轨道的范围/us |
+|---|---:|
+| 轨道最早事件至首个 VECTOR | 2.861–3.281 |
+| 前两段 MTE2 之间，主要可见 Scalar | 1.270–1.551 |
+| 最长 VECTOR 活动区间 | 1.402–1.544 |
+| 末段 MTE3 至最后事件 | 0.747–1.078 |
+
+这些是采样区间，尚无 PC/源码阶段标签；不能直接称为某函数、纯等待、VF 本体或可回收延迟。
+OpBasicInfo 的 6.418674 us 仅为本次诊断调用，不加入性能基线统计。
+下一候选优先检查单 token 下 cuSeqlens/state index 的元数据复用和本核 head 遍历范围。
+源码存在重复读取和归属扫描，不代表编译器一定保留等量机器指令；需独立实验或编译结果确认。
+本轮完成原始 JSON/CSV/二进制身份、65 个区间和逐轨重叠检查，不修改内核、JSON 或测评 Python。
+此处不补记设备精度通过或正式性能优化验收。
 
 ## 内网执行
 
