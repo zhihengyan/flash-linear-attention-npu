@@ -51,6 +51,19 @@ UB/搬运与公开接口/A2A3 源码保持。以上为本机离线结果；随�
 本轮 case 1 `--dry-run`、5 份变更文档的 11 个本地链接和代码块配对检查通过，
 `git diff --check` 通过；确认 `.h/.cpp/.py/.json` 与 93f5c70a 无差异。
 
+## 2026-11-05：PipeTimeline 采集准备
+
+当前分支补齐 [PipeTimeline 步骤](msprof-metrics.md#6-pipetimeline采集并查看流水)。
+原脚本支持 calls=1，工具直接采样流水，本轮仅更新文档，未增加内核标记、计时张量或 Python 参数。
+内核、性能 JSON 和测评脚本继续与 93f5c70a 一致；若沿用上一轮相同环境和安装对象，无需重新编译。
+固定 case 1、device 0、calls=launch-count=1、warm-up=20，输出新目录并保留完整原始结果。
+该模式按官方说明只显示 6 个采样核，不能据此宣称获得所有 32 核的完整时序。
+
+本机已通过 case 1、calls=1 的 dry-run、3 份变更文档的 8 个本地链接（含锚点）、
+PipeTimeline 命令参数一致性和 git diff --check；确认 .h/.cpp/.py/.json 与 93f5c70a 无差异。
+没有本机 A5 或 msprof，不声称已经完成设备采集；需在上轮 Ascend950DT_9582 环境执行命令。
+真实流水待回传后分析，其耗时不与 BasicInfo 混为性能样本。
+
 ## 内网执行
 
 先为相应提交编译并安装单算子 run 包，并使用新 Python 进程：

@@ -18,7 +18,8 @@
 | K / V | 128 / 128 |
 | state / gate | BF16 / g-only |
 | 布局、序列、state index | 连续、单个有效 token、index=0 |
-| Python 调用数 / msprof launch-count / warm-up | 20 / 20 / 20 |
+| BasicInfo/PMU 的 Python 调用数 / launch-count / warm-up | 20 / 20 / 20 |
+| PipeTimeline 的 Python 调用数 / launch-count / warm-up | 1 / 1 / 20 |
 | 目标 kernel | `RecurrentGatedDeltaRule` |
 | 设备 | Linux + Ascend 950，下面以 device 0 为例 |
 
@@ -144,14 +145,83 @@ Block Dim 从 OpBasicInfo 确认，不能仅凭 TilingKey 推断。
 若 UB 写入量下降而 BasicInfo 时延持平，说明流量确实可能减少，但尚无证据表明它能缩短关键路径。
 也不能把少写 2 MiB 直接换算成若干微秒收益。
 
-若汇总指标仍无法区分计算和等待，Ascend 950 可进一步单独采 `--aic-metrics=PipeTimeline`，
-在 MindStudio Insight 查看流水；复用第 3 步调用参数，但换一个新输出目录。
-`TimelineDetail`、`MemoryDetail` 在所引 26.0 文档中面向 A2/A3，本 A5 方案不使用它们。
-该平台支持范围依据前面的 [msOpProf 使用说明](https://github.com/Ascend/msopprof/blob/26.0.0/docs/en/user_guide/msopprof_user_guide.md)。
+汇总指标仍无法区分计算和等待时，按下一节采集 PipeTimeline。
 
-## 6. 保留哪些结果
+## 6. PipeTimeline：采集并查看流水
+
+### 是否需要改代码或重新编译
+
+现有 Python 脚本已支持 `--calls 1`，能够直接采集，不需要新增 kernel 打点、修改 ABI 或计时张量，
+也不需要为 PipeTimeline 添加 `-g`。本次仅更新采集说明，内核、JSON 和测评 Python 与 93f5c70a 一致。
+若继续使用上轮 BasicInfo/PMU 的环境和同一份已安装产物，可直接执行下面的命令。
+若源码、构建或安装产物已变化，先按第 1 节完成安装核对。
+
+目标仍是同一环境下的 case 1：B=T=1、Hk=16、Hv=32、BF16 state、g-only。
+先采一条代表调用用于查看时序，`--calls` 和 `--launch-count` 都设为 1，工具预热仍为 20。
+在上一轮 Ascend950DT_9582 环境继续采集；其他型号的数据单独保存和分析。
+
+### 采集步骤
+
+在 Linux A5 环境加载 CANN、激活上一轮 ATK/PyTorch 环境，在仓库根目录检查：
+
+```bash
+msprof op --help
+SCRIPT="$PWD/tests/atk/recurrent_gated_delta_rule/scripts/msprof_op_rgdr.py"
+python "$SCRIPT" --repo-root "$PWD" --case-id 1 --calls 1 --dry-run
+```
+
+确认帮助中支持 `PipeTimeline`，离线配置仍为 case 1 后，执行：
+
+```bash
+SCRIPT="$PWD/tests/atk/recurrent_gated_delta_rule/scripts/msprof_op_rgdr.py"
+mkdir -p tests/atk/recurrent_gated_delta_rule/runs/msprof_op
+OUT=$(mktemp -d "$PWD/tests/atk/recurrent_gated_delta_rule/runs/msprof_op/rgdr_timeline_XXXXXXXX")
+msprof op \
+  --application="python $SCRIPT --repo-root $PWD --device 0 --case-id 1 --calls 1 --metadata $OUT/application.json" \
+  --kernel-name=RecurrentGatedDeltaRule \
+  --launch-count=1 --warm-up=20 --aic-metrics=PipeTimeline --output="$OUT"
+```
+
+与前面的命令一样，示例假定仓库路径不含空格，每次使用新的输出目录。
+检查 msprof 正常结束，`application.json` 为 `application_complete`，`completed_calls=1`，
+并核对 device_name、case_spec、安装对象哈希与本轮目标一致。查找输出文件：
+
+```bash
+find "$OUT" -type f \( \
+  -name 'trace.json' -o \
+  -name 'visualize_data.bin' -o \
+  -name 'OpBasicInfo*.csv' \)
+```
+
+保留整个 `OUT` 目录。流水文件位于目标 kernel 的 `OPPROF_*` 子目录中，具体层级随工具版本变化。
+本轮不执行 `--summarize`；它只统计 OpBasicInfo，不解析流水，也不需要为这次采集生成
+`rgdr_task_summary.json`。当前工具若不支持 PipeTimeline，先核对工具版本与 A5 支持范围，
+不要替换成 A2/A3 的 `TimelineDetail` 或 `MemoryDetail`。
+
+### 如何查看与判读
+
+1. 将生成的 `visualize_data.bin` 导入 MindStudio Insight，查看 Timeline 流水视图。
+   `trace.json` 也应一并保留，便于后续分析。加载的是目标 RGDR 任务，而非输入构造任务。
+2. 先看 Scalar 活动区与 Vector、MTE2、MTE3 的空隙和重叠：确认较长区间是持续控制活动，
+   还是 Vector/搬运完成前的等待；汇总的 Scalar 时间不能直接当作某个函数或某次 Wait 的耗时。
+3. 比较实际展示核的计算段长度、搬运先后和流水空隙，判断下一轮应针对元数据/地址控制，
+   还是输入准备与搬运重叠。没有自定义标记时，流水不会自动标出 ProcessHead 等 C++ 函数名。
+
+**该功能基于采样，官方说明只显示 6 个核，即使算子启用了全部核。**
+因此 Block Dim=32 而流水只展示 6 核，不表示丢失了 26 个核的计算；
+也不能保证这 6 核包含上一轮 PMU 中时长最大的 block，或据此恢复所有 32 核的全局尾部。
+若确需把区间对应到具体源码阶段，再单独设计可选 MarkStamp 标记；当前先保留原二进制进行采样。
+
+PipeTimeline 属于诊断采集，其时延不替代第 2 节的 BasicInfo；原地更新 state 的重放输出不作精度验收。
+参数、6 核采样限制与可选 MarkStamp 的说明见官方
+[msOpProf 使用说明：Pipeline Chart](https://github.com/Ascend/msopprof/blob/26.0.0/docs/en/user_guide/msopprof_user_guide.md#pipeline-chart)，
+查看方式见 [MindStudio Insight 算子调优](https://gitcode.com/Ascend/msinsight/blob/26.0.0/docs/en/user_guide/operator_tuning.md)。
+本机无 A5，以上命令尚待在目标环境执行；当前提交不声称已经生成真实流水。
+
+## 7. 保留哪些结果
 
 保留两组完整输出目录、各自的 `application.json`、BasicInfo 的 `rgdr_task_summary.json`，
 以及 PMU 的全部目标 OpBasicInfo/PipeUtilization/MemoryUB CSV。另记 CANN/msprof 版本、设备型号、
 构建安装命令和原始采集命令；不要只截取全核平均值。
+PipeTimeline 另保留其完整输出目录，包含 application.json、trace.json、visualize_data.bin 和采集日志。
 这份说明提供采集方法，本机没有 A5，尚未执行真实 PMU 采集。
