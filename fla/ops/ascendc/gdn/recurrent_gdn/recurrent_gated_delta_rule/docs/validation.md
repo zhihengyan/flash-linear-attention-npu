@@ -1,8 +1,10 @@
 # A5 多头 decode 开发记录
 
 基线 f918240b，原分支 codex/gdn-k32-tail-scratch-elision 保持该提交。
-新分支 codex/gdn-a5-multihead-tail-scratch 从其创建，性能 JSON 原样继承。
-本机为 Windows，无 torch/ATK/CANN/NPU 或 C++ 编译器；本轮交付编码和离线检查，设备验收待执行。
+原实验分支 codex/gdn-a5-multihead-tail-scratch 从其创建，性能 JSON 原样继承。
+当前采集分支 codex/gdn-a5-tail-pmu-profile 从 93f5c70a 创建，原实验分支保持 247efa15。
+本分支源码、JSON 和 Python 脚本与 93f5c70a 一致；仅更新文档，撤回设计中尚未采用的多头调度。
+本机为 Windows，无 torch/ATK/CANN/NPU 或 C++ 编译器；此前交付编码和离线检查，本轮补充采集文档。
 采用 CHUNK_DEPENDENT/V1，来源 a14961e9dfe8c8264768d67fb447101873da4ecf；
 仅参考递推 scratch 生命周期、任务与事件闭环，不移植其 Cube/GM workspace 架构。
 
@@ -11,7 +13,7 @@
 | case 1 JSON | 对照原分支 Git blob | 运行 case 1；原文件保持不变 |
 | msprof op 脚本 | case 1 加载、参数校验、CSV 过滤/计数/统计、模拟调用边界 | A5 真实采集，核对目标任务/样本数 |
 | 末 token scratch | true/false VF 展开、四个 gate 分支、普通/末 token 分派 | BF16/FP32、g/gk/both、多 token、多 V 分片 |
-| 多头单 token 调度 | head 归属/偏移、guard、空工作、V_S 顺序与 Set/Wait 配对 | case 1、非零 index、padded block/head、核数少于 head |
+| 多头单 token 调度 | 已撤回，当前源码没有该分支 | 本轮不做该实验 |
 | 原路径 | 原单 work、UB、Copy helpers、公共 ABI/A2/A3 与基线比较 | case 0、原 200 精度场景及 MSS/确定性 |
 
 性能 case 1：20 次独立 state 调用，msprof warm-up=20、launch-count=20、BasicInfo；
@@ -20,11 +22,34 @@
 
 开发顺序：先提交脚本/基线准备，再提交末 token 改动，最后提交多头调度。
 保留中间提交以便在设备上分别归因两项优化。静态检查通过不代表设备精度/性能通过。
+上述为原实验顺序；当前采集分支停留在末 token 改动。
 
 已完成：测评脚本 12 项离线检查通过，包括当前 runtime 返回多个 OPP vendor 的适配、
 首次目标调用前全部 state 克隆及 CSV 计数/单位/过滤负向检查。
 末 token 改动的 4 项源码检查通过：VF 数学保持、四个 gate 分支参数、仅末 token 分派变化、
-UB/搬运与公开接口/A2A3 源码保持。尚未执行 CANN 编译或设备精度/性能测试。
+UB/搬运与公开接口/A2A3 源码保持。以上为本机离线结果；随后用户回传的设备性能见下一节。
+
+## 2026-11-05：回到末 token 省写基线并准备 PMU 采集
+
+下表为用户回传的 case 1 均值，使用相同脚本和命令参数；不代表独立重复轮次或完整设备验收。
+
+| 版本 | 平均 Task Duration(us) |
+|---|---:|
+| main | 6.60 |
+| 93f5c70a，仅末 token 省写 | 6.55 |
+| 9a515a70，再加多头直接分发 | 6.71 |
+| 94d3ab97，移除设备重复取余 | 6.57 |
+
+用户确认回到 93f5c70a。保留原实验分支供追溯，不重置其历史。
+末 token updated scratch 没有后续读取者；第一遍 scratch、GM 输出与原同步仍保留。
+该语义独立性不能保证所有编译产物和输入下延迟绝不回退；现有数据按基本持平处理。
+32 个 head 累计少写 2 MiB UB；若每核一个 head，则每核少写 64 KiB，并非每核少写 2 MiB。
+
+下一步按 [采集说明](msprof-metrics.md) 分别采集 BasicInfo 和 PipeUtilization,MemoryUB。
+原脚本只汇总 OpBasicInfo；PMU CSV 单独保留，并按目标任务、block_id/sub_block_id 分析。
+本机不能执行 A5 采集，尚无 PMU、样本分布、独立重复轮次或设备精度结论；不归档阶段 5 完成。
+本轮 case 1 `--dry-run`、5 份变更文档的 11 个本地链接和代码块配对检查通过，
+`git diff --check` 通过；确认 `.h/.cpp/.py/.json` 与 93f5c70a 无差异。
 
 ## 内网执行
 

@@ -9,10 +9,9 @@ state 原地更新，输出仍为 attention；g/gk 至少提供一个，accepted
 本轮用户指定性能输入为 `_perf.json` case 1：B=T=1、Hk=16、Hv=32、K=V=128、BF16 state、
 g-only、无 accepted-token 输入、连续布局、seed=20260826。JSON 从基线 f918240b 原样继承。
 
-A5 的额外调度分支只处理 BF16 state、B=T=1、Hv>1、K=V=vStep=128、stateStride2=128、
-g-only、无 accepted-token 输入。设备端仍要求 prefix=0、length=1，否则直接返回；
-不假定 state index 为零，保留 state 的 block/head stride。
-原单 work 分支继续保留；其他输入沿用通用调度。
+当前采集分支的实现回到 93f5c70a，仅保留末 token scratch 省写。
+原单 work 分支继续要求 Hk=Hv=1；case 1 使用原通用调度，没有多头直接分发分支。
+state index、block/head stride、accepted-token 和空序列的处理沿用原实现。
 
 A5 通用调度中，每个序列、每个 V 分片的最后一个 token 可以省去更新后 FP32 scratch 的 UB 写入。
 中间 token 仍写入该 scratch，所有 token 的全局 state/out 输出及第一遍门控后 scratch 均保留。

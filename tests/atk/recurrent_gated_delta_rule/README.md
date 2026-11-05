@@ -72,7 +72,7 @@ decode 用例。两条均使用 `K=V=128`、BF16 state、g-only、连续布局�
 
 case 1 保留原用例的随机种子、输入生成方式、值域、状态索引和 gate 配置；同时更新用例编号、
 名称和性能标签。它是用户指定头数的合成性能用例，不是现有精度用例的直接平移，也不是现网
-抓取记录。原 200 条精度用例保持不变；case 1 的 NPU 运行、精度及性能尚未验证。
+抓取记录。原 200 条精度用例保持不变；case 1 的设备精度尚待验证，已回传的性能均值见开发记录。
 原 single-work 模板仍要求 `Hk=Hv=1`。本分支把末 token scratch 省写推广到 A5 通用路径，
 因此 case 1 的所有 head 也可以省去最后一次 updated FP32 scratch 写入。
 
@@ -122,8 +122,11 @@ atk node --name npu_dut --backend npu --devices 0 \
 ```
 
 msprof 可能预热/重放原地更新 state 的 kernel，采集输出不用于精度验收。
-基线为 `f918240b`，保留对应 run 包，以同一脚本、JSON、设备和采集参数交错安装比较。
+当前采集基线为 `93f5c70a`；需要隔离末 token 省写时，可与 `7acfe2e1` 交错比较。
+保留对应 run 包，使用同一脚本、JSON、设备和采集参数。
 msprof 参数依据：[msOpProf 26.0 参数说明](https://github.com/Ascend/msopprof/blob/26.0.0/docs/en/user_guide/msopprof_user_guide.md)。
+基于 93f5c70a 的 PipeUtilization、MemoryUB 命令、字段和判读方法见
+[A5 指标采集说明](../../../fla/ops/ascendc/gdn/recurrent_gdn/recurrent_gated_delta_rule/docs/msprof-metrics.md)。
 本地离线测试见 `scripts/test_msprof_op_rgdr.py`；设计和待验证记录见
 [design.md](../../../fla/ops/ascendc/gdn/recurrent_gdn/recurrent_gated_delta_rule/docs/design.md)、
 [validation.md](../../../fla/ops/ascendc/gdn/recurrent_gdn/recurrent_gated_delta_rule/docs/validation.md)。
