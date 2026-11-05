@@ -7,14 +7,21 @@
 ## 1. 目标
 
 目标输入为用户确认的性能 case 1。保留其生成器、随机种子、值域、CPU 标杆、容差和全部 JSON。
-当前采集分支基于 93f5c70a，只保留 A5 每个序列/每个 V 分片的末 token 不保存
-updated FP32 scratch 的 VF 实例。原多头直接分发实验保留在另一分支，不属于当前设计。
+当前实现以 93f5c70a 的末 token scratch 省写为基础。本轮相对 a6d33dbb 只实验设备元数据复用，
+保留原通用 head 扫描、负载分配、VF 数学和同步。原多头直接分发实验仍保留在另一分支。
 
 用户报告该版本 case 1 平均 6.55 us，与 main 的 6.60 us 接近持平，尚不宣称稳定收益。
 以同设备、相同安装与预热条件下的 msprof op / OpBasicInfo 的 Task Duration(us) 比较版本。
 Python 默认调用 20 次，各次独立 state 在首个 RGDR 前克隆；msprof warm-up=20、launch-count=20，
 统计均值、中位数、标准差、P90/P99。输入构造与校验不计入目标 kernel。
 case 1 理论每次少写 32*128*128*4=2 MiB UB，GM 读写量不减少；实际收益取决于 Store 是否在关键路径。
+
+本轮固定 Ascend950DT_9582、case 1、32 个任务块；同环境 BasicInfo 基线均值 6.472764 us、
+中位数 6.502314 us、CV 4.2365%。此前其他型号上的均值只保留作历史记录，不参与本轮判断。
+PipeTimeline 显示计算前约 1.27–1.55 us 的 Scalar 为主区间，没有源码标签，不能认定全是元数据读取。
+候选只减少重复整数元数据读取，不改变浮点计算量、tensor GM 读写或同步。
+目标是在同一环境重复对照中获得超过轮间波动的下降；目前无单次 GM GetValue 延迟或指令反汇编，
+不能给出确定的微秒收益，也不能将整个采样窗口作为收益上限。
 
 ## 2. Stage 完整详设
 
@@ -36,7 +43,14 @@ case 1 的 Nwork=32；若可用核数>=32，则 blockDim=32、每核一个 head�
 ### Stage 0：Vector，准备输入与分发
 
 ProcessGeneral 继续读取序列信息、扫描 head，并用 IsCurrentBlock 判断本核任务。
+ComputeAvgload 保留原求和顺序和分核公式，同时返回最后一次读取的序列长度。
+ProcessGeneral 仅在 B==1 时复用该值，多序列继续按原位置读取。
+B=0 时返回初始值 0，原序列循环不进入，也不新增长度索引 1 的访问。
 每个序列在本核首次有效 head 时读取 state index 并调用 CopyInGamaBeta。
+ProcessHead 对 seq1-seq0==1 复用传入的初始 state index 计算输出地址；多 token 仍逐 token 读取。
+单 token 无 accepted 输入时初始索引位置为 seq0；有 accepted 输入时，原校验要求 1<=accepted<=1，
+仍选择 seq0。因此两者输出索引均相同；prefix、非零 state index 和各级 stride 沿原地址公式处理。
+所有复用值仅在当前调用/序列的 Scalar 局部变量中存活，metadata 为只读输入，无跨调用缓存。
 每个本核 head 调用原 CopyInQKV、PrefetchState、LoadPrefetchedState，不引入 Q/K 复用或缓冲调整。
 通用路径沿用原队列和同步；原 Hk=Hv=1 的 ProcessSingleWork 及其 V_S Set/Wait 保持。
 当前 case 1 不进入 ProcessSingleWork，也没有新增多头调度的 V_S Set/Wait。
@@ -97,4 +111,7 @@ R03/R08/R11：地址、缓冲和峰值分配不变，不持有跨 head 活跃输
 R10/R16：只删除无消费者 Store，未合并或新增 GM 数据流。
 R21：所有算术、Exp、Cast、mask 与顺序保持，末次 UB 结果不再读取；非有限值与精度仍需 NPU 验收。
 
-后续候选先由 [PipeUtilization、MemoryUB 采集](msprof-metrics.md) 定位，不继续叠加调度改动。
+本轮只验证元数据复用，head 遍历范围保留为下一候选。
+Scalar 局部值可能延长寄存器生命周期，新增选择条件也可能改变机器码；复用收益须以编译结果和设备数据确认。
+先验收 case 1 和原有空序列、accepted、多 token、stride 场景，再按
+[采集说明](msprof-metrics.md) 重复比较 BasicInfo，必要时复采 PMU/PipeTimeline。

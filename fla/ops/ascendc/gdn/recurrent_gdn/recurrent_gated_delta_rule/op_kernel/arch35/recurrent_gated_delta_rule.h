@@ -311,13 +311,16 @@ public:
         gamaInUb = tmpBuff.GetWithOffset<float>(static_cast<uint32_t>(betaNumAlign), buffOffset);
     }
 
-    __aicore__ inline void ComputeAvgload()
+    __aicore__ inline int32_t ComputeAvgload()
     {
         uint64_t realT = 0;
+        int32_t lastSeqLen = 0;
         for (uint64_t batch_i = 1; batch_i < B_ + 1; batch_i++) {
-            realT += cuSeqlensGm_.GetValue(batch_i);
+            lastSeqLen = cuSeqlensGm_.GetValue(batch_i);
+            realT += lastSeqLen;
         }
         avgload = Ceil(realT * NV_, GetBlockNum());
+        return lastSeqLen;
     }
 
     __aicore__ inline void Process()
@@ -331,10 +334,11 @@ public:
 
     __aicore__ inline void ProcessGeneral()
     {
-        ComputeAvgload();
+        const int32_t lastSeqLen = ComputeAvgload();
         int32_t seq1 = cuSeqlensGm_.GetValue(0);
         for (uint64_t batch_i = 0; batch_i < B_; batch_i++) {
-            int32_t seqLen = cuSeqlensGm_.GetValue(batch_i+1);
+            // With one sequence, its length is the final load-summation read.
+            int32_t seqLen = B_ == 1 ? lastSeqLen : cuSeqlensGm_.GetValue(batch_i+1);
             if (seqLen <= 0) {
                 continue;
             }
@@ -597,8 +601,11 @@ private:
                 uint64_t curQKOffset = (seq_i - seq0) * alignK_;
                 uint64_t curVOffset = (seq_i - seq0) * alignV_ + v_i;
                 uint64_t attnOffset = (seq_i * NV_ + head_i) * realV_ + v_i;
+                // For one token, validated accepted-token selection also points to seq0.
+                const uint64_t stateOutIndex = seq1 - seq0 == 1
+                    ? stateOffset : static_cast<uint64_t>(ssmStateIndicesGm_.GetValue(seq_i));
                 uint64_t curStateOutOffset =
-                    static_cast<uint64_t>(stateStride0_) * ssmStateIndicesGm_.GetValue(seq_i) +
+                    static_cast<uint64_t>(stateStride0_) * stateOutIndex +
                     stateStride1_ * head_i + stateStride2_ * v_i;
                 gama_ = hasGama_ ? gamaInUb.GetValue(gbOffset) : 1;
                 beta_ = betaInUb.GetValue(gbOffset);

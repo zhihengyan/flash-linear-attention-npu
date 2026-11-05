@@ -1,5 +1,7 @@
 # RecurrentGatedDeltaRule 接口与本轮边界
 
+## 参数和返回
+
 公开签名、输入输出和异常约束沿用当前 [算子说明](../README.md) 与
 [ACLNN 说明](aclnnRecurrentGatedDeltaRule.md)。本轮不改变接口、tiling 数据布局、SoC 支持或数学语义。
 query/key/value/beta/out 为 BF16，state 支持 BF16/FP32，K=V=128；Hv 为 Hk 的整数倍。
@@ -9,7 +11,7 @@ state 原地更新，输出仍为 attention；g/gk 至少提供一个，accepted
 本轮用户指定性能输入为 `_perf.json` case 1：B=T=1、Hk=16、Hv=32、K=V=128、BF16 state、
 g-only、无 accepted-token 输入、连续布局、seed=20260826。JSON 从基线 f918240b 原样继承。
 
-当前采集分支的实现回到 93f5c70a，仅保留末 token scratch 省写。
+当前分支在 93f5c70a 的末 token scratch 省写基础上实验只读整数元数据复用，公开接口与数学语义不变。
 原单 work 分支继续要求 Hk=Hv=1；case 1 使用原通用调度，没有多头直接分发分支。
 state index、block/head stride、accepted-token 和空序列的处理沿用原实现。
 

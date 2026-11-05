@@ -89,6 +89,39 @@ OpBasicInfo 的 6.418674 us 仅为本次诊断调用，不加入性能基线统�
 本轮完成原始 JSON/CSV/二进制身份、65 个区间和逐轨重叠检查，不修改内核、JSON 或测评 Python。
 此处不补记设备精度通过或正式性能优化验收。
 
+## 2026-11-05：元数据复用实验计划
+
+用户确认继续在当前分支实验。对照基线为 a6d33dbb（内核同 93f5c70a），
+固定上一轮 Ascend950DT_9582、case 1、BasicInfo calls/warm-up/launch-count=20/20/20。
+本环境初始均值 6.472764 us、中位数 6.502314 us、CV 4.2365%；其他设备数据不参与对照。
+候选只改 arch35 的 Scalar 元数据复用，不叠加 head 调度、VF、缓冲或同步变化。
+
+| 设计差异 | 边界和验证 |
+|---|---|
+| ComputeAvgload 返回最后读到的序列长度，仅 B=1 复用 | B=0、B=1、多个序列、空序列在首/中/尾；多序列原读取与负载分配保持 |
+| 单 token 输出 state index 复用初始索引 | accepted 缺失/合法值 1、非法值提前退出；非零 prefix/index、padding stride、多 V 分片 |
+| 多 token 保留逐 token 索引 | accepted 选择初始 slot、不同输出 slot、稀疏/逆序 index、多 token 原回归 |
+| VF/队列/同步与 ABI 保持 | 对照 a6d33dbb 的函数和文件；原 200 条精度及 case 1 设备验收待执行 |
+
+同一 kernel 的只读元数据不由输出写回修改；缓存只在当前 Scalar 调用/序列内存活。
+理论减少 case 1 每核一次序列长度读取和每个 V 分片一次输出索引读取，tensor GM 字节数不减少。
+机器码可能已合并旧读取，新增条件和寄存器生存期也可能抵消收益，不预设一定加速。
+保持 CHUNK_DEPENDENT/V1 参考；本轮只核对递推状态和地址生命周期，不引入参考算子的 Cube/workspace 结构。
+
+本机离线检查：19 项中 18 项通过，1 项因缺少 C++17 编译器跳过。
+新增的可选 C++ harness 抽取生产控制函数，对照 a6d33dbb 的地址、任务、gate 参数和访问次数；
+本机未执行该 harness，不能记为 Scalar 控制执行验证通过。首次运行曾遇临时目录权限错误，
+改用可写的任务临时目录后测试通过，未修改测评程序来规避该环境问题。
+VF、原 single-work、分核、全部 Copy helpers、ABI、A2/A3、prefill K32、三份 JSON 和 msprof 脚本保持。
+
+188 个 completed issue、21 条规则映射检查通过。四层静态脚本返回 42 条既有 DFX-MESSAGE error，
+位置在未改动的 host/API 文件（例如 aclnn 实现 118 行）；另有 1 条未改动算子 README 缺少“支持范围”概念的提示。
+不是零告警检视，本轮没有改动公开参数校验和报错格式。
+#362：缓存不假设零 prefix/index 或连续 stride；#365/#429：ATK runner、导入和 OPP 初始化保持；
+#640：浮点 VF、Exp/Cast 与顺序保持，设备精度/非有限值结果待执行；#641：host 及原设备非法元数据 guard 保持。
+本轮未取得 CANN 编译、NPU 精度、MSS/确定性或性能结果，候选收益尚未验证。
+同环境编译安装、case 1 与原精度回归、BasicInfo 交错对照见 [实验步骤](metadata-reuse-experiment.md)。
+
 ## 内网执行
 
 先为相应提交编译并安装单算子 run 包，并使用新 Python 进程：

@@ -134,6 +134,13 @@ PipeTimeline 可直接复用此 Python 脚本，无需改 kernel：`--calls 1` �
 [design.md](../../../fla/ops/ascendc/gdn/recurrent_gdn/recurrent_gated_delta_rule/docs/design.md)、
 [validation.md](../../../fla/ops/ascendc/gdn/recurrent_gdn/recurrent_gated_delta_rule/docs/validation.md)。
 
+### 当前实验：A5 元数据复用
+
+对照基线为 `a6d33dbb`，当前候选仅复用单序列长度和单 token 输出 state index。
+性能 JSON、CPU 标杆、测评脚本与原 head 调度保持。候选尚待设备精度和同环境多轮性能验证，
+不能以源码读取次数替代性能结论。构建安装、case 1 精度、原 200 条回归和交错测量步骤见
+[元数据复用实验说明](../../../fla/ops/ascendc/gdn/recurrent_gdn/recurrent_gated_delta_rule/docs/metadata-reuse-experiment.md)。
+
 ```bash
 bash tests/atk/run_test_cpu.sh -op=recurrent_gated_delta_rule -npu_device_id=0
 bash tests/atk/run_test_cpu.sh -op=recurrent_gated_delta_rule -npu_device_id=0 -scope=accuracy
