@@ -323,6 +323,23 @@ Block Dim=32 时，每核已有一个完整 head，在同样 32 个 AIV 上继�
 gate、rank-one 更新及输出转换仍需 Vector。Cube 路径的布局准备与跨单元同步是 case 1 的额外成本，优先级低于
 28 AIV 设备上的 V 行分配。设备可用 Vector 核数以 [GetCoreNumAiv](https://www.hiascend.com/document/detail/en/CANNCommunityEdition/910/API/ascendcopapi/docs/en/api/Utils-API/platform_info/PlatformAscendC/GetCoreNumAiv.md) 为准。
 
+## A5 case 1 静态 UB 实验
+
+直接对照为 fc3532a6，累计对照为 a6d33dbb。启动窗口证据来自诊断分支的 862e7beb。
+case 1 使用原性能 JSON 和 CPU 标杆。目标为在同卡上净省约 0.10 µs，至少验证是否超过 0.0642 µs。
+沿用 CHUNK_DEPENDENT/V1（a14961e9dfe8c8264768d67fb447101873da4ecf）的状态与 ready/free 核对方法，
+本路径各核只处理一个 head，没有跨核中转和槽复用。
+
+先核对 tiling 日志的 staticUb=1、Block Dim=32 和 vStep=128，再验证 case 1 的 out、原地 state 和内存时序。
+原单 head、BF16/FP32 通用路径以及 gk、accepted-token、多 token、非连续 state 的回退继续跑原精度回归。
+性能沿用 [case 1 的 BasicInfo 命令](head-range-experiment.md#5-设备验证和采样)，
+同卡交替比较无打点候选和 fc3532a6。首个候选将静态槽、固定调度和替代同步一起验证。
+
+MSS case 2 沿用性能 case 1。设备侧核对实际编译产物和 tiling 选择后，按
+[ATK 执行步骤](../../../../../../../tests/atk/recurrent_gated_delta_rule/README.md#a5-case-1-静态-ub)
+检查内存时序和确定性。本地 RGDR 脚本测试通过 25 项，另 1 项因缺少 C++17 编译器跳过。
+源级检视覆盖新槽位的边界、读写顺序以及回退模板。CANN 编译、实机命中、精度、MSS 和性能结果待设备验证。
+
 ## 内网执行
 
 先为相应提交编译并安装单算子 run 包，并使用新 Python 进程：

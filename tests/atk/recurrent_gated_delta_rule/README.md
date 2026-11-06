@@ -145,12 +145,13 @@ PipeTimeline 可直接复用此 Python 脚本，无需改 kernel：`--calls 1` �
 
 ### A5 初始 state Cast 融合的分支覆盖
 
-| 模板参数（D_T_STATE, SINGLE_WORK） | 路径 | 精度代表 | MSS 代表 | 设备选择证据 |
+| 模板参数（D_T_STATE, SINGLE_WORK, STATIC_UB） | 路径 | 精度代表 | MSS 代表 | 设备选择证据 |
 | --- | --- | --- | --- | --- |
-| BF16, 0 | 单序列单 token 多头，g-only，无 accepted-token，单 V 分片 | 性能 case 1、精度 case 173 | MSS case 1 | 核对实际 vStep=128、有效长度及 BF16 直接读分支 |
-| BF16, 0 | 原通用转换与递推 | 精度 case 2–5 | 专项可直接用精度 JSON | 核对多 token 或 gk 回退条件 |
-| FP32, 0 | FP32 通用路径 | 精度 case 1 | 专项可直接用精度 JSON | 核对 FP32 模板 |
-| BF16, 1 | 原 A5 单 work | 精度 case 0 | MSS case 0 | 核对 SINGLE_WORK=1 |
+| BF16, 0, 1 | A5 case 1 的静态 UB 路径 | 性能 case 1 | MSS case 2 | 核对 staticUb=1、Block Dim=32、vStep=128 和有效长度 |
+| BF16, 0, 0 | 单序列单 token 多头，g-only，无 accepted-token，单 V 分片 | 精度 case 173 | MSS case 1 | 核对实际 vStep=128、有效长度及 BF16 直接读分支 |
+| BF16, 0, 0 | 原通用转换与递推 | 精度 case 2–5 | 专项可直接用精度 JSON | 核对多 token 或 gk 回退条件 |
+| FP32, 0, 0 | FP32 通用路径 | 精度 case 1 | 专项可直接用精度 JSON | 核对 FP32 模板 |
+| BF16, 1, 0 | 原 A5 单 work | 精度 case 0 | MSS case 0 | 核对 SINGLE_WORK=1 |
 
 新增 MSS case 1 沿用精度 case 173 的 Hk=128、Hv=256。确认 blockDim<256 且 vStep=128 后，
 检查同一核连续处理多个 head 时输入 slot 的复用。以下命令从仓库根目录执行。
@@ -161,6 +162,22 @@ MSS_START=1 MSS_END=2 bash tests/atk/run_test_cpu.sh \
 DETERMINISM_START=1 DETERMINISM_END=2 bash tests/atk/run_test_cpu.sh \
   -op=recurrent_gated_delta_rule -soc=ascend950 -npu_device_id=0 -scope=determinism
 ```
+
+### A5 case 1 静态 UB
+
+使用同设备比较静态 UB 候选和 `fc3532a6`。两版均以正常参数编译单算子并安装各自 run 包。
+核对安装的目标 `.o` 和采集 dump 的哈希，确认候选实际命中 `staticUb=1`。
+使用上面的性能 case 1 精度命令校验 out 和原地 state，再检查内存和确定性。
+
+```bash
+MSS_START=2 MSS_END=3 bash tests/atk/run_test_cpu.sh \
+  -op=recurrent_gated_delta_rule -soc=ascend950 -npu_device_id=0 -scope=mssanitizer
+DETERMINISM_START=2 DETERMINISM_END=3 bash tests/atk/run_test_cpu.sh \
+  -op=recurrent_gated_delta_rule -soc=ascend950 -npu_device_id=0 -scope=determinism
+```
+
+精度通过后用前文的 BasicInfo 步骤交替测量。首轮目标为相对 `fc3532a6` 净省约 0.10 µs，
+并核对原有回退用例。
 
 ```bash
 bash tests/atk/run_test_cpu.sh -op=recurrent_gated_delta_rule -npu_device_id=0
