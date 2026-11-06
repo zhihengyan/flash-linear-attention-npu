@@ -6,10 +6,10 @@
 
 ## 1. 目标
 
-目标输入为用户确认的性能 case 1。保留其生成器、随机种子、值域、CPU 标杆、容差和全部 JSON。
-当前实现以 a6d33dbb（kernel 同 93f5c70a）为基线，只缩小单序列、单 token、多头的 head 遍历范围。
-元数据复用代码恢复为基线，历史提交和结果保留。本轮保留原 head 归属、VF、搬运和同步，
-不使用此前独立的多头直接分发计算路径。
+目标输入为用户确认的性能 case 1。沿用其生成器、随机种子、值域、CPU 标杆和容差。
+已采用的 head 范围策略以 a6d33dbb（kernel 同 93f5c70a）为基线，缩小单序列、单 token、多头的遍历范围。
+本轮以含该策略的 0d188aca 为直接对照，实验变量为初始 BF16 state 的 Cast 位置。
+相对 a6d33dbb 的累计目标为 case 1 的 Task Duration 下降超过 3%。
 
 以同设备、相同安装与预热条件下的 msprof op / OpBasicInfo 的 Task Duration(us) 比较版本。
 Python 默认调用 20 次，各次独立 state 在首个 RGDR 前克隆；msprof warm-up=20、launch-count=20，
@@ -40,7 +40,7 @@ V 分片起点为 vi，有效行数 r=min(vStep,V-vi)。输入偏移为 (token*H
 仅 B=1、L=1、Hv>1 时，以 a=avgload=ceil(Hv/blockDim) 计算本核连续区间
 [headBegin,headEnd)=[c*a,min(c*a+a,Hv))；headBegin>=Hv 时不进入 head 循环。
 它与原 IsCurrentBlock 每 a 个 head 推进一核的归属相同，不能改为 head=c+j*blockDim。
-case 1 的 blockDim=min(Hv,可用 AIV 核数)，仍为原连续分配；不增加新 TilingKey 或独立计算路径。
+case 1 的 blockDim=min(Hv,可用 AIV 核数)，继续按原连续分配。初始 state 读取模式在原 TilingKey 内选择。
 case 1 的 Nwork=32；若可用核数>=32，则 blockDim=32、每核一个 head、一个 wave；
 否则每核最多 ceil(32/blockDim) 个 head，wave=ceil(32/blockDim)。Hk=16 时 hk=floor(hv/2)。
 
@@ -60,17 +60,18 @@ ComputeAvgload 和序列元数据读取与 a6d33dbb 完全一致，保留原前�
 该分支只有一个序列，区间结束后的私有游标没有后续消费者，不要求模拟尾部无工作扫描。
 多序列、空序列、多 token 和单 head 都保留原扫描，B=0 仍不进入序列循环。
 每个序列在本核首次有效 head 时读取 state index 并调用 CopyInGamaBeta。
-ProcessHead、全部元数据读取和地址计算沿用 a6d33dbb，prefix、非零 state index、各级 stride、
-gate、BF16/FP32 state 及 V 分片不作额外假设；accepted-token 非法值仍在搬入前退出。
-每个本核 head 调用原 CopyInQKV、PrefetchState、LoadPrefetchedState，不引入 Q/K 复用或缓冲调整。
-通用路径沿用原队列和同步；原 Hk=Hv=1 的 ProcessSingleWork 及其 V_S Set/Wait 保持。
-当前 case 1 不进入 ProcessSingleWork，也没有新增多头调度的 V_S Set/Wait。
+全部元数据读取、head 归属和地址计算沿用 0d188aca。每个 head 调用原 CopyInQKV 和 PrefetchState。
+A5 通用 BF16 路径中，B=T=1、设备序列有效长度为 1、Hv>1、g-only、无 accepted-token、vStep=V 时，
+首遍 VF 从 state 输入队列直接读 BF16。前缀和序列校验先于该选择。分块或其他输入进入原 LoadPrefetchedState。
+两种模式共享 V 分片、token 和输出循环，Hk=Hv=1 的 ProcessSingleWork 沿用原同步。
 
 ### Stage 1：Vector，门控与第一遍归约
 
-保持 FP32 Sg=exp(g)*S（以及通用路径可选逐 K gate）、dot=reduce(Sg*k) 的原指令顺序。
+在 BF16 直接读模式中，每行从输入队列搬入 128 个 BF16 元素。
+用 RegLayout::ZERO/ONE 扩展偶数、奇数 K lane，匹配原 FP32 DIST_DINTLV_B32 的配对。
+随后按原顺序计算 FP32 Sg=exp(g)*S（通用路径另支持逐 K gate）、dot=reduce(Sg*k)。
 第一遍保存 Sg 和 dot，LocalMemBar<VEC_STORE,VEC_LOAD> 后第二遍读取，不能省去此 scratch。
-g/beta、缩放和归约树与基线一致；不做 FMA 替换、代数重排或新的数值转换。
+g/beta、缩放、归约树和最终输出舍入沿用基线。
 
 ### Stage 2：Vector，更新与投影
 
@@ -79,13 +80,13 @@ stateOut 转换和 attention 投影都直接使用更新后的 FP32 寄存器。
 Compute<writeUpdatedScratch> 选择同一 VF 的编译期参数：
 通用路径 seq_i+1<seq1 时 true，否则 false；原单 work 默认 false。
 true 实例逐操作保持原逻辑，false 仅删除第二遍 updated scratch Store。
-末 token 后，下一 V 分片/下一 head 必先 LoadPrefetchedState 覆盖 scratch，所以不存在后续读取者。
+末 token 后，下一 V 分片/下一 head 以独立的初始 state 为输入，直接读模式的第一遍也会覆盖门控后 scratch。
 两个原 VF LocalMemBar、所有输出 Store、队列入队和第一遍 scratch Store 保持。
 
 ### Stage 3：Vector/MTE，写回与释放
 
 保留所有 token 的 state GM 写回，不能只保存序列最终状态。
-通用路径按原输出队列配置立即写回或 pending flush；单 token 时仍先 attention、后 state。
+通用路径按原输出队列配置立即写回或 pending flush，混合队列深度下沿用原提交顺序。
 state index、head stride、block stride 均取自原输入；不改变 tensor view offset 的调用层处理。
 通用路径的 pending 输出与多 token 次序不变。
 
@@ -101,28 +102,27 @@ case 1 的 tmpBuff 相对字节区间为：
 | v | [512,4608) | 输入 Cast 至当前 head VF 完成 |
 | q | [4608,8704) | 输入 Cast/scale 至当前 head VF 完成 |
 | k | [8704,12800) | 输入 Cast 至当前 head VF 完成 |
-| FP32 state | [12800,78336) | 初始 Cast、两遍 VF；仅非末 token 保存更新供下一 token |
+| FP32 state | [12800,78336) | 通用模式的初始 Cast；两遍 VF 之间保存 Sg；仅非末 token 保存更新供下一 token |
 | beta | [78336,79360) | 一次 batch 搬入至本核 head 全部完成 |
 | g | [79360,80384) | 一次 batch 搬入/Exp 至本核 head 全部完成 |
 
 输入 Q/K/V 队列各 2048 B，BF16 state 输入 32768 B，g/beta 输入 1024/512 B；
 state 输出每 slot 32768 B，attention 输出每 slot 256 B，slot 数沿原 host 选择的 1/2。
-每个有效 head 仍读取/写回 BF16 state 各 32 KiB；第一遍 gated scratch 必须写回，
-末 token updated scratch 少写 64 KiB/head。Q/K 在两个 V head 间重复搬运保持原状。
+每个有效 head 从 GM 读写 BF16 state 各 32 KiB。直接读模式省去初始 state 的 FP32 UB 写入和读回各 64 KiB，
+复用现有输入 slot 和第一遍的门控后 FP32 scratch。末 token updated scratch 省写属于基线。
 
 ```text
-检查有效任务 -> 原输入 EnQue/DeQue -> Cast/Exp/scale/state Cast
--> 原通用路径同步 -> 读 g/beta 标量 -> VF 第一遍
--> 原 LocalMemBar -> VF 第二遍（末 token 不写 updated scratch）
--> 原 LocalMemBar -> 原输出 EnQue/DeQue -> GM 写回 -> Free -> 下一 head
+MTE2 搬入 BF16 state -> stateInQueue EnQue/DeQue -> 读 g/beta 标量
+-> VF 第一遍（BF16 Load、寄存器 Cast、门控和归约）
+-> 原 LocalMemBar -> VF 第二遍（末 token 省写 updated scratch）
+-> 原 LocalMemBar -> 输出 EnQue -> 释放 state 输入 slot -> 原输出 DeQue/写回
 ```
 
 R01/R20：AIV-only 继承原 head 所有权与次序，只跳过不属于本核的单 token head 扫描，不引入跨核归约。
 R03/R08/R11：地址、缓冲和峰值分配不变，不持有跨 head 活跃输出。
-R10/R16：只删除无消费者 Store，未合并或新增 GM 数据流。
-R21：所有算术、Exp、Cast、mask 与顺序保持，末次 UB 结果不再读取；用户已回传精度通过，
-专项覆盖与正式验收状态按 validation.md 中的证据范围记录。
+R10/R16：直接读模式只改变初始 state 的 UB 中转。VECIN 队列负责 MTE2 ready 和 VF 消费后的 slot 复用。
+g/beta 的高层 Vector 生产与 LocalTensor 标量读取沿用构建的自动同步。[CANN Pipe 同步说明](https://www.hiascend.com/document/detail/en/CANNCommunityEdition/910/programug/Ascendcopdevg/docs/en/guide/programming_guide/programming_model/ai_core_simd_programming/cpp_tensor_programming/static_tensor_programming.md)
+R21：两遍计算与输出 Cast 顺序沿用原实现。直接读模式的精度和队列时序需独立验证。
 
 当前采用 head 遍历范围，元数据复用已从实现中移除。
-新增范围计算的成本已纳入本轮用户回传的 A/B 比较；当前实现保持，后续改动独立验证。
-复现步骤和覆盖要求见 [实验说明](head-range-experiment.md) 与 [开发记录](validation.md)。
+head 范围的 A/B 复现步骤见 [实验说明](head-range-experiment.md)。本轮 Cast 融合的验证见 [开发记录](validation.md)。

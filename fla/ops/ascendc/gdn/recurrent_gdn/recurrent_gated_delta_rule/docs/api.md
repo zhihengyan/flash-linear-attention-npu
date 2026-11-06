@@ -11,10 +11,8 @@ state 原地更新，输出仍为 attention；g/gk 至少提供一个，accepted
 本轮用户指定性能输入为 `_perf.json` case 1：B=T=1、Hk=16、Hv=32、K=V=128、BF16 state、
 g-only、无 accepted-token 输入、连续布局、seed=20260826。JSON 从基线 f918240b 原样继承。
 
-当前轮以内核同 93f5c70a 的 a6d33dbb 为基线，仅缩小 A5 单序列、单 token、多头的 head 遍历范围。
-元数据复用实验不带入当前实现。公开接口、数学语义与原 head 归属不变。
-原单 work 分支继续要求 Hk=Hv=1；case 1 保留原通用计算与输入/输出流程。
-state index、block/head stride、accepted-token 和空序列的处理沿用原实现。
+当前轮在 0d188aca 的 A5 多头范围优化上测试初始 BF16 state 的寄存器扩展。case 1 属于通用多头路径。
+单 work 分支继续要求 Hk=Hv=1。state index、block/head stride、accepted-token、空序列和输出语义沿用原接口。
 
 A5 通用调度中，每个序列、每个 V 分片的最后一个 token 可以省去更新后 FP32 scratch 的 UB 写入。
 中间 token 仍写入该 scratch，所有 token 的全局 state/out 输出及第一遍门控后 scratch 均保留。

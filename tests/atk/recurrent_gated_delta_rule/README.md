@@ -72,7 +72,7 @@ decode 用例。两条均使用 `K=V=128`、BF16 state、g-only、连续布局�
 
 case 1 保留原用例的随机种子、输入生成方式、值域、状态索引和 gate 配置；同时更新用例编号、
 名称和性能标签。它是用户指定头数的合成性能用例，不是现有精度用例的直接平移，也不是现网
-抓取记录。原 200 条精度用例保持不变；case 1 的设备精度尚待验证，已回传的性能均值见开发记录。
+抓取记录。原 200 条精度用例也可用于本轮回归。Cast 融合候选的 case 1 设备精度待验证。
 原 single-work 模板仍要求 `Hk=Hv=1`。本分支把末 token scratch 省写推广到 A5 通用路径，
 因此 case 1 的所有 head 也可以省去最后一次 updated FP32 scratch 写入。
 
@@ -122,7 +122,7 @@ atk node --name npu_dut --backend npu --devices 0 \
 ```
 
 msprof 可能预热/重放原地更新 state 的 kernel，采集输出不用于精度验收。
-当前采集基线为 `93f5c70a`；需要隔离末 token 省写时，可与 `7acfe2e1` 交错比较。
+Cast 融合的直接对照为 `0d188aca`，累计对照为 `a6d33dbb`。
 保留对应 run 包，使用同一脚本、JSON、设备和采集参数。
 msprof 参数依据：[msOpProf 26.0 参数说明](https://github.com/Ascend/msopprof/blob/26.0.0/docs/en/user_guide/msopprof_user_guide.md)。
 基于 93f5c70a 的 PipeUtilization、MemoryUB 命令、字段和判读方法见
@@ -136,14 +136,31 @@ PipeTimeline 可直接复用此 Python 脚本，无需改 kernel：`--calls 1` �
 
 ### 当前采用：A5 单 token head 遍历范围
 
-内核以 `a6d33dbb` 为基线，移除未见收益的元数据复用，只缩小 B=1、单 token、多头的遍历区间。
-head 归属和顺序、VF、元数据、搬运、同步、CPU 标杆、三份 JSON 与 msprof 脚本均沿基线。
-case 1 的源码级归属检查从 1024 次降至 32 次。用户回传当前实现 `0d188aca` 相对
+在 `0d188aca`，case 1 的源码级归属检查从 1024 次降至 32 次。用户回传该实现相对
 `a6d33dbb936cf40528942133428e371889b5e21a`，三组交替 A/B 性能收益约 1.9%，精度测试通过。
 本次为用户设备验证反馈，未附分轮统计或精度覆盖明细；性能结论限于本轮既定环境和 case 1。
 构建安装、分支/精度回归和同环境 BasicInfo 步骤见
 [head 范围实验说明](../../../fla/ops/ascendc/gdn/recurrent_gdn/recurrent_gated_delta_rule/docs/head-range-experiment.md)。
 历史元数据实验结果见 [归档说明](../../../fla/ops/ascendc/gdn/recurrent_gdn/recurrent_gated_delta_rule/docs/metadata-reuse-experiment.md)。
+
+### A5 初始 state Cast 融合的分支覆盖
+
+| 模板参数（D_T_STATE, SINGLE_WORK） | 路径 | 精度代表 | MSS 代表 | 设备选择证据 |
+| --- | --- | --- | --- | --- |
+| BF16, 0 | 单序列单 token 多头，g-only，无 accepted-token，单 V 分片 | 性能 case 1、精度 case 173 | MSS case 1 | 核对实际 vStep=128、有效长度及 BF16 直接读分支 |
+| BF16, 0 | 原通用转换与递推 | 精度 case 2–5 | 专项可直接用精度 JSON | 核对多 token 或 gk 回退条件 |
+| FP32, 0 | FP32 通用路径 | 精度 case 1 | 专项可直接用精度 JSON | 核对 FP32 模板 |
+| BF16, 1 | 原 A5 单 work | 精度 case 0 | MSS case 0 | 核对 SINGLE_WORK=1 |
+
+新增 MSS case 1 沿用精度 case 173 的 Hk=128、Hv=256。确认 blockDim<256 且 vStep=128 后，
+检查同一核连续处理多个 head 时输入 slot 的复用。以下命令从仓库根目录执行。
+
+```bash
+MSS_START=1 MSS_END=2 bash tests/atk/run_test_cpu.sh \
+  -op=recurrent_gated_delta_rule -soc=ascend950 -npu_device_id=0 -scope=mssanitizer
+DETERMINISM_START=1 DETERMINISM_END=2 bash tests/atk/run_test_cpu.sh \
+  -op=recurrent_gated_delta_rule -soc=ascend950 -npu_device_id=0 -scope=determinism
+```
 
 ```bash
 bash tests/atk/run_test_cpu.sh -op=recurrent_gated_delta_rule -npu_device_id=0

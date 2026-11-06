@@ -3,8 +3,8 @@
 基线 f918240b，原分支 codex/gdn-k32-tail-scratch-elision 保持该提交。
 原实验分支 codex/gdn-a5-multihead-tail-scratch 从其创建，性能 JSON 原样继承。
 当前采集分支 codex/gdn-a5-tail-pmu-profile 从 93f5c70a 创建，原实验分支保持 247efa15。
-本分支源码、JSON 和 Python 脚本与 93f5c70a 一致；仅更新文档，撤回设计中尚未采用的多头调度。
-本机为 Windows，无 torch/ATK/CANN/NPU 或 C++ 编译器；此前交付编码和离线检查，本轮补充采集文档。
+采集准备阶段使用 93f5c70a 的源码、JSON 和 Python 脚本，撤回当时尚未采用的多头调度。
+本机为 Windows，无 torch/ATK/CANN/NPU 或 C++ 编译器。
 采用 CHUNK_DEPENDENT/V1，来源 a14961e9dfe8c8264768d67fb447101873da4ecf；
 仅参考递推 scratch 生命周期、任务与事件闭环，不移植其 Cube/GM workspace 架构。
 
@@ -251,6 +251,29 @@ msprof 脚本及 prefill K32 保持。27 个本地文档链接、采集命令参
 下一候选先验证 case 1 的 out 和 state 精度，再在同卡交替测 0d188aca 与候选，确认增量。
 总收益另在同卡以 a6d33dbb 为对照确认。沿用 case 1 的 BasicInfo 参数，
 PMU 或 PipeTimeline 单独比较当前版本与候选的 Vector 区间和 UB 访问。
+
+## 2026-11-06 初始 state Cast 融合开发
+
+用户确认在当前分支实现首选候选。直接对照为 0d188aca，累计对照为 a6d33dbb。
+采用 CHUNK_DEPENDENT/V1（a14961e9dfe8c8264768d67fb447101873da4ecf）的状态生命周期和 ready/free 核对方法。
+寄存器扩展参考 db179916，沿用本分支的多头调度。
+
+先验证 case 1 的 out/state，再验证单头、FP32、gk、accepted-token、多 token、空序列及分片回退。
+C++ 控制用例覆盖一核多个 head 的 slot 复用、非零 state index、padded stride 和不同输出队列深度。
+MSS case 1 源自精度 case 173，使用 Hk=128、Hv=256，在 blockDim<256 且 vStep=128 时覆盖同核 slot 复用。
+设备选择证据应核对实际有效长度、blockDim、vStep 和编译产物的 BF16 load/Cast 分支。
+构建并校验单算子包后，沿用 [case 1 的精度和 BasicInfo 命令](head-range-experiment.md)。
+测性能前完成独立精度，同卡交替比较 0d188aca、候选和 a6d33dbb，分别报告直接收益与累计收益。
+
+| 设计项 | 实现 | 开发期证据 |
+| --- | --- | --- |
+| 分派与地址 | `ProcessHead` 按实际有效长度等条件选择；`ProcessHeadTiles` 共享地址、输出与 pending flush | 原 head scan 和回退函数语义的源码对照通过 |
+| 初始读与两遍 VF | `ComputeRecurrentGatedDeltaRuleVF` 仅替换第一遍 state load，ZERO/ONE 匹配偶奇 lane | VF 回退、lane 次序、尾 token 省写和原数学的源码检查通过 |
+| 输入队列 | `PrefetchState`、`DeQue`、`Compute`、`FreeTensor` 配对，原 VF 内存屏障保留 | 源码顺序检查通过。实际同步、slot 复用和确定性待设备验证 |
+
+本机离线脚本 22 项，21 项通过，1 项因缺少 C++17 编译器跳过。算子 review 的 issue 规则覆盖检查通过，
+静态扫描仍报告原有 host/API 的 42 条 DFX 错误和算子 README 的 1 条文档提示。
+本机缺少 CANN/NPU，待验证 CANN 构建、精度、MSS 和性能。现有 1.8%–1.9% 数据对应 0d188aca。
 
 ## 内网执行
 

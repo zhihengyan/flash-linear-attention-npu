@@ -13,8 +13,8 @@ KERNEL = OP / "op_kernel/arch35/recurrent_gated_delta_rule.h"
 BASE = "f918240b"
 
 
-def baseline(path):
-    return subprocess.check_output(["git", "show", BASE + ":" + path.relative_to(ROOT).as_posix()],
+def baseline(path, revision=BASE):
+    return subprocess.check_output(["git", "show", revision + ":" + path.relative_to(ROOT).as_posix()],
                                    cwd=ROOT, text=True, encoding="utf-8")
 
 
@@ -32,6 +32,11 @@ def body(source, name):
 
 def normalize(source):
     return re.sub(r"\s+", "", re.sub(r"//[^\n]*|/\*.*?\*/", "", source, flags=re.S))
+
+
+def without_bf16_input_branch(source):
+    return re.sub(r"^([ ]*)if constexpr \(loadBf16State\) \{\n.*?^\1\} else ",
+                  r"\1", source, flags=re.M | re.S)
 
 
 RANGE_BLOCK = re.compile(
@@ -66,23 +71,30 @@ def production_range_expressions(source):
 class MultiheadSourceTest(unittest.TestCase):
     def test_vf_math_and_scratch_guard_are_unchanged(self):
         source, old = KERNEL.read_text(encoding="utf-8"), baseline(KERNEL)
-        self.assertEqual(body(source, "ComputeRecurrentGatedDeltaRuleVF"),
-                         body(old, "ComputeRecurrentGatedDeltaRuleVF"))
+        vf = without_bf16_input_branch(body(source, "ComputeRecurrentGatedDeltaRuleVF"))
+        self.assertEqual(normalize(vf), normalize(body(old, "ComputeRecurrentGatedDeltaRuleVF")))
         self.assertEqual(body(source, "ProcessSingleWork"), body(old, "ProcessSingleWork"))
 
     def test_all_gate_modes_forward_the_compile_time_store_policy(self):
         source, old = KERNEL.read_text(encoding="utf-8"), baseline(KERNEL)
-        self.assertIn("template <bool writeUpdatedScratch = !singleWork>", source)
-        compute = body(source, "Compute")
+        self.assertIn("template <bool writeUpdatedScratch = !singleWork, bool loadBf16State = false>", source)
+        compute = without_bf16_input_branch(body(source, "Compute"))
         choices = re.findall(r"ComputeRecurrentGatedDeltaRuleVF<stateType, outType, "
                              r"(true|false), (true|false), writeUpdatedScratch>", compute)
         self.assertCountEqual(choices, [("true", "true"), ("true", "false"),
                                        ("false", "true"), ("false", "false")])
-        self.assertEqual(compute.replace(", writeUpdatedScratch>", ", !singleWork>"), body(old, "Compute"))
+        compute = compute.replace(", writeUpdatedScratch>", ", !singleWork>").replace(", beta_, nullptr", ", beta_")
+        self.assertEqual(compute, body(old, "Compute"))
 
-    def test_general_path_changes_only_the_final_token_compute_dispatch(self):
+    def test_fallback_keeps_original_head_body_and_tail_store_policy(self):
         source, old = KERNEL.read_text(encoding="utf-8"), baseline(KERNEL)
-        process = body(source, "ProcessHead")
+        head = body(source, "ProcessHead")
+        before_select = head.split("if constexpr (std::is_same<stateType, bfloat16_t>::value)", 1)[0]
+        after_tiles = head.split("ProcessHeadTiles<false>(seq0, seq1, head_i, stateOffset);", 1)[1]
+        tiles = without_bf16_input_branch(body(source, "ProcessHeadTiles"))
+        tiles = tiles.replace("LocalTensor<stateType> initialState;", "")
+        tiles = re.sub(r"\{\s*(LoadPrefetchedState\(curSingleV\);)\s*\}", r"\1", tiles)
+        process = before_select + tiles + after_tiles
         dispatch = re.compile(
             r"if\s*\(seq_i\s*\+\s*1\s*<\s*static_cast<uint64_t>\(seq1\)\)\s*\{\s*"
             r"Compute<true>\(curSingleV, curQKOffset, curVOffset\);\s*\}\s*else\s*\{\s*"
@@ -120,15 +132,24 @@ class MultiheadSourceTest(unittest.TestCase):
         self.assertEqual(normalize(restored), normalize(body(old, "ProcessGeneral")))
         self.assertGreater(process.index("uint64_t headBegin"), process.index("seq1 += seqLen;"))
 
-    def test_metadata_reuse_is_removed_and_only_general_differs_from_a6(self):
+    def test_cast_fusion_keeps_the_adopted_head_scan(self):
         source = KERNEL.read_text(encoding="utf-8")
-        original = subprocess.check_output(["git", "show", "a6d33dbb:"+KERNEL.relative_to(ROOT).as_posix()],
-                                           cwd=ROOT, text=True, encoding="utf-8")
-        start = source.index("    __aicore__ inline void ProcessGeneral()")
-        end = source.index("\nprivate:", start)
-        old_start = original.index("    __aicore__ inline void ProcessGeneral()")
-        old_end = original.index("\nprivate:", old_start)
-        self.assertEqual(source[:start]+source[end:], original[:old_start]+original[old_end:])
+        self.assertEqual(body(source, "ProcessGeneral"), body(baseline(KERNEL, "0d188aca"), "ProcessGeneral"))
+
+    def test_bf16_input_uses_original_lane_order_and_queue_lifetime(self):
+        source = KERNEL.read_text(encoding="utf-8")
+        self.assertRegex(source, r"castTraitB16ToB32\s*=\s*\{\s*RegLayout::ZERO,")
+        self.assertRegex(source, r"castTraitB16ToB32One\s*=\s*\{\s*RegLayout::ONE,")
+        vf = body(source, "ComputeRecurrentGatedDeltaRuleVF")
+        load = vf.split("if constexpr (loadBf16State)", 1)[1].split("} else", 1)[0]
+        self.assertIn("DataCopy(input, initialState + rowOffset);", load)
+        self.assertIn("castTraitB16ToB32>(state0, input, fullFp32Mask);", load)
+        self.assertIn("castTraitB16ToB32One>(state1, input, fullFp32Mask);", load)
+        tiles = body(source, "ProcessHeadTiles")
+        lifetime = ("PrefetchState(nextStateOffset, nextSingleV);", "stateInQueue_.DeQue<stateType>()",
+                    "initialState.GetPhyAddr()", "Compute<false, true>", "stateInQueue_.FreeTensor(initialState)")
+        positions = [tiles.index(operation) for operation in lifetime]
+        self.assertEqual(positions, sorted(positions))
 
 
 class HeadOwnershipTest(unittest.TestCase):
@@ -185,16 +206,39 @@ class HeadRangeControlTest(unittest.TestCase):
 #include <cstdint>
 #include <iostream>
 #include <stdexcept>
+#include <type_traits>
 #include <vector>
+#define __ubuf__
+using bfloat16_t = uint16_t;
 struct Tensor {
     std::vector<int32_t> values;
     std::vector<uint64_t> reads;
     int32_t GetValue(uint64_t i) { reads.push_back(i); return values.at(i); }
 };
-struct Local { float GetValue(uint64_t i) { return float(i + 1); } };
+struct Local {
+    float GetValue(uint64_t i) { return float(i + 1); }
+    bfloat16_t* GetPhyAddr() { static bfloat16_t slot; return &slot; }
+};
+template<typename> using LocalTensor = Local;
 struct Queue { void FreeTensor(Local&) {} };
+struct StateQueue {
+    std::vector<std::vector<uint64_t>>* events = nullptr;
+    bool held = false;
+    template<typename> Local DeQue() {
+        assert(!held);
+        held = true;
+        events->push_back({8});
+        return {};
+    }
+    void FreeTensor(Local&) {
+        assert(held);
+        held = false;
+        events->push_back({9});
+    }
+};
 struct Control {
     using inType = int;
+    using stateType = bfloat16_t;
     uint32_t B_=0,T_=0,NV_=32,NK_=16,alignK_=128,realK_=128,alignV_=128,realV_=128,vStep_=128;
     uint32_t load=0,usedblk=0,avgload=0,cores=32,blockIdx=0,ownershipChecks=0;
     uint32_t stateStride0_=1<<28,stateStride1_=20000,stateStride2_=144;
@@ -205,6 +249,7 @@ struct Control {
     Tensor cuSeqlensGm_,ssmStateIndicesGm_,numAcceptedTokensGm_;
     Local gamaInUb,betaInUb,gamaKInUb;
     Queue gamaKInQueue_;
+    StateQueue stateInQueue_;
     std::vector<std::vector<uint64_t>> events;
     uint32_t GetBlockNum() {return cores;}
     uint64_t Ceil(uint64_t a,uint64_t b) {return (a+b-1)/b;}
@@ -212,24 +257,34 @@ struct Control {
     void CopyInQKV(uint64_t a,uint64_t b,int32_t c) {events.push_back({2,a,b,uint64_t(c)});}
     void PrefetchState(uint64_t a,uint32_t b) {events.push_back({3,a,b});}
     void LoadPrefetchedState(uint32_t a) {events.push_back({4,a});}
-    template<bool store> void Compute(uint32_t a,uint64_t b,uint64_t c) {
+    template<bool store, bool direct=false>
+    void Compute(uint32_t a,uint64_t b,uint64_t c,bfloat16_t* input=nullptr) {
+        assert(direct == (input != nullptr));
+        assert(direct == stateInQueue_.held);
+        assert(!direct || !store);
         events.push_back({5,a,b,c,store,uint64_t(gama_),uint64_t(beta_)});
     }
     void CopyOutAttn(uint64_t a,uint32_t b) {events.push_back({6,a,b});}
     void CopyOutState(uint64_t a,uint32_t b) {events.push_back({7,a,b});}
 };
 '''
-        def control(name, text, return_type):
-            signatures = ((return_type, "ComputeAvgload", ""), ("bool", "IsCurrentBlock", "int32_t seqlen"),
-                          ("void", "ProcessHead", "int32_t seq0,int32_t seq1,uint64_t head_i,uint64_t stateOffset"),
+        def control(name, text):
+            head_args = "int32_t seq0,int32_t seq1,uint64_t head_i,uint64_t stateOffset"
+            signatures = (("void", "ComputeAvgload", ""), ("bool", "IsCurrentBlock", "int32_t seqlen"),
+                          ("void", "ProcessHead", head_args),
                           ("void", "ProcessGeneral", ""))
-            return "struct "+name+" : Control {\n"+"\n".join(
+            tiles = ""
+            if name == "Candidate":
+                tiles = ("template<bool loadBf16State> void ProcessHeadTiles("+head_args+") {"+
+                         body(text, "ProcessHeadTiles")+"}\n")
+            return "struct "+name+" : Control {\n"+tiles+"\n".join(
                 result+" "+function+"("+arguments+") {"+
                 ("++ownershipChecks;" if function == "IsCurrentBlock" else "")+body(text, function)+"}"
                 for result, function, arguments in signatures)+"\n};\n"
         main = r'''
 int main() {
     size_t checked=0;
+    size_t reusedDirectSlots=0;
     const std::vector<std::vector<int32_t>> sequences={
         {},{0},{1},{2},{8},{-1},{9},{0,1},{1,0},{0,1,0},{1,2,1},{8,1,0},{0,0,0},{1,1,1}};
     for(const auto& seq:sequences) for(int prefix:{0,3,-1}) for(int acceptedMode:{0,1,2,3,4})
@@ -247,12 +302,28 @@ int main() {
         for(uint32_t t=0;t<config.T_;++t)config.ssmStateIndicesGm_.values[t]=config.T_-t+7;
         config.hasAcceptedTokens_=acceptedMode!=0;
         config.NV_=nv;config.NK_=nv%2==0 ? nv/2 : 1;config.cores=cores;config.blockIdx=core;config.vStep_=step;
-        config.attnOutBufferNum_=depth;config.stateOutBufferNum_=depth;
+        config.attnOutBufferNum_=depth;config.stateOutBufferNum_=checked%3==0 ? 1 : depth;
         config.hasGama_=checked%2;config.hasGamaK_=checked%3==0;
         Baseline before;Candidate after;
         static_cast<Control&>(before)=config;static_cast<Control&>(after)=config;
+        after.stateInQueue_.events=&after.events;
         before.ProcessGeneral();after.ProcessGeneral();
-        if(before.events!=after.events)throw std::runtime_error("address/order/gate trace differs");
+        const bool direct=seq==std::vector<int32_t>{1} && prefix==0 && nv>1 && step==128 &&
+                          acceptedMode==0 && config.hasGama_ && !config.hasGamaK_;
+        std::vector<std::vector<uint64_t>> expected;
+        size_t directTiles=0;
+        for(const auto& event:before.events) {
+            if(direct && event[0]==4) {
+                expected.push_back({8});
+                ++directTiles;
+            } else {
+                expected.push_back(event);
+            }
+            if(direct && event[0]==5)expected.push_back({9});
+        }
+        if(directTiles>1)++reusedDirectSlots;
+        if(expected!=after.events || after.stateInQueue_.held)
+            throw std::runtime_error("address/order/gate/slot trace differs");
         assert(before.avgload==after.avgload);
         if(seq.size()!=1 || seq[0]!=1 || nv<=1 || prefix<0)
             assert(before.load==after.load && before.usedblk==after.usedblk);
@@ -265,10 +336,11 @@ int main() {
         }
         ++checked;
     }
+    assert(reusedDirectSlots>0);
     std::cout<<checked<<" production scalar-control cases passed\n";
 }
 '''
-        code = support+control("Baseline", old, "void")+control("Candidate", source, "void")+main
+        code = support+control("Baseline", old)+control("Candidate", source)+main
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory)/"head_range_control.cpp"
             executable = Path(directory)/"head_range_control.exe"

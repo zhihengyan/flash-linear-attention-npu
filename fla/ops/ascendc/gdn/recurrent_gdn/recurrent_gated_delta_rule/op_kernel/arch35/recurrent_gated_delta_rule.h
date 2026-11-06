@@ -34,6 +34,8 @@ constexpr uint16_t V_LENGTH = VECTOR_REG_WIDTH / sizeof(float);
 
 constexpr CastTrait castTraitB16ToB32 = {
     RegLayout::ZERO, SatMode::UNKNOWN, MaskMergeMode::ZEROING, RoundMode::UNKNOWN};
+constexpr CastTrait castTraitB16ToB32One = {
+    RegLayout::ONE, SatMode::UNKNOWN, MaskMergeMode::ZEROING, RoundMode::UNKNOWN};
 constexpr static CastTrait castTraitFp32ToB16ZeroRint = {
     RegLayout::ZERO, SatMode::NO_SAT, MaskMergeMode::MERGING, RoundMode::CAST_RINT};
 constexpr static CastTrait castTraitFp32ToB16OneRint = {
@@ -53,15 +55,15 @@ struct RGDRInitParams {
     GM_ADDR finalState;
 };
 
-template <typename stateType, typename outType, bool hasGama, bool hasGamaK, bool writeUpdatedScratch = true>
+template <typename stateType, typename outType, bool hasGama, bool hasGamaK, bool writeUpdatedScratch = true,
+          bool loadBf16State = false>
 __simd_vf__ inline void ComputeRecurrentGatedDeltaRuleVF(
     __ubuf__ float *state, __ubuf__ float *key, __ubuf__ float *query, __ubuf__ float *value,
     __ubuf__ float *gamaK, __ubuf__ stateType *stateOut, __ubuf__ outType *attnOut,
-    __ubuf__ float *attnTmp, uint16_t rows, uint16_t kLength, float gama, float beta)
+    __ubuf__ float *attnTmp, uint16_t rows, uint16_t kLength, float gama, float beta,
+    __ubuf__ stateType *initialState)
 {
     // The public interface fixes Dk to 128, i.e. two FP32 vector registers on A5.
-    // Keeping the complete recurrence in one VF lets both state halves remain in registers
-    // across gate, dot-product, rank-one update, output projection and output conversion.
     constexpr uint16_t FP32_PER_REG = VECTOR_REG_WIDTH / sizeof(float);
     MaskReg fullFp32Mask = CreateMask<float, MaskPattern::ALL>();
     MaskReg fullB16Mask = CreateMask<bfloat16_t, MaskPattern::ALL>();
@@ -95,7 +97,15 @@ __simd_vf__ inline void ComputeRecurrentGatedDeltaRuleVF(
         const uint32_t rowOffset = static_cast<uint32_t>(row) * kLength;
         RegTensor<float> state0;
         RegTensor<float> state1;
-        if constexpr (std::is_same<stateType, float32_t>()) {
+        if constexpr (loadBf16State) {
+            static_assert(std::is_same<stateType, bfloat16_t>::value && hasGama && !hasGamaK && !writeUpdatedScratch,
+                          "direct BF16 state requires the g-only single-token path");
+            RegTensor<stateType> input;
+            DataCopy(input, initialState + rowOffset);
+            // Match the even/odd K lanes of the FP32 deinterleaving load.
+            Cast<float, stateType, castTraitB16ToB32>(state0, input, fullFp32Mask);
+            Cast<float, stateType, castTraitB16ToB32One>(state1, input, fullFp32Mask);
+        } else if constexpr (std::is_same<stateType, float32_t>()) {
             DataCopy(state0, state + rowOffset);
             DataCopy(state1, state + rowOffset + FP32_PER_REG);
         } else {
@@ -492,8 +502,9 @@ private:
         }
     }
 
-    template <bool writeUpdatedScratch = !singleWork>
-    __aicore__ inline void Compute(uint32_t curSingleV, uint64_t curQKOffset, uint64_t curVOffset)
+    template <bool writeUpdatedScratch = !singleWork, bool loadBf16State = false>
+    __aicore__ inline void Compute(uint32_t curSingleV, uint64_t curQKOffset, uint64_t curVOffset,
+                                   __ubuf__ stateType *initialState = nullptr)
     {
         LocalTensor<stateType> stateOutLocal = stateOutQueue_.AllocTensor<stateType>();
         LocalTensor<outType> attnOutLocal = attnOutQueue_.AllocTensor<outType>();
@@ -508,28 +519,33 @@ private:
             reinterpret_cast<__ubuf__ stateType *>(stateOutLocal.GetPhyAddr());
         __ubuf__ outType *attnOutAddr = reinterpret_cast<__ubuf__ outType *>(attnOutLocal.GetPhyAddr());
         __ubuf__ float *attnTmpAddr = reinterpret_cast<__ubuf__ float *>(attnInUb.GetPhyAddr());
-        if (hasGama_) {
+        if constexpr (loadBf16State) {
+            ComputeRecurrentGatedDeltaRuleVF<stateType, outType, true, false, writeUpdatedScratch, true>(
+                stateAddr, keyAddr, queryAddr, valueAddr, gamaKAddr, stateOutAddr, attnOutAddr,
+                attnTmpAddr, static_cast<uint16_t>(curSingleV), static_cast<uint16_t>(alignK_),
+                gama_, beta_, initialState);
+        } else if (hasGama_) {
             if (hasGamaK_) {
                 ComputeRecurrentGatedDeltaRuleVF<stateType, outType, true, true, writeUpdatedScratch>(
                     stateAddr, keyAddr, queryAddr, valueAddr, gamaKAddr, stateOutAddr, attnOutAddr,
                     attnTmpAddr, static_cast<uint16_t>(curSingleV), static_cast<uint16_t>(alignK_),
-                    gama_, beta_);
+                    gama_, beta_, nullptr);
             } else {
                 ComputeRecurrentGatedDeltaRuleVF<stateType, outType, true, false, writeUpdatedScratch>(
                     stateAddr, keyAddr, queryAddr, valueAddr, gamaKAddr, stateOutAddr, attnOutAddr,
                     attnTmpAddr, static_cast<uint16_t>(curSingleV), static_cast<uint16_t>(alignK_),
-                    gama_, beta_);
+                    gama_, beta_, nullptr);
             }
         } else if (hasGamaK_) {
             ComputeRecurrentGatedDeltaRuleVF<stateType, outType, false, true, writeUpdatedScratch>(
                 stateAddr, keyAddr, queryAddr, valueAddr, gamaKAddr, stateOutAddr, attnOutAddr,
                 attnTmpAddr, static_cast<uint16_t>(curSingleV), static_cast<uint16_t>(alignK_),
-                gama_, beta_);
+                gama_, beta_, nullptr);
         } else {
             ComputeRecurrentGatedDeltaRuleVF<stateType, outType, false, false, writeUpdatedScratch>(
                 stateAddr, keyAddr, queryAddr, valueAddr, gamaKAddr, stateOutAddr, attnOutAddr,
                 attnTmpAddr, static_cast<uint16_t>(curSingleV), static_cast<uint16_t>(alignK_),
-                gama_, beta_);
+                gama_, beta_, nullptr);
         }
         stateOutQueue_.EnQue<stateType>(stateOutLocal);
         attnOutQueue_.EnQue<outType>(attnOutLocal);
@@ -585,13 +601,34 @@ private:
             }
             return;
         }
+        if constexpr (std::is_same<stateType, bfloat16_t>::value) {
+            if (B_ == 1 && T_ == 1 && seq1 - seq0 == 1 && NV_ > 1 && hasGama_ && !hasGamaK_ &&
+                !hasAcceptedTokens_ && vStep_ == realV_) {
+                ProcessHeadTiles<true>(seq0, seq1, head_i, stateOffset);
+                return;
+            }
+        }
+        ProcessHeadTiles<false>(seq0, seq1, head_i, stateOffset);
+        if (hasGamaK_) {
+            gamaKInQueue_.FreeTensor(gamaKInUb);
+        }
+    }
+
+    template <bool loadBf16State>
+    __aicore__ inline void ProcessHeadTiles(int32_t seq0, int32_t seq1, uint64_t head_i, uint64_t stateOffset)
+    {
         uint64_t nextVOffset = 0;
         uint32_t nextSingleV = realV_ > vStep_ ? vStep_ : realV_;
         uint64_t nextStateOffset = stateStride0_ * stateOffset + stateStride1_ * head_i;
         PrefetchState(nextStateOffset, nextSingleV);
         for (uint64_t v_i = 0; v_i < realV_; v_i += vStep_) {
             uint32_t curSingleV = v_i + vStep_ > realV_ ? realV_ - v_i : vStep_;
-            LoadPrefetchedState(curSingleV);
+            LocalTensor<stateType> initialState;
+            if constexpr (loadBf16State) {
+                initialState = stateInQueue_.DeQue<stateType>();
+            } else {
+                LoadPrefetchedState(curSingleV);
+            }
             nextVOffset = v_i + vStep_;
             if (nextVOffset < realV_) {
                 nextSingleV = nextVOffset + vStep_ > realV_ ? realV_ - nextVOffset : vStep_;
@@ -613,7 +650,13 @@ private:
                 gama_ = hasGama_ ? gamaInUb.GetValue(gbOffset) : 1;
                 beta_ = betaInUb.GetValue(gbOffset);
                 // Only a following token in this V tile consumes the updated scratch.
-                if (seq_i + 1 < static_cast<uint64_t>(seq1)) {
+                if constexpr (loadBf16State) {
+                    __ubuf__ stateType *initialStateAddr =
+                        reinterpret_cast<__ubuf__ stateType *>(initialState.GetPhyAddr());
+                    Compute<false, true>(curSingleV, curQKOffset, curVOffset, initialStateAddr);
+                    // The VF is now the last consumer of this input slot.
+                    stateInQueue_.FreeTensor(initialState);
+                } else if (seq_i + 1 < static_cast<uint64_t>(seq1)) {
                     Compute<true>(curSingleV, curQKOffset, curVOffset);
                 } else {
                     Compute<false>(curSingleV, curQKOffset, curVOffset);
@@ -643,9 +686,6 @@ private:
             if (hasPendingState) {
                 CopyOutState(pendingStateOffset, curSingleV);
             }
-        }
-        if (hasGamaK_) {
-            gamaKInQueue_.FreeTensor(gamaKInUb);
         }
     }
 
