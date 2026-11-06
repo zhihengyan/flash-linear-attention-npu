@@ -100,7 +100,7 @@ PMU 可能多次重放以取得不同计数器；不要用其时延替代第 2 �
 
 | 文件 | 字段 | 本轮用途 |
 |---|---|---|
-| OpBasicInfo | `Task Duration(us)`、`Block Dim`、`Device ID`、`Current Freq` | 总时延、实际核数、设备与频率 |
+| OpBasicInfo | `Task Duration(us)`、`Block Dim`、`Device ID`、`Current Freq` | 总时延、启动的任务块数、设备与频率 |
 | PipeUtilization | `block_id`、`sub_block_id`、`aiv_time(us)`、`aiv_total_cycles` | 找最慢核及核间差异 |
 | PipeUtilization | `aiv_scalar_time(us)`、`aiv_scalar_ratio` | 判断元数据读取、head 扫描和控制是否值得继续查 |
 | PipeUtilization | `aiv_vec_time(us)`、`aiv_vec_ratio` | 判断 Vector 计算、Cast、归约是否占据主要活动时间 |

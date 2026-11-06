@@ -286,7 +286,7 @@ MSS case 1 源自精度 case 173，使用 Hk=128、Hv=256，在 blockDim<256 且
 | fc3532a6 | 6.4192 | 相对 0d188aca 降 1.34%，相对 a6d33dbb 降 3.09% |
 
 Cast 融合增加了 0.0870 µs 的节省，累计节省 0.2048 µs，达到 case 1 的 3% 性能目标。
-本轮回传为性能汇总，fc3532a6 的独立精度、MSS、确定性及分轮分布待记录。
+用户随后确认 fc3532a6 精度测试通过。精度用例范围、MSS、确定性及性能分轮分布待记录。
 相对 fc3532a6 再降 1% 需要净节省 0.0642 µs，均值降到 6.3550 µs。
 
 | 方向 | 依据与判断 |
@@ -301,6 +301,27 @@ Cast 融合增加了 0.0870 µs 的节省，累计节省 0.2048 µs，达到 cas
 
 建议保留当前方案并结束本轮性能迭代。若后续需要继续压低该用例的时延，先在当前产物上区分 TPipe/UB 初始化和
 元数据准备，确认最慢核可净回收的时间超过 0.0642 µs，再考虑实现静态 UB 路径。
+
+## case 1 的 AIV 分配
+
+RGDR 使用 AIV-only，启动的 block 数为 min(B×Hv, GetCoreNumAiv())。Hk=16 决定两个 value head 共享一组
+Q/K，分核工作量仍按 Hv=32 计算。此前 Ascend950DT_9582 的 20 次调用中，PipeUtilization 每次均有
+32 个不同 block_id，且全部有 Vector 活动。八轮复测的时延汇总未提供 Block Dim，需用该次 OpBasicInfo 核实。
+
+| 可用 AIV | case 1 的 Block Dim | 按当前连续区间实际处理 head 的 block |
+| --- | ---: | --- |
+| 至少 32 | 32 | 32 个各处理一个 head |
+| 28 | 28 | ceil(32/28)=2，前 16 个各处理两个 head，后 12 个没有 head |
+
+28 AIV 时，按余数均分整 head 可让 4 核各处理两个、24 核各处理一个，最重核仍需处理两份完整 state。
+若要进一步缩短最重核的工作量，可以给每个核分一个完整 head，把剩余 4 个 head 各拆成四份 32 行交给 16 个核。
+每份拥有独立的 state 和 attention 写区间，并在本核完成完整 K=128 的归约。最重核处理的 V 行可从
+256 降到 160，代价是额外的 Q/K 准备、较多的搬运和队列操作。该数字是静态工作量比较，实际时延待设备验证。
+Block Dim=32 时，每核已有一个完整 head，在同样 32 个 AIV 上继续切 V 缺少上述负载均衡空间。
+
+14 个 AIC 若可用，也需要 Cube/Vector 混合路径才能参与。单 head 的 state-key 和 state-query 是窄矩阵向量积，
+gate、rank-one 更新及输出转换仍需 Vector。Cube 路径的布局准备与跨单元同步是 case 1 的额外成本，优先级低于
+28 AIV 设备上的 V 行分配。设备可用 Vector 核数以 [GetCoreNumAiv](https://www.hiascend.com/document/detail/en/CANNCommunityEdition/910/API/ascendcopapi/docs/en/api/Utils-API/platform_info/PlatformAscendC/GetCoreNumAiv.md) 为准。
 
 ## 内网执行
 
