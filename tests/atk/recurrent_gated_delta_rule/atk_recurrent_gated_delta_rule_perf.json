@@ -276,7 +276,7 @@
         "required": true,
         "dtype": "string",
         "shape": null,
-        "range_values": "{\"B\":1,\"HK\":16,\"HV\":32,\"K\":128,\"T\":1,\"V\":128,\"block_num\":1,\"case_id\":1,\"data_profile\":\"random\",\"design_id\":\"RGDR-PERF001\",\"design_routes\":\"P\",\"dtype\":\"bf16\",\"gate_mode\":\"g\",\"input_layout\":\"contiguous\",\"name\":\"decode_hk16_hv32_g_bf16_state\",\"op\":\"recurrent_gated_delta_rule\",\"platform_focus\":\"all\",\"route\":\"ascendc\",\"scale\":0.08838834764831843,\"seed\":20260826,\"seq_lengths\":[1],\"soc\":\"all\",\"state_dtype\":\"bf16\",\"state_indices\":[0],\"state_layout\":\"contiguous\",\"tags\":\"performance,synthetic,decode\"}",
+        "range_values": "{\"B\":1,\"HK\":16,\"HV\":48,\"K\":128,\"T\":1,\"V\":128,\"block_num\":1,\"case_id\":1,\"data_profile\":\"random\",\"design_id\":\"RGDR-PERF001\",\"design_routes\":\"P\",\"dtype\":\"bf16\",\"gate_mode\":\"g\",\"input_layout\":\"contiguous\",\"name\":\"decode_hk16_hv48_g_bf16_state\",\"op\":\"recurrent_gated_delta_rule\",\"platform_focus\":\"all\",\"route\":\"ascendc\",\"scale\":0.08838834764831843,\"seed\":20260826,\"seq_lengths\":[1],\"soc\":\"all\",\"state_dtype\":\"bf16\",\"state_indices\":[0],\"state_layout\":\"contiguous\",\"tags\":\"performance,synthetic,decode\"}",
         "backward": false
       },
       {
@@ -357,7 +357,7 @@
         "required": true,
         "dtype": "int",
         "shape": null,
-        "range_values": 32,
+        "range_values": 48,
         "backward": false
       },
       {

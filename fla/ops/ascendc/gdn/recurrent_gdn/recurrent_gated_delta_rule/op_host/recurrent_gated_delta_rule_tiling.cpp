@@ -125,11 +125,10 @@ ge::graphStatus RecurrentGatedDeltaRuleTiling::DoLibApiTiling()
     const bool isA5 = platformInfo != nullptr &&
         platform_ascendc::PlatformAscendC(platformInfo).GetSocVersion() == platform_ascendc::SocVersion::ASCEND950;
     const bool singleWork = CanUseA5SingleWork(tilingData_, isA5, stateDtype == ge::DT_BF16);
-    const bool staticUb = CanUseA5StaticUb(tilingData_, isA5, stateDtype == ge::DT_BF16);
-    tilingKey_ = GET_TPL_TILING_KEY(stateDtypeKey, singleWork, staticUb);
-    OP_LOGD(context_->GetNodeName(), "stateDtypeKey=[%llu], singleWork=[%u], staticUb=[%u], tilingKey=[%llu]",
+    tilingKey_ = GET_TPL_TILING_KEY(stateDtypeKey, singleWork);
+    OP_LOGD(context_->GetNodeName(), "stateDtypeKey=[%llu], singleWork=[%u], tilingKey=[%llu]",
             static_cast<unsigned long long>(stateDtypeKey), static_cast<uint32_t>(singleWork),
-            static_cast<uint32_t>(staticUb), static_cast<unsigned long long>(tilingKey_));
+            static_cast<unsigned long long>(tilingKey_));
     return ge::GRAPH_SUCCESS;
 };
 

@@ -49,7 +49,7 @@ class MsprofEvidenceTest(unittest.TestCase):
         stream = SimpleNamespace(npu_stream=17, synchronize=lambda: events.append(("sync",)))
 
         def build(spec, device):
-            self.assertEqual((spec["HK"], spec["HV"]), (16, 32))
+            self.assertEqual((spec["HK"], spec["HV"]), (16, 48))
             events.append(("build",))
             return inputs
 
@@ -94,7 +94,10 @@ class MsprofEvidenceTest(unittest.TestCase):
         path = ROOT / bench.OP_REL / bench.CASE_FILE
         original = path.read_bytes()
         spec = bench.load_case(ROOT, 1)
-        self.assertEqual((spec["B"], spec["T"], spec["HK"], spec["HV"]), (1, 1, 16, 32))
+        self.assertEqual((spec["B"], spec["T"], spec["HK"], spec["HV"]), (1, 1, 16, 48))
+        case = next(case for case in json.loads(original) if case["id"] == 1)
+        attrs = {item["name"]: item["range_values"] for item in case["inputs"]}
+        self.assertEqual((attrs["HK"], attrs["HV"]), (spec["HK"], spec["HV"]))
         self.assertEqual(spec["state_dtype"], "bf16")
         run = subprocess.run([sys.executable, "-I", str(Path(bench.__file__).resolve()), "--dry-run"],
                              capture_output=True, text=True)
@@ -107,7 +110,7 @@ class MsprofEvidenceTest(unittest.TestCase):
 
     def test_case_loader_rejects_shape_and_metadata_drift(self):
         cases = json.loads((ROOT / bench.OP_REL / bench.CASE_FILE).read_text(encoding="utf-8"))
-        for key, value in (("HV", 16), ("seq_lengths", [0]), ("state_indices", [1]),
+        for key, value in (("HV", 32), ("seq_lengths", [0]), ("state_indices", [1]),
                            ("accepted_tokens", [1]), ("state_dtype", "fp32")):
             with self.subTest(key=key), tempfile.TemporaryDirectory() as temp:
                 case = json.loads(json.dumps(cases[1]))

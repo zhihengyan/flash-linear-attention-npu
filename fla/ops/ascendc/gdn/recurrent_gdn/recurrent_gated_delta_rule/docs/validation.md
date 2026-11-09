@@ -273,72 +273,7 @@ MSS case 1 源自精度 case 173，使用 Hk=128、Hv=256，在 blockDim<256 且
 
 本机离线脚本 22 项，21 项通过，1 项因缺少 C++17 编译器跳过。算子 review 的 issue 规则覆盖检查通过，
 静态扫描仍报告原有 host/API 的 42 条 DFX 错误和算子 README 的 1 条文档提示。
-本机缺少 CANN/NPU。交付时的 1.8%–1.9% 数据对应 0d188aca，Cast 融合的设备性能见下一节。
-
-## case 1 八轮交替结果与后续判断
-
-用户回传三版八轮交替测试，剔除最好和最坏表现后的均值如下。降幅按所列对照的 Task Duration 计算。
-
-| 版本 | 均值（µs） | 相对对照的降幅 |
-| --- | ---: | --- |
-| a6d33dbb | 6.6240 | 本轮基线 |
-| 0d188aca | 6.5062 | 相对 a6d33dbb 降 1.78% |
-| fc3532a6 | 6.4192 | 相对 0d188aca 降 1.34%，相对 a6d33dbb 降 3.09% |
-
-Cast 融合增加了 0.0870 µs 的节省，累计节省 0.2048 µs，达到 case 1 的 3% 性能目标。
-用户随后确认 fc3532a6 精度测试通过。精度用例范围、MSS、确定性及性能分轮分布待记录。
-相对 fc3532a6 再降 1% 需要净节省 0.0642 µs，均值降到 6.3550 µs。
-
-| 方向 | 依据与判断 |
-| --- | --- |
-| 静态 UB 布局 | case 1 仍创建 TPipe，每核走 9 次 InitBuffer。固定单 token、单 V 分片且每核一个 head 时，可以为输入、两遍 VF scratch 和输出预置 UB 地址，省去动态队列初始化。理论量级有机会越过 0.0642 µs，当前缺少拆分后的初始化成本和替换同步开销，优先保留为有条件的候选。 |
-| 提前 state 搬入 | 当前源码在 QKV 准备后发起 state 搬入。旧基线一条可分辨轨道上，后段 MTE2 已与前段 Vector 重叠约 0.424 µs，两段相邻 MTE2 之间仅约 0.072 µs。保持前一段搬运和发射顺序时，可提前量至多约为该间隙。采样无源码标签，另外三条轨道未分开显示对应搬运，fc3532a6 未采同口径流水。 |
-| state 搬运粒度、两遍 VF 再融合与 Scalar 微调 | state 必须从 GM 读写 BF16 各 32 KiB/head，现有每方向已是一条多块搬运调用。改成单连续块的时间差待生成指令和设备证据。逐行合并 VF 在旧单头实验回退，元数据复用在多头对照未见收益。暂不据此开启新一轮编码。 |
-
-静态 UB 方案需要重新验证 MTE2→Vector、Vector→MTE3 及 slot 生命周期。CANN 手册提供通用开销的量级，
-本算子是否省出 1% 取决于当前最慢任务块上暴露的初始化时间与替换开销。
-[CANN 静态 Tensor 编程说明](https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/910/programug/Ascendcopdevg/docs/guide/%E7%BC%96%E7%A8%8B%E6%8C%87%E5%8D%97/%E7%BC%96%E8%AF%91%E4%B8%8E%E8%BF%90%E8%A1%8C/%E7%BC%96%E8%AF%91/%E7%BA%A6%E6%9D%9F%E8%AF%B4%E6%98%8E.md)
-
-建议保留当前方案并结束本轮性能迭代。若后续需要继续压低该用例的时延，先在当前产物上区分 TPipe/UB 初始化和
-元数据准备，确认最慢核可净回收的时间超过 0.0642 µs，再考虑实现静态 UB 路径。
-
-## case 1 的 AIV 分配
-
-RGDR 使用 AIV-only，启动的 block 数为 min(B×Hv, GetCoreNumAiv())。Hk=16 决定两个 value head 共享一组
-Q/K，分核工作量仍按 Hv=32 计算。此前 Ascend950DT_9582 的 20 次调用中，PipeUtilization 每次均有
-32 个不同 block_id，且全部有 Vector 活动。八轮复测的时延汇总未提供 Block Dim，需用该次 OpBasicInfo 核实。
-
-| 可用 AIV | case 1 的 Block Dim | 按当前连续区间实际处理 head 的 block |
-| --- | ---: | --- |
-| 至少 32 | 32 | 32 个各处理一个 head |
-| 28 | 28 | ceil(32/28)=2，前 16 个各处理两个 head，后 12 个没有 head |
-
-28 AIV 时，按余数均分整 head 可让 4 核各处理两个、24 核各处理一个，最重核仍需处理两份完整 state。
-若要进一步缩短最重核的工作量，可以给每个核分一个完整 head，把剩余 4 个 head 各拆成四份 32 行交给 16 个核。
-每份拥有独立的 state 和 attention 写区间，并在本核完成完整 K=128 的归约。最重核处理的 V 行可从
-256 降到 160，代价是额外的 Q/K 准备、较多的搬运和队列操作。该数字是静态工作量比较，实际时延待设备验证。
-Block Dim=32 时，每核已有一个完整 head，在同样 32 个 AIV 上继续切 V 缺少上述负载均衡空间。
-
-14 个 AIC 若可用，也需要 Cube/Vector 混合路径才能参与。单 head 的 state-key 和 state-query 是窄矩阵向量积，
-gate、rank-one 更新及输出转换仍需 Vector。Cube 路径的布局准备与跨单元同步是 case 1 的额外成本，优先级低于
-28 AIV 设备上的 V 行分配。设备可用 Vector 核数以 [GetCoreNumAiv](https://www.hiascend.com/document/detail/en/CANNCommunityEdition/910/API/ascendcopapi/docs/en/api/Utils-API/platform_info/PlatformAscendC/GetCoreNumAiv.md) 为准。
-
-## A5 case 1 静态 UB 实验
-
-直接对照为 fc3532a6，累计对照为 a6d33dbb。启动窗口证据来自诊断分支的 862e7beb。
-case 1 使用原性能 JSON 和 CPU 标杆。目标为在同卡上净省约 0.10 µs，至少验证是否超过 0.0642 µs。
-沿用 CHUNK_DEPENDENT/V1（a14961e9dfe8c8264768d67fb447101873da4ecf）的状态与 ready/free 核对方法，
-本路径各核只处理一个 head，没有跨核中转和槽复用。
-
-先核对 tiling 日志的 staticUb=1、Block Dim=32 和 vStep=128，再验证 case 1 的 out、原地 state 和内存时序。
-原单 head、BF16/FP32 通用路径以及 gk、accepted-token、多 token、非连续 state 的回退继续跑原精度回归。
-性能沿用 [case 1 的 BasicInfo 命令](head-range-experiment.md#5-设备验证和采样)，
-同卡交替比较无打点候选和 fc3532a6。首个候选将静态槽、固定调度和替代同步一起验证。
-
-MSS case 2 沿用性能 case 1。设备侧核对实际编译产物和 tiling 选择后，按
-[ATK 执行步骤](../../../../../../../tests/atk/recurrent_gated_delta_rule/README.md#a5-case-1-静态-ub)
-检查内存时序和确定性。本地 RGDR 脚本测试通过 25 项，另 1 项因缺少 C++17 编译器跳过。
-源级检视覆盖新槽位的边界、读写顺序以及回退模板。CANN 编译、实机命中、精度、MSS 和性能结果待设备验证。
+本机缺少 CANN/NPU，待验证 CANN 构建、精度、MSS 和性能。现有 1.8%–1.9% 数据对应 0d188aca。
 
 ## 内网执行
 

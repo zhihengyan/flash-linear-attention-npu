@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Direct RGDR calls for `msprof op`, or offline OpBasicInfo statistics.
 
-Defaults to ATK perf case 1 (Hk=16, Hv=32) and reuses its input builder.
+Defaults to ATK perf case 1 (Hk=16, Hv=48) and reuses its input builder.
 Case 0 remains available for the one-head baseline. This is a diagnostic, not
 ATK accuracy/performance acceptance. No torch imports in the offline path.
 """
@@ -52,7 +52,7 @@ def load_case(root, case_id):
     if len(values) != 1:
         raise ValueError("expected one original case_spec")
     spec = json.loads(values[0])
-    head_pairs = {0: (1, 1), 1: (16, 32)}
+    head_pairs = {0: (1, 1), 1: (16, 48)}
     if case_id not in head_pairs:
         raise ValueError("only the confirmed perf cases 0 and 1 are supported")
     hk, hv = head_pairs[case_id]

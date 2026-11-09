@@ -62,17 +62,17 @@ ATK DUT 统一通过 `fla_npu.ops.ascendc.recurrent_gated_delta_rule` 执行。`
 
 ## 性能用例
 
-`atk_recurrent_gated_delta_rule_perf.json` 保留最小用例，并新增一条 `Hk=16、Hv=32` 的单 token
+`atk_recurrent_gated_delta_rule_perf.json` 保留最小用例，case 1 按用户确认的现网头数使用 `Hk=16、Hv=48` 的单 token
 decode 用例。两条均使用 `K=V=128`、BF16 state、g-only、连续布局，不提供 accepted-token 输入。
 
 | 性能 Case ID | 详细设计 ID | B / T | Hk / Hv | 来源与用途 |
 |---:|---|---|---|---|
 | 0 | RGDR-P001 | 1 / 1 | 1 / 1 | 原精度 case 0，保留最小开销对照 |
-| 1 | RGDR-PERF001 | 1 / 1 | 16 / 32 | 从 case 0 派生，仅改变输入头数，用于观察多头 decode 性能 |
+| 1 | RGDR-PERF001 | 1 / 1 | 16 / 48 | 从 case 0 派生，头数对齐用户确认的现网部署参数 |
 
-case 1 保留原用例的随机种子、输入生成方式、值域、状态索引和 gate 配置；同时更新用例编号、
-名称和性能标签。它是用户指定头数的合成性能用例，不是现有精度用例的直接平移，也不是现网
-抓取记录。原 200 条精度用例也可用于本轮回归。Cast 融合候选的 case 1 设备精度待验证。
+case 1 使用合成输入，沿用原用例的随机种子、输入生成方式、值域、状态索引和 gate 配置。
+内核恢复到 `fc3532a6`。此前约 3.09% 的时延降幅及已通过的 case 1 精度对应 `Hk=16、Hv=32`；
+当前 16/48 用例的设备精度和性能待验证。原 200 条精度用例也可用于本轮回归。
 原 single-work 模板仍要求 `Hk=Hv=1`。本分支把末 token scratch 省写推广到 A5 通用路径，
 因此 case 1 的所有 head 也可以省去最后一次 updated FP32 scratch 写入。
 
@@ -90,6 +90,8 @@ PERFORMANCE_START=1 PERFORMANCE_END=2 \
 [msprof_op_rgdr.py](scripts/msprof_op_rgdr.py) 基于
 `codex/gdn-a5-public-latency-diagnostic` 的同名脚本适配，默认 `--case-id=1`，
 直接读取本目录性能 JSON 并复用 executor 的 `build_inputs`。可用 `--case-id=0` 测最小用例。
+`load_case()` 也校验 case 1 的头数，已同步改为 `(16, 48)`。更改头数时需同时更新 JSON 的
+`case_spec`、外层 `HK/HV` 属性和脚本的 `head_pairs`。
 离线运行 `python scripts/msprof_op_rgdr.py --dry-run` 可核对输入配置，不加载 torch/NPU。
 
 先在 Linux A5 上构建、安装并核对目标 run 包。激活 ATK/PyTorch 环境并加载 CANN 后，在仓根执行：
@@ -136,22 +138,21 @@ PipeTimeline 可直接复用此 Python 脚本，无需改 kernel：`--calls 1` �
 
 ### 当前采用：A5 单 token head 遍历范围
 
-在 `0d188aca`，case 1 的源码级归属检查从 1024 次降至 32 次。用户回传该实现相对
+在 `0d188aca`，原 16/32 用例的源码级归属检查从 1024 次降至 32 次。用户回传该实现相对
 `a6d33dbb936cf40528942133428e371889b5e21a`，三组交替 A/B 性能收益约 1.9%，精度测试通过。
-本次为用户设备验证反馈，未附分轮统计或精度覆盖明细；性能结论限于本轮既定环境和 case 1。
+本次为用户设备验证反馈，未附分轮统计或精度覆盖明细；性能结论限于当时环境的 16/32 用例。
 构建安装、分支/精度回归和同环境 BasicInfo 步骤见
 [head 范围实验说明](../../../fla/ops/ascendc/gdn/recurrent_gdn/recurrent_gated_delta_rule/docs/head-range-experiment.md)。
 历史元数据实验结果见 [归档说明](../../../fla/ops/ascendc/gdn/recurrent_gdn/recurrent_gated_delta_rule/docs/metadata-reuse-experiment.md)。
 
 ### A5 初始 state Cast 融合的分支覆盖
 
-| 模板参数（D_T_STATE, SINGLE_WORK, STATIC_UB） | 路径 | 精度代表 | MSS 代表 | 设备选择证据 |
+| 模板参数（D_T_STATE, SINGLE_WORK） | 路径 | 精度代表 | MSS 代表 | 设备选择证据 |
 | --- | --- | --- | --- | --- |
-| BF16, 0, 1 | A5 case 1 的静态 UB 路径 | 性能 case 1 | MSS case 2 | 核对 staticUb=1、Block Dim=32、vStep=128 和有效长度 |
-| BF16, 0, 0 | 单序列单 token 多头，g-only，无 accepted-token，单 V 分片 | 精度 case 173 | MSS case 1 | 核对实际 vStep=128、有效长度及 BF16 直接读分支 |
-| BF16, 0, 0 | 原通用转换与递推 | 精度 case 2–5 | 专项可直接用精度 JSON | 核对多 token 或 gk 回退条件 |
-| FP32, 0, 0 | FP32 通用路径 | 精度 case 1 | 专项可直接用精度 JSON | 核对 FP32 模板 |
-| BF16, 1, 0 | 原 A5 单 work | 精度 case 0 | MSS case 0 | 核对 SINGLE_WORK=1 |
+| BF16, 0 | 单序列单 token 多头，g-only，无 accepted-token，单 V 分片 | 性能 case 1、精度 case 173 | MSS case 1 | 核对实际 vStep=128、有效长度及 BF16 直接读分支 |
+| BF16, 0 | 原通用转换与递推 | 精度 case 2–5 | 专项可直接用精度 JSON | 核对多 token 或 gk 回退条件 |
+| FP32, 0 | FP32 通用路径 | 精度 case 1 | 专项可直接用精度 JSON | 核对 FP32 模板 |
+| BF16, 1 | 原 A5 单 work | 精度 case 0 | MSS case 0 | 核对 SINGLE_WORK=1 |
 
 新增 MSS case 1 沿用精度 case 173 的 Hk=128、Hv=256。确认 blockDim<256 且 vStep=128 后，
 检查同一核连续处理多个 head 时输入 slot 的复用。以下命令从仓库根目录执行。
@@ -162,22 +163,6 @@ MSS_START=1 MSS_END=2 bash tests/atk/run_test_cpu.sh \
 DETERMINISM_START=1 DETERMINISM_END=2 bash tests/atk/run_test_cpu.sh \
   -op=recurrent_gated_delta_rule -soc=ascend950 -npu_device_id=0 -scope=determinism
 ```
-
-### A5 case 1 静态 UB
-
-使用同设备比较静态 UB 候选和 `fc3532a6`。两版均以正常参数编译单算子并安装各自 run 包。
-核对安装的目标 `.o` 和采集 dump 的哈希，确认候选实际命中 `staticUb=1`。
-使用上面的性能 case 1 精度命令校验 out 和原地 state，再检查内存和确定性。
-
-```bash
-MSS_START=2 MSS_END=3 bash tests/atk/run_test_cpu.sh \
-  -op=recurrent_gated_delta_rule -soc=ascend950 -npu_device_id=0 -scope=mssanitizer
-DETERMINISM_START=2 DETERMINISM_END=3 bash tests/atk/run_test_cpu.sh \
-  -op=recurrent_gated_delta_rule -soc=ascend950 -npu_device_id=0 -scope=determinism
-```
-
-精度通过后用前文的 BasicInfo 步骤交替测量。首轮目标为相对 `fc3532a6` 净省约 0.10 µs，
-并核对原有回退用例。
 
 ```bash
 bash tests/atk/run_test_cpu.sh -op=recurrent_gated_delta_rule -npu_device_id=0

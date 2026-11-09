@@ -1,8 +1,8 @@
 # A5 decode：PipeUtilization、MemoryUB 采集方法
 
 当前采集分支为 `codex/gdn-a5-tail-pmu-profile`，保留 prefill K32 和末 token scratch 省写。
-当前轮以内核同 93f5c70a 的 a6d33dbb 为基线实验 [head 遍历范围](head-range-experiment.md)，
-case 1 仍使用原通用计算流程和原 head 归属。每轮按源码提交与安装对象哈希区分版本。
+内核恢复到 fc3532a6，包含 [head 遍历范围](head-range-experiment.md) 和初始 BF16 state Cast 融合。
+case 1 按用户确认的现网头数改为 Hk=16、Hv=48。每轮按源码提交与安装对象哈希区分版本。
 后续多头直接分发实验留在 `codex/gdn-a5-multihead-tail-scratch`，本分支没有该调度。
 
 本轮先回答两个问题：主要时间花在 Scalar、Vector 还是 GM 搬运；省掉的 UB Store 是否影响关键路径。
@@ -10,12 +10,13 @@ case 1 仍使用原通用计算流程和原 head 归属。每轮按源码提交�
 
 ## 1. 固定输入和环境
 
-使用现有 `tests/atk/recurrent_gated_delta_rule/scripts/msprof_op_rgdr.py`，不用修改 Python：
+使用本分支的 `tests/atk/recurrent_gated_delta_rule/scripts/msprof_op_rgdr.py`，其头数校验已与性能 JSON 同步。
+下表为当前配置，文中的历史回传结果对应 16/32 用例，16/48 的精度和性能需重新采集。
 
 | 参数 | 固定值 |
 |---|---|
 | 性能用例 | `_perf.json` case 1 |
-| B / T / Hk / Hv | 1 / 1 / 16 / 32 |
+| B / T / Hk / Hv | 1 / 1 / 16 / 48 |
 | K / V | 128 / 128 |
 | state / gate | BF16 / g-only |
 | 布局、序列、state index | 连续、单个有效 token、index=0 |
@@ -100,7 +101,7 @@ PMU 可能多次重放以取得不同计数器；不要用其时延替代第 2 �
 
 | 文件 | 字段 | 本轮用途 |
 |---|---|---|
-| OpBasicInfo | `Task Duration(us)`、`Block Dim`、`Device ID`、`Current Freq` | 总时延、启动的任务块数、设备与频率 |
+| OpBasicInfo | `Task Duration(us)`、`Block Dim`、`Device ID`、`Current Freq` | 总时延、实际核数、设备与频率 |
 | PipeUtilization | `block_id`、`sub_block_id`、`aiv_time(us)`、`aiv_total_cycles` | 找最慢核及核间差异 |
 | PipeUtilization | `aiv_scalar_time(us)`、`aiv_scalar_ratio` | 判断元数据读取、head 扫描和控制是否值得继续查 |
 | PipeUtilization | `aiv_vec_time(us)`、`aiv_vec_ratio` | 判断 Vector 计算、Cast、归约是否占据主要活动时间 |

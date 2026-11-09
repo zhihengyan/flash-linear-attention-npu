@@ -12,7 +12,7 @@
  * \brief
  */
 #if defined(__CCE_AICORE__) && __CCE_AICORE__ == 310
-#include "arch35/recurrent_gated_delta_rule_static_ub.h"
+#include "arch35/recurrent_gated_delta_rule.h"
 #else
 #include "recurrent_gated_delta_rule.h"
 #endif
@@ -41,7 +41,7 @@ struct RGDRDTypeTraits<RGDR_TPL_FP32> {
 } // namespace RecurrentGatedDeltaRule
 
 #ifndef TORCH_MODE
-template <int D_T_STATE, bool SINGLE_WORK, bool STATIC_UB>
+template <int D_T_STATE, bool SINGLE_WORK>
 __global__ __aicore__ void
 recurrent_gated_delta_rule(GM_ADDR query, GM_ADDR key, GM_ADDR value, GM_ADDR beta, GM_ADDR state, GM_ADDR cuSeqlens,
                            GM_ADDR ssmStateIndices, GM_ADDR g, GM_ADDR gk, GM_ADDR numAcceptedTokens, GM_ADDR out,
@@ -50,26 +50,16 @@ recurrent_gated_delta_rule(GM_ADDR query, GM_ADDR key, GM_ADDR value, GM_ADDR be
     REGISTER_TILING_DEFAULT(RecurrentGatedDeltaRuleTilingData);
     GET_TILING_DATA(tilingData, tilingGM);
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
+    TPipe pipe;
+    using StateType = typename RGDRDTypeTraits<D_T_STATE>::type;
 #if defined(__CCE_AICORE__) && __CCE_AICORE__ == 310
-    if constexpr (STATIC_UB) {
-        static_assert(D_T_STATE == RGDR_TPL_BF16 && !SINGLE_WORK, "static UB requires the BF16 multihead path");
-        RGDRInitParams initParams{query, key, value, g, gk, beta, state, cuSeqlens,
-                                  ssmStateIndices, numAcceptedTokens, out, stateOut};
-        ProcessStaticUb(initParams, tilingData);
-    } else
-#endif
-    {
-        TPipe pipe;
-        using StateType = typename RGDRDTypeTraits<D_T_STATE>::type;
-#if defined(__CCE_AICORE__) && __CCE_AICORE__ == 310
-        RGDR<bfloat16_t, bfloat16_t, StateType, SINGLE_WORK> op(&tilingData);
+    RGDR<bfloat16_t, bfloat16_t, StateType, SINGLE_WORK> op(&tilingData);
 #else
-        RGDR<bfloat16_t, bfloat16_t, StateType> op(&tilingData);
+    RGDR<bfloat16_t, bfloat16_t, StateType> op(&tilingData);
 #endif
-        RGDRInitParams initParams{query, key, value, g, gk, beta, state, cuSeqlens,
-                                  ssmStateIndices, numAcceptedTokens, out, stateOut};
-        op.Init(initParams, &pipe);
-        op.Process();
-    }
+    RGDRInitParams initParams{query, key, value, g, gk, beta, state, cuSeqlens,
+                              ssmStateIndices, numAcceptedTokens, out, stateOut};
+    op.Init(initParams, &pipe);
+    op.Process();
 }
 #endif

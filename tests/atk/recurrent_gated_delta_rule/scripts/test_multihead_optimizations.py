@@ -5,13 +5,11 @@ import re
 import shutil
 import subprocess
 import tempfile
-from types import SimpleNamespace
 import unittest
 
 ROOT = Path(__file__).resolve().parents[4]
 OP = ROOT / "fla/ops/ascendc/gdn/recurrent_gdn/recurrent_gated_delta_rule"
 KERNEL = OP / "op_kernel/arch35/recurrent_gated_delta_rule.h"
-STATIC_KERNEL = OP / "op_kernel/arch35/recurrent_gated_delta_rule_static_ub.h"
 BASE = "f918240b"
 
 
@@ -116,7 +114,10 @@ class MultiheadSourceTest(unittest.TestCase):
                 self.assertEqual(body(source, name), body(old, name))
         for relative in ("op_host/op_api/aclnn_recurrent_gated_delta_rule.h",
                          "op_host/op_api/aclnn_recurrent_gated_delta_rule.cpp",
+                         "op_host/recurrent_gated_delta_rule_tiling.cpp",
                          "op_host/recurrent_gated_delta_rule_def.cpp",
+                         "op_kernel/recurrent_gated_delta_rule_struct.h",
+                         "op_kernel/recurrent_gated_delta_rule.cpp",
                          "op_kernel/recurrent_gated_delta_rule.h"):
             path = OP / relative
             with self.subTest(path=relative):
@@ -149,100 +150,6 @@ class MultiheadSourceTest(unittest.TestCase):
                     "initialState.GetPhyAddr()", "Compute<false, true>", "stateInQueue_.FreeTensor(initialState)")
         positions = [tiles.index(operation) for operation in lifetime]
         self.assertEqual(positions, sorted(positions))
-
-
-class StaticUbTest(unittest.TestCase):
-    def setUp(self):
-        self.struct = OP / "op_kernel/recurrent_gated_delta_rule_struct.h"
-        self.source = self.struct.read_text(encoding="utf-8")
-        self.layout = {}
-        for name, expr in re.findall(r"static constexpr uint32_t (\w+) = ([^;]+);", self.source):
-            expr = expr.replace("sizeof(uint16_t)", "2").replace("sizeof(float)", "4")
-            self.layout[name] = eval(expr, {"__builtins__": {}}, self.layout)
-
-    def test_static_layout_matches_tensor_extents_and_alignment(self):
-        expected = {
-            "STATE_IN": 32768, "STATE_SCRATCH": 65536, "STATE_OUT": 32768,
-            "Q_IN": 256, "K_IN": 256, "V_IN": 256,
-            "Q_FP32": 512, "K_FP32": 512, "V_FP32": 512,
-            "ATTN_TMP": 512, "ATTN_OUT": 256,
-            "BETA_IN": 256, "GATE_IN": 256, "BETA_FP32": 256, "GATE_FP32": 256,
-        }
-        local_tensors = re.findall(r"LocalTensor<(float|bfloat16_t)> \w+\(TPosition::\w+, L::(\w+), ([^;]+)\);",
-                                   STATIC_KERNEL.read_text(encoding="utf-8"))
-        extents = {}
-        for dtype, name, expr in local_tensors:
-            expr = expr.replace("L::", "").replace("sizeof(bfloat16_t)", "2").replace("sizeof(float)", "4")
-            extents[name] = eval(expr.replace("/", "//"), {"__builtins__": {}}, self.layout) * (
-                2 if dtype == "bfloat16_t" else 4)
-        self.assertEqual(extents, expected)
-        end = 0
-        for name, size in expected.items():
-            start = self.layout[name]
-            self.assertEqual(start, end, name)
-            self.assertEqual(start % 256, 0, name)
-            end = start + size
-        self.assertEqual(self.layout["BYTES"], end)
-        self.assertEqual(end, 132 * 1024)
-
-    def test_only_the_valid_one_head_per_core_configuration_is_eligible(self):
-        expr = re.search(r"return ([^;]+);", body(self.source, "CanUseA5StaticUb")).group(1)
-        expr = expr.replace("L::", "layout.").replace("&&", "and").replace("\n", " ")
-        select = compile(expr, "<production static UB predicate>", "eval")
-        valid = dict(b=1, t=1, nk=16, nv=32, vectorCoreNum=32, dk=128, dv=128, vStep=128,
-                     stateStride0=32 * 128 * 128, stateStride1=128 * 128, stateStride2=128,
-                     hasGama=1, hasGamaK=0, hasAcceptedTokens=0, ubCalSize=132 * 1024)
-
-        def eligible(shape, a5=True, bf16=True):
-            return eval(select, {"__builtins__": {}}, dict(
-                t=SimpleNamespace(**shape), layout=SimpleNamespace(**self.layout), isA5=a5, isBf16State=bf16))
-
-        self.assertTrue(eligible(valid))
-        self.assertFalse(eligible(valid, a5=False))
-        self.assertFalse(eligible(valid, bf16=False))
-        for field, value in dict(b=2, t=2, nk=8, nv=16, vectorCoreNum=28, dk=64, dv=64, vStep=64,
-                                 stateStride0=33 * 128 * 128, stateStride1=129 * 128, stateStride2=144,
-                                 hasGama=0, hasGamaK=1, hasAcceptedTokens=1,
-                                 ubCalSize=132 * 1024 - 1).items():
-            with self.subTest(field=field):
-                self.assertFalse(eligible({**valid, field: value}))
-
-    def test_tiling_data_and_general_kernel_are_unchanged(self):
-        old = baseline(self.struct, "fc3532a6")
-        packed = re.compile(r"#pragma pack\(push, 8\).*?#pragma pack\(pop\)", re.S)
-        self.assertEqual(packed.search(self.source).group(), packed.search(old).group())
-        self.assertEqual(KERNEL.read_text(encoding="utf-8"), baseline(KERNEL, "fc3532a6"))
-        selections = re.findall(r"ASCENDC_TPL_DTYPE_SEL\(D_T_STATE, RGDR_TPL_(BF16|FP32)\),\s*"
-                                r"ASCENDC_TPL_BOOL_SEL\(SINGLE_WORK, (\d)\),\s*"
-                                r"ASCENDC_TPL_BOOL_SEL\(STATIC_UB, (\d)\)", self.source)
-        self.assertCountEqual(selections, [("BF16", "0", "0"), ("FP32", "0", "0"),
-                                           ("BF16", "1", "0"), ("BF16", "0", "1")])
-        host = OP / "op_host/recurrent_gated_delta_rule_tiling.cpp"
-        old_host = baseline(host, "fc3532a6")
-        new_host = host.read_text(encoding="utf-8")
-        self.assertEqual(new_host.replace(body(new_host, "DoLibApiTiling"), body(old_host, "DoLibApiTiling")), old_host)
-        entry = OP / "op_kernel/recurrent_gated_delta_rule.cpp"
-        entry_source = entry.read_text(encoding="utf-8")
-        generic = entry_source.split("    } else\n#endif\n    {", 1)[1].rsplit("\n    }", 1)[0]
-        old_body = body(baseline(entry, "fc3532a6"), "recurrent_gated_delta_rule")
-        old_generic = old_body[old_body.index("TPipe pipe;"):]
-        self.assertEqual(normalize(generic), normalize(old_generic))
-
-    def test_static_path_orders_the_producers_and_consumers(self):
-        source = body(STATIC_KERNEL.read_text(encoding="utf-8"), "ProcessStaticUb")
-        for producer, event, consumer in (
-            ("DataCopyPad(gateIn,", ("MTE2_V", 0), "Cast(betaFp32,"),
-            ("DataCopyPad(vIn,", ("MTE2_V", 1), "Cast(qFp32,"),
-            ("DataCopyPad(stateIn,", ("MTE2_V", 2), "ComputeRecurrentGatedDeltaRuleVF<"),
-            ("Exp(gateFp32,", ("V_S", 3), "gateFp32.GetValue(head)"),
-            ("ComputeRecurrentGatedDeltaRuleVF<", ("V_MTE3", 4), "DataCopyPad(attnOutGm["),
-        ):
-            suffix = f"<HardEvent::{event[0]}>(EVENT_ID{event[1]})"
-            offsets = [source.index(token) for token in (producer, "SetFlag" + suffix, "WaitFlag" + suffix, consumer)]
-            self.assertEqual(offsets, sorted(offsets), event)
-        self.assertLess(source.index("seqLengths.GetValue(1)"), source.index("stateIndices.GetValue(0)"))
-        self.assertLess(source.index("DataCopyPad(stateOutGm["), source.index("PipeBarrier<PIPE_ALL>"))
-        self.assertNotRegex(source, r"\b(TPipe|TQue|AllocTensor|EnQue|DeQue)\b")
 
 
 class HeadOwnershipTest(unittest.TestCase):

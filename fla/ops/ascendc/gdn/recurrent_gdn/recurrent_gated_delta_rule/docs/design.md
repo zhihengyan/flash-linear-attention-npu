@@ -126,27 +126,3 @@ R21：两遍计算与输出 Cast 顺序沿用原实现。直接读模式的精�
 
 当前采用 head 遍历范围，元数据复用已从实现中移除。
 head 范围的 A/B 复现步骤见 [实验说明](head-range-experiment.md)。本轮 Cast 融合的验证见 [开发记录](validation.md)。
-
-## A5 case 1 静态 UB 候选
-
-直接对照为 fc3532a6。五轮诊断的四条采样轨道上，TPipe 与 UB 初始化的中位数合计 280 ns，
-其中 UB 初始化约 233 ns。目标是相同 case 1 的无打点 kernel 净省 0.10 µs。以 6.4192 µs
-为参考，继续采用的性能门槛是净省超过 0.0642 µs。静态 UB 需要新的显式同步，280 ns 为观测毛值。
-
-新增私有模板参数 STATIC_UB。仅当 A5、BF16 state、B=T=1、Hk=16、Hv=32、blockDim=32、
-K=V=vStep=128、state stride 为连续布局、g-only、无 accepted-token 且 UB 容量满足布局时选择。
-每核的 head 为 blockIdx，Q/K head 为 blockIdx/2。仍读取设备 prefix、有效长度和 state index，
-只在 prefix=0、有效长度=1 时计算。state 的 block/head stride 保留，输入和输出均按原地址语义访问。
-
-各核固定使用 132 KiB UB。前三个区间为 BF16 初始 state [0,32768)、FP32 门控后 state
-[32768,98304)、BF16 state 输出 [98304,131072)。随后依次是 BF16 Q/K/V 三个 256 B 槽、
-FP32 Q/K/V 三个 512 B 槽、512 B attention scratch、256 B attention 输出和四个 256 B gate/beta 槽。
-所有槽均以 256 B 为单位对齐。gate/beta 槽只搬入 32 个实际元素并使用原 Cast/Exp 的有效长度。
-每核只有一次计算和写回，整个调用没有 slot 回绕。
-
-静态模板入口使用 InitSocState。GM→UB 的 gate/beta、QKV、state 分别由 MTE2→V 事件发布，
-门控/beta 的 Vector 生产完成后由 V→S 事件保护标量读取。Cast、Q scale 和主 VF 之间使用 Vector
-流水内屏障。主 VF 复用原 BF16 直接读、两遍归约、尾 token 省写和输出转换。
-V→MTE3 事件保护 state 和 attention 写回，退出前排空本核流水。静态模板与 TPipe 通用模板独立编译，
-共用原公开入口及 tiling 数据布局。各 SoC 的原分支仍按原条件选择。
-[CANN 静态 Tensor 的支持接口和同步规则](https://www.hiascend.com/document/detail/en/CANNCommunityEdition/910/programug/Ascendcopdevg/docs/en/guide/programming_guide/programming_model/ai_core_simd_programming/cpp_tensor_programming/static_tensor_programming.md)
