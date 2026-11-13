@@ -92,6 +92,9 @@ private:
         ArchTag, bfloat16_t, LayoutW, bfloat16_t, LayoutH, PType, LayoutOutput>;
     using TileS2 = Common::Tile::PackedTileCopyTlaToUB<
         ArchTag, bfloat16_t, LayoutLeftS2, bfloat16_t, LayoutRightS2, float, LayoutOutput>;
+    using TileS2Split = Common::Tile::PackedTileCopyTlaToUB<
+        ArchTag, bfloat16_t, LayoutLeftS2, bfloat16_t, LayoutRightS2, float, LayoutOutput,
+        void, Catlass::Gemm::Tile::CopyL0CToUBMode::SPLIT_M>;
     using ElementAccumulator = typename TileS2::ElementAccumulator;
 
     // FP32 state 时，每个 AIV 用两个 64 KiB bank 常驻本轮两个 head 的 state。
@@ -340,7 +343,7 @@ private:
 
     __aicore__ inline void LoadStage0H(
         const FwdHWorkUnit &unit, const FwdHChunkSpan &chunk, const FwdHHeadBinding &head,
-        uint32_t hSlot)
+        uint32_t hSlot, bool splitState = false)
     {
         AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(HRightReadyEvent(hSlot));
         AscendC::GlobalTensor<bfloat16_t> gmH;
@@ -351,6 +354,10 @@ private:
         } else {
             AscendC::CrossCoreWaitFlag<0x4, PIPE_MTE2>(
                 FwdHAicPeerFlag(FWD_H_H_READY_FLAG, head.localSlot, head.aiv));
+            if (splitState && !chunk.first) {
+                AscendC::CrossCoreWaitFlag<0x4, PIPE_MTE2>(
+                    FwdHAicPeerFlag(FWD_H_H_READY_FLAG, 0, 1));
+            }
             gmH.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(args_.h) + HOffset(unit, chunk, head));
         }
         auto gmHLayout = tla::MakeLayout<bfloat16_t, LayoutH>(FWD_H_K, FWD_H_V);
@@ -434,7 +441,8 @@ private:
         AscendC::SetFlag<AscendC::HardEvent::FIX_M>(FixFreeEvent(pipelineSlot));
     }
 
-    __aicore__ inline void RunStage0(const FwdHWorkUnit &unit, const FwdHChunkSpan &chunk)
+    __aicore__ inline void RunStage0(const FwdHWorkUnit &unit, const FwdHChunkSpan &chunk,
+                                     bool wPrefetched = false)
     {
         // Stage0：H_c=cast_BF16(R_c)，P_c=W_c@H_c；Cube 使用 BF16 输入、FP32 累加。
         if (chunk.first && args_.tiling.useInitialState == 0) {
@@ -442,7 +450,9 @@ private:
         }
         for (uint32_t roundHead = 0; roundHead < unit.headRound.activeHeadCount; ++roundHead) {
             const FwdHHeadBinding &head = unit.headRound.heads[roundHead];
-            LoadStage0W(unit, chunk, head, head.roundHead);
+            if (!wPrefetched) {
+                LoadStage0W(unit, chunk, head, head.roundHead);
+            }
             LoadStage0H(unit, chunk, head, head.roundHead);
             if (roundHead > 0) {
                 ComputeStage0Head(unit, chunk, unit.headRound.heads[roundHead - 1],
@@ -540,7 +550,8 @@ private:
 
     __aicore__ inline void ComputeStage2Head(
         const FwdHWorkUnit &unit, const FwdHChunkSpan &chunk, const FwdHHeadBinding &head,
-        const FwdHKgBinding &binding, uint32_t hSlot, uint32_t pipelineSlot, bool stage0Ran)
+        const FwdHKgBinding &binding, uint32_t hSlot, uint32_t pipelineSlot, bool stage0Ran,
+        bool splitState = false)
     {
         // Stage2 计算：state_v_first=false 时 D=kg^T@right，输出 [K,V]；
         // state_v_first=true 时交换两个输入，计算 right^T@kg，输出物理 [V,K]。
@@ -618,22 +629,37 @@ private:
             AscendC::CrossCoreWaitFlag<0x4, PIPE_FIX>(
                 FwdHAicPeerFlag(FWD_H_P_FREE_FLAG, DataSlot(head), head.aiv));
         }
+        if (splitState && !chunk.first) {
+            AscendC::CrossCoreWaitFlag<0x4, PIPE_FIX>(
+                FwdHAicPeerFlag(FWD_H_D_FREE_FLAG, 0, 1));
+        }
         AscendC::WaitFlag<AscendC::HardEvent::M_FIX>(FixDoneEvent(pipelineSlot));
         AscendC::LocalTensor<float> dUb =
             UbBuffer()[FwdHLocalSlotBase(DataSlot(head))].template ReinterpretCast<float>();
         auto ubLayout = tla::MakeLayout<float, LayoutOutput>(FWD_H_K, FWD_H_V);
         auto tensorUb = tla::MakeTensor(dUb, ubLayout, Catlass::Arch::PositionUB{});
-        CopyL0CToUbS2<decltype(tensorUb)> copyD;
-        copyD(tensorUb, tensorL0C, static_cast<uint8_t>(head.aiv), 0);
-        AscendC::CrossCoreSetFlag<0x4, PIPE_FIX>(
-            FwdHAicPeerFlag(FWD_H_D_READY_FLAG, head.localSlot, head.aiv));
+        if (splitState) {
+            typename TileS2Split::template CopyL0CToDst<decltype(tensorUb)> copyD;
+            copyD(tensorUb, tensorL0C, 0);
+            AscendC::CrossCoreSetFlag<0x4, PIPE_FIX>(FwdHAicPeerFlag(FWD_H_D_READY_FLAG, 0, 0));
+            AscendC::CrossCoreSetFlag<0x4, PIPE_FIX>(FwdHAicPeerFlag(FWD_H_D_READY_FLAG, 0, 1));
+        } else {
+            CopyL0CToUbS2<decltype(tensorUb)> copyD;
+            copyD(tensorUb, tensorL0C, static_cast<uint8_t>(head.aiv), 0);
+            AscendC::CrossCoreSetFlag<0x4, PIPE_FIX>(
+                FwdHAicPeerFlag(FWD_H_D_READY_FLAG, head.localSlot, head.aiv));
+        }
         AscendC::SetFlag<AscendC::HardEvent::FIX_M>(FixFreeEvent(pipelineSlot));
     }
 
     __aicore__ inline void RunStage2(const FwdHWorkUnit &unit, const FwdHChunkSpan &chunk,
-                                     bool stage0Ran)
+                                     bool stage0Ran, bool prefetchNextW = false)
     {
         // Stage2：g-only 计算 D_c=k_raw_c^T@V_new_g；gk-only 计算 D_c=kg_c^T@V_new。
+        FwdHChunkSpan next{};
+        if (prefetchNextW) {
+            next = FwdHBuildChunk(unit.sequence, chunk.chunk + 1);
+        }
         for (uint32_t kgSlot = 0; kgSlot < unit.headRound.requiredKhCount; ++kgSlot) {
             LoadKg(unit, chunk, FwdHBuildKgBinding(unit.headRound, kgSlot));
         }
@@ -646,6 +672,10 @@ private:
                     FwdHBuildKgBinding(unit.headRound, previous.kgSlot);
                 ComputeStage2Head(unit, chunk, previous, binding, previous.roundHead,
                                   (roundHead - 1) & 1U, stage0Ran);
+                if (prefetchNextW) {
+                    // Unique kgSlot == roundHead has just released WReady.
+                    LoadStage0W(unit, next, previous, previous.roundHead);
+                }
             }
         }
         if (unit.headRound.activeHeadCount > 0) {
@@ -653,6 +683,9 @@ private:
             const FwdHHeadBinding &head = unit.headRound.heads[last];
             const FwdHKgBinding binding = FwdHBuildKgBinding(unit.headRound, head.kgSlot);
             ComputeStage2Head(unit, chunk, head, binding, head.roundHead, last & 1U, stage0Ran);
+            if (prefetchNextW) {
+                LoadStage0W(unit, next, head, head.roundHead);
+            }
         }
     }
 
@@ -667,7 +700,7 @@ private:
         return FwdHKgBinding{head.kh, static_cast<uint8_t>(slot), 0, 0, 0};
     }
 
-    __aicore__ inline void ProcessSingleHeadPipeline(const FwdHWorkUnit &unit)
+    __aicore__ inline void ProcessSingleHeadPipeline(const FwdHWorkUnit &unit, bool splitState)
     {
         // 单 head 稳态：W 在 0/1、K 在 2/3 按 chunk 奇偶轮转。当前 right 的
         // GM->L1 发射后立即排入下一 chunk 的 W/K，令 MTE2 lookahead 与本轮
@@ -686,7 +719,7 @@ private:
             const uint32_t parity = chunkId & 1U;
             const bool stage0Ran = !(chunk.first && args_.tiling.useInitialState == 0);
             if (stage0Ran) {
-                LoadStage0H(unit, chunk, head, 0);
+                LoadStage0H(unit, chunk, head, 0, splitState);
                 ComputeStage0Head(unit, chunk, head, 0, parity, 0);
             }
             if (!NeedsStage2(chunk)) {
@@ -703,7 +736,7 @@ private:
                 }
             }
             const FwdHKgBinding binding = BuildSingleHeadKgBinding(head, 2 + parity);
-            ComputeStage2Head(unit, chunk, head, binding, 0, 0, stage0Ran);
+            ComputeStage2Head(unit, chunk, head, binding, 0, 0, stage0Ran, splitState);
         }
     }
 
@@ -712,19 +745,28 @@ private:
         if (!hasCubeWork_) {
             return;
         }
+        const bool splitState = CompilePolicy::STATE_FP32 && !STATE_V_FIRST &&
+            CompilePolicy::GATE_MODE == FwdHGateMode::SCALAR_G &&
+            unit.headRound.activeHeadCount == 1 && args_.tiling.useInitialState != 0 &&
+            args_.tiling.storeFinalState != 0;
         if constexpr (CompilePolicy::STATE_FP32 &&
                       CompilePolicy::GATE_MODE == FwdHGateMode::SCALAR_G) {
             if (unit.headRound.activeHeadCount == 1) {
-                ProcessSingleHeadPipeline(unit);
+                ProcessSingleHeadPipeline(unit, splitState);
             } else {
+                // Prefetch only when each head has its own KG and W event slot.
+                const bool prefetchTwoHeads =
+                    unit.headRound.activeHeadCount == 2 && unit.headRound.requiredKhCount == 2 &&
+                    unit.headRound.heads[0].roundHead == 0 && unit.headRound.heads[0].kgSlot == 0 &&
+                    unit.headRound.heads[1].roundHead == 1 && unit.headRound.heads[1].kgSlot == 1;
                 for (uint32_t chunkId = 0; chunkId < unit.sequence.chunkCount; ++chunkId) {
                     const FwdHChunkSpan chunk = FwdHBuildChunk(unit.sequence, chunkId);
                     const bool stage0Ran = !(chunk.first && args_.tiling.useInitialState == 0);
                     if (stage0Ran) {
-                        RunStage0(unit, chunk);
+                        RunStage0(unit, chunk, prefetchTwoHeads && chunkId > 0);
                     }
                     if (NeedsStage2(chunk)) {
-                        RunStage2(unit, chunk, stage0Ran);
+                        RunStage2(unit, chunk, stage0Ran, prefetchTwoHeads && !chunk.last);
                     }
                 }
             }
@@ -772,6 +814,9 @@ private:
                         FwdHAicPeerFlag(FWD_H_P_FREE_FLAG, DataSlot(head), head.aiv));
                 }
             }
+        }
+        if (splitState) {
+            AscendC::CrossCoreWaitFlag<0x4, PIPE_FIX>(FwdHAicPeerFlag(FWD_H_D_FREE_FLAG, 0, 1));
         }
         if (hasNextWorkUnit) {
             // PIPE_S 将 round 握手放到控制流水，阻止下一轮 MTE2 预取越过 DONE/ACK。
