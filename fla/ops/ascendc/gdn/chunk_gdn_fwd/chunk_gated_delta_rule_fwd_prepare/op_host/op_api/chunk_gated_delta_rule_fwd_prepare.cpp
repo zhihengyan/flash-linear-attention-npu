@@ -60,6 +60,7 @@ const std::array<const aclTensor *, 9> ChunkGatedDeltaRuleFwdPrepare(
     const aclTensor *qRstdOptional,
     const aclTensor *kRstdOptional,
     const aclTensor *betaEffOptional,
+    bool scalarInputBth,
     aclOpExecutor *executor)
 {
     const bool hasHats = qHatOptional != nullptr && kHatOptional != nullptr &&
@@ -109,7 +110,7 @@ const std::array<const aclTensor *, 9> ChunkGatedDeltaRuleFwdPrepare(
     }
     const aclTensor *actualBetaEff = betaEffOptional;
     if (actualBetaEff == nullptr) {
-        actualBetaEff = executor->AllocTensor(g->GetViewShape(), DataType::DT_FLOAT, Format::FORMAT_ND);
+        actualBetaEff = executor->AllocTensor(gOut->GetViewShape(), DataType::DT_FLOAT, Format::FORMAT_ND);
     }
     if ((cuSeqlensOptional != nullptr && actualCuSeqlens == nullptr) ||
         (chunkIndicesOptional != nullptr && actualChunkIndices == nullptr) ||
@@ -123,7 +124,7 @@ const std::array<const aclTensor *, 9> ChunkGatedDeltaRuleFwdPrepare(
         ChunkGatedDeltaRuleFwdPrepare,
         OP_INPUT(q, k, v, g, beta, aLogOptional, dtBiasOptional, actualCuSeqlens, actualChunkIndices),
         OP_OUTPUT(gOut, wOut, uOut, aOut, actualQHat, actualKHat, actualQRstd, actualKRstd, actualBetaEff),
-        OP_ATTR(chunkSize, allowNegEigval, useExp2, useQkL2norm, useGateInKernel, useBetaSigmoid, outputA));
+        OP_ATTR(chunkSize, allowNegEigval, useExp2, useQkL2norm, useGateInKernel, useBetaSigmoid, outputA, scalarInputBth));
     if (ret != ACLNN_SUCCESS) {
         OP_LOGE(ACLNN_ERR_PARAM_INVALID, "ADD_TO_LAUNCHER_LIST_AICORE ChunkGatedDeltaRuleFwdPrepare failed.");
         return {nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr};

@@ -38,6 +38,7 @@ const std::array<const aclTensor *, 9> ChunkGatedDeltaRuleFwdPrepare(
     const aclTensor *qRstdOptional,
     const aclTensor *kRstdOptional,
     const aclTensor *betaEffOptional,
+    bool scalarInputBth,
     aclOpExecutor *executor);
 
 } // namespace l0op

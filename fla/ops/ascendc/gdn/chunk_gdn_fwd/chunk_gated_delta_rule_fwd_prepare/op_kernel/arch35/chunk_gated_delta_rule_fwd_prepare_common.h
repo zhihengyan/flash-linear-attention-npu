@@ -147,6 +147,7 @@ struct ChunkGatedDeltaRuleFwdStageTilingData {
 
     // 1: A is written to GM. 0: A remains resident in L1 only.
     int64_t hasAOutput;
+    int64_t scalarInputBth;
 };
 
 
@@ -303,6 +304,7 @@ struct PrepareState {
         useExp2 = td.useExp2ForGateCumsum;
         totalChunks = td.totalChunkTileCount;
         outputA = td.hasAOutput;
+        scalarInputBth = td.scalarInputBth;
         if (chunkSize <= 0) {
             chunkSize = kGdnChunkSize;
         }
@@ -373,7 +375,7 @@ struct PrepareState {
     int64_t B, HK, HV, T, K, V, HRatio, chunkSize;
     int64_t isVariable, hasChunkIndices;
     int64_t useQkL2norm, useGateInKernel, useBetaSigmoid, hasDtBias, allowNegEigval, useExp2;
-    int64_t totalChunks, outputA;
+    int64_t totalChunks, outputA, scalarInputBth;
     int64_t coreIdx, numCore, subBlock, auxReady;
 };
 

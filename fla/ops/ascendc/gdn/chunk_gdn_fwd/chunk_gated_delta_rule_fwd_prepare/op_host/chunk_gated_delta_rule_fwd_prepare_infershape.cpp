@@ -84,7 +84,15 @@ static ge::graphStatus InferShapeChunkGatedDeltaRuleFwdPrepare(gert::InferShapeC
         chunkSize = *context->GetAttrs()->GetAttrPointer<int64_t>(0);
     }
 
-    CopyShape(gShape, context->GetOutputShape(OUT_G));
+    const auto *attrs = context->GetAttrs();
+    const bool *bthPtr = attrs != nullptr && attrs->GetAttrNum() > 7
+                             ? attrs->GetAttrPointer<bool>(7) : nullptr;
+    const bool scalarInputBth = bthPtr != nullptr && *bthPtr;
+    if (scalarInputBth) {
+        SetShape3(context->GetOutputShape(OUT_G), B, HV, T);
+    } else {
+        CopyShape(gShape, context->GetOutputShape(OUT_G));
+    }
     SetShape4(context->GetOutputShape(OUT_W), B, HV, T, K);
     CopyShape(vShape, context->GetOutputShape(OUT_U));
     SetShape4(context->GetOutputShape(OUT_A), B, HV, T, chunkSize);
@@ -92,7 +100,11 @@ static ge::graphStatus InferShapeChunkGatedDeltaRuleFwdPrepare(gert::InferShapeC
     CopyShape(kShape, context->GetOutputShape(OUT_K_HAT));
     SetShape3(context->GetOutputShape(OUT_Q_RSTD), B, HK, T);
     SetShape3(context->GetOutputShape(OUT_K_RSTD), B, HK, T);
-    CopyShape(gShape, context->GetOutputShape(OUT_BETA));
+    if (scalarInputBth) {
+        SetShape3(context->GetOutputShape(OUT_BETA), B, HV, T);
+    } else {
+        CopyShape(gShape, context->GetOutputShape(OUT_BETA));
+    }
     (void)V;
     return ge::GRAPH_SUCCESS;
 }

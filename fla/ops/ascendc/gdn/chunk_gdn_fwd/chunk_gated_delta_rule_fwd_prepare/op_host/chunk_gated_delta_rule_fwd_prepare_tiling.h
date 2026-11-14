@@ -62,6 +62,7 @@ BEGIN_TILING_DATA_DEF(ChunkGatedDeltaRuleFwdPrepareTilingData)
     TILING_DATA_FIELD_DEF(int64_t, totalChunkTileCount);
     // Prepare-only. 1: A is written to GM. 0: A remains resident in L1 only.
     TILING_DATA_FIELD_DEF(int64_t, hasAOutput);
+    TILING_DATA_FIELD_DEF(int64_t, scalarInputBth);
 END_TILING_DATA_DEF;
 
 REGISTER_TILING_DATA_CLASS(ChunkGatedDeltaRuleFwdPrepare, ChunkGatedDeltaRuleFwdPrepareTilingData)
@@ -93,6 +94,7 @@ constexpr size_t PREPARE_ATTR_USE_QK_L2NORM = 3;
 constexpr size_t PREPARE_ATTR_USE_GATE = 4;
 constexpr size_t PREPARE_ATTR_USE_BETA_SIGMOID = 5;
 constexpr size_t PREPARE_ATTR_OUTPUT_A = 6;
+constexpr size_t PREPARE_ATTR_SCALAR_INPUT_BTH = 7;
 
 } // namespace optiling
 

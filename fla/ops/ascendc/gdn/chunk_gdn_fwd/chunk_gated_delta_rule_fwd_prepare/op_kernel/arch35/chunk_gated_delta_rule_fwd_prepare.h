@@ -24,7 +24,7 @@ namespace ChunkGatedDeltaRuleFwdPrepare {
 using namespace AscendC;
 using namespace AscendC::MicroAPI;
 
-template <typename GateDtype, typename ALogDtype>
+template <typename GateDtype, typename BetaDtype, typename ALogDtype>
 class ChunkGatedDeltaRuleFwdPrepareKernel : public PrepareState {
 public:
     using InDtype = bfloat16_t;
@@ -49,7 +49,7 @@ public:
         gmK.SetGlobalBuffer(reinterpret_cast<__gm__ InDtype *>(k));
         gmV.SetGlobalBuffer(reinterpret_cast<__gm__ InDtype *>(v));
         gmG.SetGlobalBuffer(reinterpret_cast<__gm__ GateDtype *>(g));
-        gmBeta.SetGlobalBuffer(reinterpret_cast<__gm__ GateDtype *>(beta));
+        gmBeta.SetGlobalBuffer(reinterpret_cast<__gm__ BetaDtype *>(beta));
         if (aLog != nullptr) {
             gmALog.SetGlobalBuffer(reinterpret_cast<__gm__ ALogDtype *>(aLog));
         }
@@ -150,6 +150,17 @@ public:
         // VCS scatter index for packing two 32x32 leaves into I_vcs 32x64:
         // values are {0, 32} (left leaf at col 0, right leaf at col 32).
         ubVcsIdx = buf.template GetBuffer<BufferType::ASCEND_UB, uint32_t>(kUbVcsIdx);
+        if ASCEND_IS_AIV {
+            if (scalarInputBth != 0) {
+                // Gather's b16 implementation loads 128 uint32 indices even
+                // for a 64-element mask. The entire 512-byte hole is reserved.
+                ubBthOffsets = buf.template GetBuffer<BufferType::ASCEND_UB, uint32_t>(0);
+                ubBthOffsets.SetSize(128);
+                for (uint32_t i = 0; i < 128; ++i) { ubBthOffsets.SetValue(i, i * 32); }
+                SetFlag<HardEvent::S_V>(kHeUb0);
+                WaitFlag<HardEvent::S_V>(kHeUb0);
+            }
+        }
 
         // UB[1.00, 9.00) KiB = 8 KiB, fp32 ND [32, 64].
         // I_vcs = concat along K of two I_32 identity leaves. Prefetched to
@@ -320,6 +331,14 @@ public:
             WaitAicStage4Done(taskIdx);
             return;
         }
+        // When K is an unmodified full tile, AIC can copy the input directly
+        // from GM into its NZ L1 slot. Preserve the prior-pack release and
+        // the existing intra-block ready credit before AIC touches that slot.
+        if (useQkL2norm == 0 && chunk.M == chunkSize) {
+            WaitAicStage4Done(taskIdx);
+            NotifyAicStage1Done(taskIdx);
+            return;
+        }
         const int64_t hk = hv / HRatio;
         const int32_t db = PingPongSlot(taskIdx);
         const int32_t nElem = static_cast<int32_t>(chunk.M * K);
@@ -366,15 +385,43 @@ public:
         LocalTensor<float> ubGfp = ubGPrime[db];
         LocalTensor<float> ubBfp = ubBetaEff[db];
         LocalTensor<GateDtype> ubGRaw = ubGfp.template ReinterpretCast<GateDtype>();
-        LocalTensor<GateDtype> ubBRaw = ubBfp.template ReinterpretCast<GateDtype>();
+        LocalTensor<BetaDtype> ubBRaw = ubBfp.template ReinterpretCast<BetaDtype>();
 
-        // g / beta share the resident 256 B slots. GateDtype view of the same
-        // address: fp32 copy is identity; b16/fp16 fills the first 128 B, then
+        // g / beta use separate resident 256 B slots. Their own dtype views
+        // can differ: fp32 copy is identity; b16/fp16 fills the first 128 B, then
         // one VL LoadCast stores 64 fp32. n<=64, load-then-store, no ubQHat.
-        CopyGmToUbElems(ubGRaw, gmG[offG], static_cast<uint32_t>(nValid));
-        CopyGmToUbElems(ubBRaw, gmBeta[offG], static_cast<uint32_t>(nValid));
-        SetFlag<HardEvent::MTE2_V>(kHeUb0);
-        WaitFlag<HardEvent::MTE2_V>(kHeUb0);
+        if constexpr (IsSameType<GateDtype, float>::value && IsSameType<BetaDtype, bfloat16_t>::value) {
+            if (scalarInputBth != 0) {
+                // q is unused in this branch; each ping/pong q slot provides
+                // two disjoint, 32-byte-aligned 2048-byte padded row buffers.
+                auto gateRows = ubQ[db].template ReinterpretCast<GateDtype>();
+                auto betaRows = ubQ[db][2048 / sizeof(InDtype)].template ReinterpretCast<BetaDtype>();
+                const int64_t offBth = (chunk.batch * T + chunk.tokenStart) * HV + hv;
+                DataCopyExtParams gp{static_cast<uint16_t>(nValid), sizeof(GateDtype),
+                                     static_cast<uint32_t>((HV - 1) * sizeof(GateDtype)), 0, 0};
+                DataCopyExtParams bp{static_cast<uint16_t>(nValid), sizeof(BetaDtype),
+                                     static_cast<uint32_t>((HV - 1) * sizeof(BetaDtype)), 0, 0};
+                DataCopyPadExtParams<GateDtype> gpad{false, 0, static_cast<uint8_t>(32 / sizeof(GateDtype) - 1), 0};
+                DataCopyPadExtParams<BetaDtype> bpad{false, 0, static_cast<uint8_t>(32 / sizeof(BetaDtype) - 1), 0};
+                DataCopyPad(gateRows, gmG[offBth], gp, gpad);
+                DataCopyPad(betaRows, gmBeta[offBth], bp, bpad);
+                SetFlag<HardEvent::MTE2_V>(kHeUb0);
+                WaitFlag<HardEvent::MTE2_V>(kHeUb0);
+                Gather(ubGRaw, gateRows, ubBthOffsets, 0, static_cast<uint32_t>(nValid));
+                Gather(ubBRaw, betaRows, ubBthOffsets, 0, static_cast<uint32_t>(nValid));
+                PipeBarrier<PIPE_V>();
+            } else {
+                CopyGmToUbElems(ubGRaw, gmG[offG], static_cast<uint32_t>(nValid));
+                CopyGmToUbElems(ubBRaw, gmBeta[offG], static_cast<uint32_t>(nValid));
+                SetFlag<HardEvent::MTE2_V>(kHeUb0);
+                WaitFlag<HardEvent::MTE2_V>(kHeUb0);
+            }
+        } else {
+            CopyGmToUbElems(ubGRaw, gmG[offG], static_cast<uint32_t>(nValid));
+            CopyGmToUbElems(ubBRaw, gmBeta[offG], static_cast<uint32_t>(nValid));
+            SetFlag<HardEvent::MTE2_V>(kHeUb0);
+            WaitFlag<HardEvent::MTE2_V>(kHeUb0);
+        }
 
         if (useGateInKernel != 0) {
             float aLog = ScalarToFp32(gmALog.GetValue(hv));
@@ -393,9 +440,9 @@ public:
 
         if (useBetaSigmoid != 0) {
             float bscale = (allowNegEigval != 0) ? 2.0f : 1.0f;
-            BetaSigmoidVF<GateDtype>(ubBRaw, ubBfp, bscale, static_cast<uint32_t>(nValid));
-        } else if constexpr (!IsSameType<GateDtype, float>::value) {
-            CastToFp32VF<GateDtype>(ubBRaw, ubBfp, static_cast<uint32_t>(nValid));
+            BetaSigmoidVF<BetaDtype>(ubBRaw, ubBfp, bscale, static_cast<uint32_t>(nValid));
+        } else if constexpr (!IsSameType<BetaDtype, float>::value) {
+            CastToFp32VF<BetaDtype>(ubBRaw, ubBfp, static_cast<uint32_t>(nValid));
         }
 
         if (hasBetaOut != 0) {
@@ -518,8 +565,9 @@ public:
     }
 
     // ========================= Stage 4 =========================
-    // Y = I + LeafLeft @ (-L). Prefill loads resident I once and MMADs I@I
-    // into each task's L0C slot before Wait Stage3 (hidden under Vector).
+    // Only Y[:,0:32] is consumed by Stage5: LeafRight is nonzero only
+    // in rows 0:32. Prefill that rectangle of I, then accumulate
+    // LeafLeft[:,32:64] @ (-L)[32:64,0:32].
     // Event bank=t&1; Wait M_FIX after each I@I so Acc Wait FIX_M(bank)
     // is that slot's Cube-idle credit, not ProcessAic's init FIX_M(1).
     // Acc uses P L0 banks (ping keeps I). Dump(t-1) overlaps Acc(t);
@@ -531,10 +579,12 @@ public:
             return;
         }
         WaitFlag<HardEvent::M_MTE1>(0);
-        LoadL1NzToL0AB<float>(l1I, l1I, l0Af[0], l0Bf[0], bt, bt, bt, true, false, 0);
+        LoadL1NzToL0AB<float>(l1I, l1I, l0Af[0], l0Bf[0],
+                              bt, kVcs32, kVcs32, true, false, 0);
         for (int64_t t = 0; t < nThis; ++t) {
             const uint8_t bank = static_cast<uint8_t>(t & 1);
-            MmadL0ABToL0C<float>(l0Af[0], l0Bf[0], l0CTask[t], bt, bt, bt, true, bank);
+            MmadL0ABToL0C<float>(l0Af[0], l0Bf[0], l0CTask[t],
+                                  bt, kVcs32, kVcs32, true, bank);
             SetFlag<HardEvent::M_FIX>(bank);
             WaitFlag<HardEvent::M_FIX>(bank);
             SetFlag<HardEvent::FIX_M>(bank);
@@ -546,10 +596,21 @@ public:
     {
         const uint8_t bank = static_cast<uint8_t>(taskIdx & 1);
         WaitFlag<HardEvent::M_MTE1>(bank);
-        // Left has nonzero logical columns only in K=[32,64).
-        // Its transposed L1 leaf and -L both select physical source rows.
-        SolveHalfKMatmulToL0C<true, true>(l1LeafLeft[taskIdx], l1NegL[taskIdx], l0AfP[bank], l0BfP[bank],
-                                          l0CTask[taskIdx], false, bank);
+        // The A load retains all 64 M rows; the B load selects only the
+        // first 32 N columns. Both select physical source rows 32:64.
+        LoadData2DParamsV2 loadA;
+        FillLoad2D(loadA, 2, 8, 4, 4, true);
+        loadA.mStartPosition = 2;
+        LoadData(l0AfP[bank], l1LeafLeft[taskIdx], loadA);
+
+        LoadData2DParamsV2 loadB;
+        FillLoad2D(loadB, 2, 4, 4, 2, true);
+        loadB.mStartPosition = 2;
+        LoadData(l0BfP[bank], l1NegL[taskIdx], loadB);
+        SetFlag<HardEvent::MTE1_M>(bank);
+        WaitFlag<HardEvent::MTE1_M>(bank);
+        MmadL0ABToL0C<float>(l0AfP[bank], l0BfP[bank], l0CTask[taskIdx],
+                              kChunk64, kVcs32, kVcs32, false, bank);
         SetFlag<HardEvent::M_FIX>(bank);
         SetFlag<HardEvent::M_MTE1>(bank);
     }
@@ -558,11 +619,21 @@ public:
     {
         const uint8_t bank = static_cast<uint8_t>(taskIdx & 1);
         WaitFlag<HardEvent::M_FIX>(bank);
-        FixpipeL0cToGmNzCs(gmWsY[WsYOffset(taskIdx)], l0CTask[taskIdx], kChunk64);
+        // L0C holds M=64,N=32. isChannelSplit produces the first four
+        // C0=8 columns of the existing 64-row L1 NZ layout.
+        FixpipeParamsArch3510<CO2Layout::NZ> p;
+        p.nSize = kVcs32;
+        p.mSize = kChunk64;
+        p.srcStride = kChunk64;
+        p.dstStride = kChunk64 * 8;
+        p.quantPre = QuantMode_t::NoQuant;
+        p.isChannelSplit = true;
+        Fixpipe<float, float, CFG_NZ_L1>(gmWsY[WsYOffset(taskIdx)], l0CTask[taskIdx], p);
         SetFlag<HardEvent::FIX_M>(bank);
         SetFlag<HardEvent::FIX_MTE2>(bank);
         WaitFlag<HardEvent::FIX_MTE2>(bank);
-        CopyGmNzToL1Fp32(l1Y[taskIdx], gmWsY[WsYOffset(taskIdx)], kChunk64);
+        DataCopy(l1Y[taskIdx], gmWsY[WsYOffset(taskIdx)],
+                 DataCopyParams(1, kChunk64 * kVcs32 / 8, 0, 0));
         NotifyAivStage4Done(taskIdx);
         SetFlag<HardEvent::MTE2_MTE1>(taskIdx);
     }
@@ -853,7 +924,23 @@ public:
                 if (!OwnsHk(PackWorkId(cur.base, cur.nThis, t) % HV)) {
                     continue;
                 }
-                WaitAivStage1Done(t);
+                ChunkRange directChunk;
+                int64_t directHv;
+                DecodeTask(cur.base, cur.nThis, t, directChunk, directHv);
+                if (useQkL2norm == 0 && directChunk.M == chunkSize) {
+                    // The ready flag protects the NegL/K L1 alias. Wait on
+                    // the same MTE2 pipe that performs the direct K upload.
+                    CrossCoreWaitFlag<0x4, PIPE_MTE2>(CubeWaitFlagForTask(t));
+                    const int64_t offK = OffsetBHTD(directChunk.batch, directHv / HRatio,
+                                                   directChunk.tokenStart, HK, T, K);
+                    CopyGmNdToL1Nz<InDtype>(l1KHat[t], gmK[offK],
+                                             static_cast<uint32_t>(chunkSize),
+                                             static_cast<uint32_t>(K));
+                    SetFlag<HardEvent::MTE2_MTE1>(t);
+                    WaitFlag<HardEvent::MTE2_MTE1>(t);
+                } else {
+                    WaitAivStage1Done(t);
+                }
                 Stage2_AicOne(t, cur.nThis);
                 if (HRatio > 1) {
                     NotifyKktSiblings(cur.base, cur.nThis, t);
@@ -922,7 +1009,7 @@ private:
     GlobalTensor<InDtype> gmK;
     GlobalTensor<InDtype> gmV;
     GlobalTensor<GateDtype> gmG;
-    GlobalTensor<GateDtype> gmBeta;
+    GlobalTensor<BetaDtype> gmBeta;
     GlobalTensor<ALogDtype> gmALog;
     GlobalTensor<ALogDtype> gmDt;
     // Output
@@ -941,7 +1028,7 @@ private:
     // Local
     // UB
     // S0
-    LocalTensor<uint32_t> ubVcsIdx;
+    LocalTensor<uint32_t> ubVcsIdx, ubBthOffsets;
     LocalTensor<float> ubIVcs, ubS0Zero;
 
     // S1

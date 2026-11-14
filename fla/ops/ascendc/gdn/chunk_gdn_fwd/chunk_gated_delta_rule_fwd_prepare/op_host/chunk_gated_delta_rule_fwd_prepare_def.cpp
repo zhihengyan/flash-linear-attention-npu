@@ -12,19 +12,23 @@ public:
     explicit ChunkGatedDeltaRuleFwdPrepare(const char *name) : OpDef(name)
     {
         const std::initializer_list<ge::DataType> dataTypes = {
-            ge::DT_BF16, ge::DT_BF16, ge::DT_FLOAT16, ge::DT_FLOAT16,
+            ge::DT_BF16, ge::DT_BF16, ge::DT_FLOAT16, ge::DT_FLOAT16, ge::DT_BF16,
         };
         const std::initializer_list<ge::DataType> gateTypes = {
-            ge::DT_FLOAT, ge::DT_BF16, ge::DT_FLOAT, ge::DT_FLOAT16,
+            ge::DT_FLOAT, ge::DT_BF16, ge::DT_FLOAT, ge::DT_FLOAT16, ge::DT_FLOAT,
+        };
+        // Fifth row: A5 q/k/v BF16, g FP32, beta BF16.
+        const std::initializer_list<ge::DataType> betaTypes = {
+            ge::DT_FLOAT, ge::DT_BF16, ge::DT_FLOAT, ge::DT_FLOAT16, ge::DT_BF16,
         };
         const std::initializer_list<ge::DataType> fp32Types = {
-            ge::DT_FLOAT, ge::DT_FLOAT, ge::DT_FLOAT, ge::DT_FLOAT,
+            ge::DT_FLOAT, ge::DT_FLOAT, ge::DT_FLOAT, ge::DT_FLOAT, ge::DT_FLOAT,
         };
         const std::initializer_list<ge::DataType> indexTypes = {
-            ge::DT_INT64, ge::DT_INT64, ge::DT_INT64, ge::DT_INT64,
+            ge::DT_INT64, ge::DT_INT64, ge::DT_INT64, ge::DT_INT64, ge::DT_INT64,
         };
         const std::initializer_list<ge::Format> formats = {
-            ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND,
+            ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND,
         };
 
         this->Input("q").ParamType(REQUIRED).DataType(dataTypes).Format(formats)
@@ -35,7 +39,7 @@ public:
             .UnknownShapeFormat(formats).AutoContiguous();
         this->Input("g").ParamType(REQUIRED).DataType(gateTypes).Format(formats)
             .UnknownShapeFormat(formats).AutoContiguous();
-        this->Input("beta").ParamType(REQUIRED).DataType(gateTypes).Format(formats)
+        this->Input("beta").ParamType(REQUIRED).DataType(betaTypes).Format(formats)
             .UnknownShapeFormat(formats).AutoContiguous();
         this->Input("a_log").ParamType(OPTIONAL).DataType(gateTypes).Format(formats)
             .UnknownShapeFormat(formats).AutoContiguous();
@@ -72,6 +76,7 @@ public:
         this->Attr("use_gate_in_kernel").AttrType(OPTIONAL).Bool(false);
         this->Attr("use_beta_sigmoid").AttrType(OPTIONAL).Bool(false);
         this->Attr("output_a").AttrType(OPTIONAL).Bool(true);
+        this->Attr("scalar_input_bth").AttrType(OPTIONAL).Bool(false);
 
         OpAICoreConfig aicoreConfig;
         aicoreConfig.DynamicCompileStaticFlag(true)

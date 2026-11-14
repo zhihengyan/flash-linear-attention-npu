@@ -1187,13 +1187,78 @@ private:
         AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(IoFreeEvent(0));
     }
 
+    // Divide full 64-token Stage1 across both AIVs; tails use the old path.
+    __aicore__ inline void PrefetchSplitStage1Inputs(
+        const FwdHWorkUnit &unit, const FwdHChunkSpan &chunk,
+        const FwdHHeadBinding &head, uint32_t inputSlot)
+    {
+        AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(WorkFreeEvent(inputSlot));
+        AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(GateFreeEvent(inputSlot));
+        const bool full = chunk.validTokens == FWD_H_CHUNK;
+        const uint32_t rows = full ? FWD_H_CHUNK / 2 : chunk.validTokens;
+        const uint32_t rowOffset = full ? aiv_ * (FWD_H_CHUNK / 2) : 0;
+        AscendC::GlobalTensor<bfloat16_t> u;
+        u.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(args_.u));
+        u.SetL2CacheHint(AscendC::CacheMode::CACHE_MODE_DISABLE);
+        AscendC::DataCopy(WorkBf16Slot(inputSlot),
+                          u[UOffset(unit, chunk, head) + rowOffset * FWD_H_V],
+                          rows * FWD_H_V);
+        CopyGateToUb(unit, chunk, head, inputSlot);
+        AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(WorkReadyEvent(inputSlot));
+    }
+
+    __aicore__ inline void ConsumeSplitStage1Head(
+        const FwdHWorkUnit &unit, const FwdHChunkSpan &chunk,
+        const FwdHHeadBinding &head, uint32_t inputSlot)
+    {
+        constexpr uint32_t halfRows = FWD_H_CHUNK / 2;
+        constexpr uint32_t halfElements = halfRows * FWD_H_V;
+        AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(WorkReadyEvent(inputSlot));
+        AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(IoReadyEvent(0));
+        AscendC::VF_CALL<FwdHPrepareScalarGateArch35Vf<CompilePolicy::USE_EXP2, GateT>>(
+            reinterpret_cast<__ubuf__ float *>(GateScaleSlot(inputSlot).GetPhyAddr()),
+            reinterpret_cast<__ubuf__ GateT *>(GateSlot(inputSlot).GetPhyAddr()),
+            reinterpret_cast<__ubuf__ float *>(AlphaSlot(inputSlot).GetPhyAddr()),
+            static_cast<uint16_t>(chunk.validTokens));
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::CrossCoreWaitFlag<0x4, PIPE_V>(FwdHAivLocalFlag(FWD_H_P_READY_FLAG, 0));
+        AscendC::VF_CALL<FwdHStage1Arch35Vf<true, true, true, false, float>>(
+            reinterpret_cast<__ubuf__ bfloat16_t *>(WorkBf16Slot(inputSlot).GetPhyAddr()),
+            reinterpret_cast<__ubuf__ float *>(LocalSlot(0).GetPhyAddr()),
+            reinterpret_cast<__ubuf__ float *>(GateScaleSlot(inputSlot).GetPhyAddr()) + aiv_ * halfRows,
+            reinterpret_cast<__ubuf__ bfloat16_t *>(RightSlot(0).GetPhyAddr()),
+            reinterpret_cast<__ubuf__ bfloat16_t *>(StateBf16Slot(0).GetPhyAddr()),
+            static_cast<uint16_t>(halfRows));
+        AscendC::CrossCoreSetFlag<0x4, PIPE_V>(FwdHAivLocalFlag(FWD_H_P_FREE_FLAG, 0));
+        AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(WorkDoneEvent(inputSlot));
+        AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(WorkDoneEvent(inputSlot));
+        AscendC::GlobalTensor<bfloat16_t> vNew;
+        vNew.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(args_.vNew));
+        AscendC::GlobalTensor<bfloat16_t> rightGm;
+        rightGm.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(
+            args_.workspace + args_.tiling.vUpdateWorkspaceOffset));
+        const uint64_t part = static_cast<uint64_t>(aiv_) * halfElements;
+        const uint64_t rightOffset = FwdHCoreSlotOffset(
+            coreIdx_, head.roundHead, FWD_H_CHUNK * FWD_H_V);
+        // Publish only after this AIV's entire disjoint right half reaches GM.
+        // Cube waits both ready credits for a full chunk before reading right.
+        AscendC::DataCopy(rightGm[rightOffset + part], RightSlot(0), halfElements);
+        AscendC::CrossCoreSetFlag<0x4, PIPE_MTE3>(FwdHAivLocalFlag(FWD_H_RIGHT_READY_FLAG, 0));
+        // vNew is not an input of this chunk's Stage2 and occupies a disjoint UB
+        // buffer; its write and local reuse credits remain ordered afterwards.
+        AscendC::DataCopy(vNew[UOffset(unit, chunk, head) + part],
+                          WorkBf16Slot(inputSlot), halfElements);
+        AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(WorkFreeEvent(inputSlot));
+        AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(IoFreeEvent(0));
+    }
+
     __aicore__ inline void ProcessSingleHeadSplitPipeline(const FwdHWorkUnit &unit)
     {
         constexpr uint32_t halfElements = (FWD_H_K / 2) * FWD_H_V;
         const FwdHHeadBinding &head = unit.headRound.heads[0];
         const FwdHChunkSpan first = FwdHBuildChunk(unit.sequence, 0);
         if (aiv_ == 0) {
-            PrefetchStage1Inputs(unit, first, head, 0, true);
+            PrefetchSplitStage1Inputs(unit, first, head, 0);
         } else {
             AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(IoFreeEvent(0));
             AscendC::GlobalTensor<float> initial;
@@ -1212,24 +1277,47 @@ private:
                 AcquireStage1LocalSlot(head);
                 if (!chunk.last) {
                     const FwdHChunkSpan next = FwdHBuildChunk(unit.sequence, chunkId + 1);
-                    PrefetchStage1Inputs(unit, next, head, gateSlot ^ 1U, true);
+                    PrefetchSplitStage1Inputs(unit, next, head, gateSlot ^ 1U);
                 }
                 if (chunkId > 0) {
                     AscendC::CrossCoreWaitFlag<0x4, PIPE_V>(FwdHAivLocalFlag(FWD_H_RIGHT_FREE_FLAG, 0));
                 }
-                DispatchStage1<true>(unit, chunk, head, gateSlot, true, true, false);
-                AscendC::CrossCoreSetFlag<0x4, PIPE_MTE3>(FwdHAivLocalFlag(FWD_H_RIGHT_READY_FLAG, 0));
+                if (chunk.validTokens == FWD_H_CHUNK) {
+                    ConsumeSplitStage1Head(unit, chunk, head, gateSlot);
+                } else {
+                    // A lone head has four reserved right slots; use slot 1 for
+                    // the partial tail so it cannot overlap the preceding full
+                    // chunk's split writers in slot 0.
+                    FwdHHeadBinding tailHead = head;
+                    tailHead.roundHead = 1;
+                    DispatchStage1<true>(unit, chunk, tailHead, gateSlot, true, true, false);
+                    AscendC::CrossCoreSetFlag<0x4, PIPE_MTE3>(FwdHAivLocalFlag(FWD_H_RIGHT_READY_FLAG, 0));
+                }
             } else {
-                AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(GateFreeEvent(gateSlot));
-                CopyGateToUb(unit, chunk, head, gateSlot);
-                AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(WorkReadyEvent(gateSlot));
-                AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(WorkReadyEvent(gateSlot));
-                AscendC::VF_CALL<FwdHPrepareScalarGateArch35Vf<CompilePolicy::USE_EXP2, GateT>>(
-                    reinterpret_cast<__ubuf__ float *>(GateScaleSlot(gateSlot).GetPhyAddr()),
-                    reinterpret_cast<__ubuf__ GateT *>(GateSlot(gateSlot).GetPhyAddr()),
-                    reinterpret_cast<__ubuf__ float *>(AlphaSlot(gateSlot).GetPhyAddr()),
-                    static_cast<uint16_t>(chunk.validTokens));
-                AscendC::PipeBarrier<PIPE_V>();
+                // Consume the previous full chunk's RIGHT_FREE1 also when
+                // this chunk is a partial tail.
+                if (chunkId > 0) {
+                    const FwdHChunkSpan prev = FwdHBuildChunk(unit.sequence, chunkId - 1);
+                    if (prev.validTokens == FWD_H_CHUNK) {
+                        AscendC::CrossCoreWaitFlag<0x4, PIPE_V>(FwdHAivLocalFlag(FWD_H_RIGHT_FREE_FLAG, 0));
+                    }
+                }
+                if (chunk.validTokens == FWD_H_CHUNK) {
+                    PrefetchSplitStage1Inputs(unit, chunk, head, gateSlot);
+                    AcquireStage1LocalSlot(head);
+                    ConsumeSplitStage1Head(unit, chunk, head, gateSlot);
+                } else {
+                    AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(GateFreeEvent(gateSlot));
+                    CopyGateToUb(unit, chunk, head, gateSlot);
+                    AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(WorkReadyEvent(gateSlot));
+                    AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(WorkReadyEvent(gateSlot));
+                    AscendC::VF_CALL<FwdHPrepareScalarGateArch35Vf<CompilePolicy::USE_EXP2, GateT>>(
+                        reinterpret_cast<__ubuf__ float *>(GateScaleSlot(gateSlot).GetPhyAddr()),
+                        reinterpret_cast<__ubuf__ GateT *>(GateSlot(gateSlot).GetPhyAddr()),
+                        reinterpret_cast<__ubuf__ float *>(AlphaSlot(gateSlot).GetPhyAddr()),
+                        static_cast<uint16_t>(chunk.validTokens));
+                    AscendC::PipeBarrier<PIPE_V>();
+                }
             }
             if (chunk.last) {
                 RunSingleSplitStage3<false>(unit, chunk, head, gateSlot);
@@ -1295,6 +1383,13 @@ private:
                 const FwdHHeadBinding &head = unit.headRound.heads[aiv_ + 2 * coreHeadId];
                 AscendC::CrossCoreWaitFlag<0x4, PIPE_V>(
                     FwdHAivLocalFlag(FWD_H_RIGHT_FREE_FLAG, head.localSlot));
+            }
+        }
+        if (splitState && aiv_ == 1) {
+            const FwdHChunkSpan last = FwdHBuildChunk(unit.sequence, unit.sequence.chunkCount - 1);
+            if (last.validTokens == FWD_H_CHUNK) {
+                // localHeads=0 cannot drain the extra RIGHT_FREE1 credit.
+                AscendC::CrossCoreWaitFlag<0x4, PIPE_V>(FwdHAivLocalFlag(FWD_H_RIGHT_FREE_FLAG, 0));
             }
         }
         // 跨 head_round 前必须把本轮所有 VEC->MTE3 写回收口。AIC 收到 ROUND_DONE 后

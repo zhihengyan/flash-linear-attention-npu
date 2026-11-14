@@ -1030,20 +1030,29 @@ static aclnnStatus ChunkGatedDeltaRuleFwdGetWorkspaceSizeImpl(
 
     const aclTensor *betaUsed = params.beta;
     const aclTensor *gUsed = params.g;
+    // A5 Prepare can widen BF16 beta inside the kernel independently of g.
+    const bool useMixedPrepareBeta = IsAscend950() && UsePreparePath(params) &&
+        params.g->GetDataType() == DataType::DT_FLOAT &&
+        params.beta->GetDataType() == DataType::DT_BF16;
     // The legacy Phase6 kernels consume FP32 gate/beta. Keep A5's native
     // low-precision prepare contract while normalizing the legacy inputs.
     if (!IsAscend950() || params.beta->GetDataType() == DataType::DT_FLOAT ||
         params.g->GetDataType() == DataType::DT_FLOAT) {
-        betaUsed = params.beta->GetDataType() == DataType::DT_FLOAT
+        betaUsed = (params.beta->GetDataType() == DataType::DT_FLOAT || useMixedPrepareBeta)
                        ? params.beta : l0op::Cast(params.beta, DataType::DT_FLOAT, executorPtr);
         gUsed = params.g->GetDataType() == DataType::DT_FLOAT
                     ? params.g : l0op::Cast(params.g, DataType::DT_FLOAT, executorPtr);
     }
-    const aclTensor *gRaw = usePreparedCumsum
+    // Only Prepare consumes the original contiguous BTH scalar inputs. Its
+    // outputs remain BHT. All other paths retain the existing BHT contract.
+    const bool scalarInputBth = useMixedPrepareBeta && !usePreparedCumsum && hv <= 65536 &&
+        !params.useQkL2norm && params.aLogOptional == nullptr && params.dtBiasOptional == nullptr &&
+        params.betaEffOutOptional == nullptr && !params.allowNegEigval;
+    const aclTensor *gRaw = (usePreparedCumsum || scalarInputBth)
                                ? gUsed
                                : (gUsed == nullptr ? nullptr
                                   : TransposeContiguous(gUsed, {0, 2, 1}, executorPtr));
-    const aclTensor *betaBht = betaUsed == nullptr ? nullptr
+    const aclTensor *betaBht = (betaUsed == nullptr || scalarInputBth) ? betaUsed
                                  : TransposeContiguous(betaUsed, {0, 2, 1}, executorPtr);
     GDN_STAGE_CHECK(gRaw != nullptr && betaBht != nullptr, 169102);
 
@@ -1139,7 +1148,7 @@ static aclnnStatus ChunkGatedDeltaRuleFwdGetWorkspaceSizeImpl(
             params.allowNegEigval, params.useExp2, params.useQkL2norm,
             params.aLogOptional != nullptr || params.dtBiasOptional != nullptr, betaEffBht != nullptr,
             params.aOutOptional != nullptr, gCumsumBht, w, u, a, qHat, kHat, qRstd,
-            kRstd, betaEffBht, executorPtr);
+            kRstd, betaEffBht, scalarInputBth, executorPtr);
         GDN_STAGE_CHECK(prepareResult[0] != nullptr && prepareResult[1] != nullptr &&
                             prepareResult[2] != nullptr &&
                             (!params.useQkL2norm ||

@@ -90,6 +90,9 @@ private:
 
     using TileS0 = Common::Tile::PackedTileCopyTlaToUB<
         ArchTag, bfloat16_t, LayoutW, bfloat16_t, LayoutH, PType, LayoutOutput>;
+    using TileS0Split = Common::Tile::PackedTileCopyTlaToUB<
+        ArchTag, bfloat16_t, LayoutW, bfloat16_t, LayoutH, PType, LayoutOutput,
+        void, Catlass::Gemm::Tile::CopyL0CToUBMode::SPLIT_M>;
     using TileS2 = Common::Tile::PackedTileCopyTlaToUB<
         ArchTag, bfloat16_t, LayoutLeftS2, bfloat16_t, LayoutRightS2, float, LayoutOutput>;
     using TileS2Split = Common::Tile::PackedTileCopyTlaToUB<
@@ -372,7 +375,7 @@ private:
 
     __aicore__ inline void ComputeStage0Head(
         const FwdHWorkUnit &unit, const FwdHChunkSpan &chunk, const FwdHHeadBinding &head,
-        uint32_t pipelineSlot, uint32_t wSlot, uint32_t hSlot)
+        uint32_t pipelineSlot, uint32_t wSlot, uint32_t hSlot, bool splitState = false)
     {
         // Stage0 计算：Pacc_c,h = W_c,h @ H_c,h，BF16 x BF16 -> FP32；
         // 随后按 StateT 转为 PType，Fixpipe 直接写入该 head 所属 AIV 的 local slot。
@@ -427,6 +430,12 @@ private:
             AscendC::CrossCoreWaitFlag<0x4, PIPE_FIX>(
                 FwdHAicPeerFlag(FWD_H_D_FREE_FLAG, DataSlot(head), head.aiv));
         }
+        const bool splitP = splitState && chunk.validTokens == FWD_H_CHUNK;
+        if (splitP && !chunk.first) {
+            // Previous split D occupied AIV1 slot 0. Consume its free credit
+            // before writing this chunk's second half of P to that slot.
+            AscendC::CrossCoreWaitFlag<0x4, PIPE_FIX>(FwdHAicPeerFlag(FWD_H_D_FREE_FLAG, 0, 1));
+        }
         AscendC::WaitFlag<AscendC::HardEvent::M_FIX>(FixDoneEvent(pipelineSlot));
         AscendC::LocalTensor<PType> pUb = UbBuffer()[
             FwdHLocalSlotBase(DataSlot(head))].template ReinterpretCast<PType>();
@@ -434,10 +443,17 @@ private:
         auto tensorUb = tla::MakeTensor(pUb, ubLayout, Catlass::Arch::PositionUB{});
         auto blockUb = tla::GetTile(tensorUb, tla::MakeCoord(0, 0),
                                     tla::MakeShape(chunk.validTokens, FWD_H_V));
-        CopyL0CToUbS0<decltype(blockUb)> copyP;
-        copyP(blockUb, tensorL0C, static_cast<uint8_t>(head.aiv), 0);
-        AscendC::CrossCoreSetFlag<0x4, PIPE_FIX>(
-            FwdHAicPeerFlag(FWD_H_P_READY_FLAG, head.localSlot, head.aiv));
+        if (splitP) {
+            typename TileS0Split::template CopyL0CToDst<decltype(tensorUb)> copyP;
+            copyP(tensorUb, tensorL0C, 0);
+            AscendC::CrossCoreSetFlag<0x4, PIPE_FIX>(FwdHAicPeerFlag(FWD_H_P_READY_FLAG, 0, 0));
+            AscendC::CrossCoreSetFlag<0x4, PIPE_FIX>(FwdHAicPeerFlag(FWD_H_P_READY_FLAG, 0, 1));
+        } else {
+            CopyL0CToUbS0<decltype(blockUb)> copyP;
+            copyP(blockUb, tensorL0C, static_cast<uint8_t>(head.aiv), 0);
+            AscendC::CrossCoreSetFlag<0x4, PIPE_FIX>(
+                FwdHAicPeerFlag(FWD_H_P_READY_FLAG, head.localSlot, head.aiv));
+        }
         AscendC::SetFlag<AscendC::HardEvent::FIX_M>(FixFreeEvent(pipelineSlot));
     }
 
@@ -513,11 +529,15 @@ private:
     }
 
     __aicore__ inline void LoadRight(
-        const FwdHChunkSpan &chunk, const FwdHHeadBinding &head, uint32_t hSlot)
+        const FwdHChunkSpan &chunk, const FwdHHeadBinding &head, uint32_t hSlot,
+        bool splitP = false)
     {
         // Stage2 搬运：等待本 head 的 Stage1 MTE3 后，从 GM ND 搬入当前 H/right L1 槽。
         AscendC::CrossCoreWaitFlag<0x4, PIPE_MTE2>(
             FwdHAicPeerFlag(FWD_H_RIGHT_READY_FLAG, head.localSlot, head.aiv));
+        if (splitP) {
+            AscendC::CrossCoreWaitFlag<0x4, PIPE_MTE2>(FwdHAicPeerFlag(FWD_H_RIGHT_READY_FLAG, 0, 1));
+        }
         AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(HRightReadyEvent(hSlot));
         if (chunk.validTokens < FWD_H_CHUNK) {
             ClearL1(L1HRight(hSlot), FWD_H_L1_KG_SLOT_BYTES);
@@ -599,6 +619,9 @@ private:
         AscendC::SetFlag<AscendC::HardEvent::MTE1_MTE2>(HRightReadyEvent(hSlot));
         AscendC::CrossCoreSetFlag<0x4, PIPE_MTE1>(
             FwdHAicPeerFlag(FWD_H_RIGHT_FREE_FLAG, head.localSlot, head.aiv));
+        if (splitState && chunk.validTokens == FWD_H_CHUNK) {
+            AscendC::CrossCoreSetFlag<0x4, PIPE_MTE1>(FwdHAicPeerFlag(FWD_H_RIGHT_FREE_FLAG, 0, 1));
+        }
         AscendC::SetFlag<AscendC::HardEvent::MTE1_M>(L0AReadyEvent(pipelineSlot));
         AscendC::SetFlag<AscendC::HardEvent::MTE1_M>(L0BReadyEvent(pipelineSlot));
         AscendC::WaitFlag<AscendC::HardEvent::MTE1_M>(L0AReadyEvent(pipelineSlot));
@@ -629,9 +652,12 @@ private:
             AscendC::CrossCoreWaitFlag<0x4, PIPE_FIX>(
                 FwdHAicPeerFlag(FWD_H_P_FREE_FLAG, DataSlot(head), head.aiv));
         }
-        if (splitState && !chunk.first) {
-            AscendC::CrossCoreWaitFlag<0x4, PIPE_FIX>(
-                FwdHAicPeerFlag(FWD_H_D_FREE_FLAG, 0, 1));
+        if (splitState && chunk.validTokens == FWD_H_CHUNK) {
+            // P split across both AIV slots; both consumers must release P.
+            AscendC::CrossCoreWaitFlag<0x4, PIPE_FIX>(FwdHAicPeerFlag(FWD_H_P_FREE_FLAG, 0, 1));
+        } else if (splitState && !chunk.first) {
+            // Tail P targets only AIV0, so its Stage2 must consume prior D_FREE1.
+            AscendC::CrossCoreWaitFlag<0x4, PIPE_FIX>(FwdHAicPeerFlag(FWD_H_D_FREE_FLAG, 0, 1));
         }
         AscendC::WaitFlag<AscendC::HardEvent::M_FIX>(FixDoneEvent(pipelineSlot));
         AscendC::LocalTensor<float> dUb =
@@ -720,13 +746,19 @@ private:
             const bool stage0Ran = !(chunk.first && args_.tiling.useInitialState == 0);
             if (stage0Ran) {
                 LoadStage0H(unit, chunk, head, 0, splitState);
-                ComputeStage0Head(unit, chunk, head, 0, parity, 0);
+                ComputeStage0Head(unit, chunk, head, 0, parity, 0, splitState);
             }
             if (!NeedsStage2(chunk)) {
                 continue;
             }
 
-            LoadRight(chunk, head, 0);
+            if (splitState && chunk.validTokens < FWD_H_CHUNK) {
+                FwdHHeadBinding tailHead = head;
+                tailHead.roundHead = 1;
+                LoadRight(chunk, tailHead, 0, false);
+            } else {
+                LoadRight(chunk, head, 0, splitState);
+            }
             if (!chunk.last) {
                 const FwdHChunkSpan next = FwdHBuildChunk(unit.sequence, chunkId + 1);
                 const uint32_t nextParity = parity ^ 1U;

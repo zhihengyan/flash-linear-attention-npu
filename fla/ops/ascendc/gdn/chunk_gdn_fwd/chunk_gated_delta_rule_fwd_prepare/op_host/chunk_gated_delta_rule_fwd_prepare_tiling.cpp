@@ -33,6 +33,13 @@ static ge::graphStatus Tiling4ChunkGatedDeltaRuleFwdPrepare(gert::TilingContext 
     auto platformInfo = context->GetPlatformInfo();
     auto ascendcPlatform = platform_ascendc::PlatformAscendC(platformInfo);
     if (ascendcPlatform.GetCurNpuArch() == NpuArch::DAV_2201) {
+        const auto *attrs = context->GetAttrs();
+        const bool *bth = attrs != nullptr && attrs->GetAttrNum() > PREPARE_ATTR_SCALAR_INPUT_BTH
+                              ? attrs->GetAttrPointer<bool>(PREPARE_ATTR_SCALAR_INPUT_BTH) : nullptr;
+        if (bth != nullptr && *bth) {
+            OP_LOGE(context->GetNodeName(), "BTH scalar inputs are unsupported on DAV_2201");
+            return ge::GRAPH_FAILED;
+        }
         return Tiling4ChunkGatedDeltaRuleFwdPrepareArch22(context);
     }
     int64_t coreNum = ascendcPlatform.GetCoreNumAic();
@@ -76,6 +83,7 @@ static ge::graphStatus Tiling4ChunkGatedDeltaRuleFwdPrepare(gert::TilingContext 
     bool useGateAttr = false;
     bool useBetaAttr = false;
     bool outputAAttr = true;
+    bool scalarInputBth = false;
     if (attrPtr != nullptr) {
         const int64_t *chunkSizePtr = attrPtr->GetAttrPointer<int64_t>(PREPARE_ATTR_CHUNK_SIZE);
         const bool *allowNegPtr = attrPtr->GetAttrPointer<bool>(PREPARE_ATTR_ALLOW_NEG_EIGVAL);
@@ -84,6 +92,9 @@ static ge::graphStatus Tiling4ChunkGatedDeltaRuleFwdPrepare(gert::TilingContext 
         const bool *useGatePtr = attrPtr->GetAttrPointer<bool>(PREPARE_ATTR_USE_GATE);
         const bool *useBetaPtr = attrPtr->GetAttrPointer<bool>(PREPARE_ATTR_USE_BETA_SIGMOID);
         const bool *outputAPtr = attrPtr->GetAttrPointer<bool>(PREPARE_ATTR_OUTPUT_A);
+        const bool *bthPtr = attrPtr->GetAttrNum() > PREPARE_ATTR_SCALAR_INPUT_BTH
+                                 ? attrPtr->GetAttrPointer<bool>(PREPARE_ATTR_SCALAR_INPUT_BTH) : nullptr;
+        if (bthPtr != nullptr) { scalarInputBth = *bthPtr; }
         if (chunkSizePtr != nullptr) {
             chunkSize = *chunkSizePtr;
         }
@@ -150,6 +161,18 @@ static ge::graphStatus Tiling4ChunkGatedDeltaRuleFwdPrepare(gert::TilingContext 
     const ge::DataType gDtype = gDesc->GetDataType();
     const ge::DataType betaDtype = betaDesc->GetDataType();
 
+    if (scalarInputBth) {
+        const auto &g = LogicalShape(gShape);
+        const auto &beta = LogicalShape(betaShape);
+        if (g.GetDimNum() != 3 || beta.GetDimNum() != 3 ||
+            g.GetDim(0) != B || g.GetDim(1) != T || g.GetDim(2) != HV ||
+            beta.GetDim(0) != B || beta.GetDim(1) != T || beta.GetDim(2) != HV ||
+            HV <= 0 || HV > 65536 || useQkL2normAttr || useGateInKernel ||
+            gDtype != ge::DT_FLOAT || betaDtype != ge::DT_BF16) {
+            OP_LOGE(context->GetNodeName(), "unsupported BTH scalar inputs or attributes");
+            return ge::GRAPH_FAILED;
+        }
+    }
     if (K != 128 || (V != 128 && V != 256) || chunkSize != 64) {
         OP_LOGE(context->GetNodeName(),
                 "unsupported K=%ld V=%ld chunkSize=%ld (need K=128 V=128/256 chunkSize=64)",
@@ -215,6 +238,7 @@ static ge::graphStatus Tiling4ChunkGatedDeltaRuleFwdPrepare(gert::TilingContext 
     tiling.set_betaStorageDtype(static_cast<int64_t>(betaDtype));
     tiling.set_totalChunkTileCount(totalChunks);
     tiling.set_hasAOutput(outputAAttr ? 1 : 0);
+    tiling.set_scalarInputBth(scalarInputBth ? 1 : 0);
 
     tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
     // Kernel GET_TILING_DATA opParaSize is GetDataSize()+8 on this CANN; mismatch

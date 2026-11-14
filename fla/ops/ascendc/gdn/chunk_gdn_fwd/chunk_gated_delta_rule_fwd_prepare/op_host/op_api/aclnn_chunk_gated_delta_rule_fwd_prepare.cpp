@@ -450,7 +450,7 @@ aclnnStatus aclnnChunkGatedDeltaRuleFwdPrepareGetWorkspaceSize(
         compute.useExp2, compute.qHatOptional != nullptr,
         compute.aLogOptional != nullptr, compute.betaEffOptional != nullptr, compute.outputA,
         compute.gOut, compute.wOut, compute.uOut, compute.aOut, compute.qHatOptional, compute.kHatOptional,
-        compute.qRstdOptional, compute.kRstdOptional, compute.betaEffOptional, executorPtr);
+        compute.qRstdOptional, compute.kRstdOptional, compute.betaEffOptional, false, executorPtr);
     CHECK_RET(result[0] != nullptr, ACLNN_ERR_PARAM_NULLPTR);
     CHECK_RET(result[1] != nullptr, ACLNN_ERR_PARAM_NULLPTR);
     CHECK_RET(result[2] != nullptr, ACLNN_ERR_PARAM_NULLPTR);
