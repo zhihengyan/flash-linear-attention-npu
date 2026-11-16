@@ -293,20 +293,30 @@ __simd_vf__ inline void FwdHStage3Arch35Vf(__ubuf__ bfloat16_t *stateBf16,
                     Adds(gate1, gate0, 0.0f, mask32);
                 }
             }
-            Mul(state0, state0, gate0, mask32);
-            Mul(state1, state1, gate1, mask32);
-            Add(state0, state0, d0, mask32);
-            Add(state1, state1, d1, mask32);
-
-            if constexpr (STATE_FP32) {
-                FwdHStoreFloatPair(stateFp32 + fp32Offset, state0, state1, mask32);
+            if constexpr (STATE_FP32 && SCALAR_G && !STATE_V_FIRST && !ZERO_STATE &&
+                          ROWS == FWD_H_K / 2) {
+                // Split-state prefill: accumulate directly into D's registers.
+                // The fused operation changes FP32 rounding relative to Mul + Add.
+                MulAddDst(d0, state0, gate0, mask32);
+                MulAddDst(d1, state1, gate1, mask32);
+                FwdHStoreFloatPair(stateFp32 + fp32Offset, d0, d1, mask32);
+                if constexpr (WRITE_H) {
+                    FwdHStoreBf16(hNext + bf16Offset, d0, d1, mask32, mask16);
+                }
             } else {
-                FwdHStoreBf16(stateBf16 + bf16Offset, state0, state1, mask32, mask16);
-            }
-            if constexpr (WRITE_H && STATE_FP32) {
-                // FP32 state 没有独立的 32 KiB H bank。当前 D 行读入寄存器后，允许把
-                // BF16 H 原位写到 D slot 的低半区；写地址只覆盖已经消费的 D 行。
-                FwdHStoreBf16(hNext + bf16Offset, state0, state1, mask32, mask16);
+                Mul(state0, state0, gate0, mask32);
+                Mul(state1, state1, gate1, mask32);
+                Add(state0, state0, d0, mask32);
+                Add(state1, state1, d1, mask32);
+                if constexpr (STATE_FP32) {
+                    FwdHStoreFloatPair(stateFp32 + fp32Offset, state0, state1, mask32);
+                } else {
+                    FwdHStoreBf16(stateBf16 + bf16Offset, state0, state1, mask32, mask16);
+                }
+                if constexpr (WRITE_H && STATE_FP32) {
+                    // BF16 H reuses the already-consumed low half of the D slot.
+                    FwdHStoreBf16(hNext + bf16Offset, state0, state1, mask32, mask16);
+                }
             }
         }
     }
@@ -351,6 +361,7 @@ public:
     {
         const FwdHCoreHeadRange range =
             FwdHResolveCoreHeadRange(args_.tiling, coreIdx_, coreNum_);
+        singleHeadCore_ = range.end == range.begin + 1;
         const uint32_t headsPerSequence = static_cast<uint32_t>(args_.tiling.vNumHead);
         uint32_t cachedSequence = FwdHSequenceCount(args_.tiling);
         FwdHSequenceSpan sequenceSpan{};
@@ -1194,9 +1205,9 @@ private:
     {
         AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(WorkFreeEvent(inputSlot));
         AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(GateFreeEvent(inputSlot));
-        const bool full = chunk.validTokens == FWD_H_CHUNK;
-        const uint32_t rows = full ? FWD_H_CHUNK / 2 : chunk.validTokens;
-        const uint32_t rowOffset = full ? aiv_ * (FWD_H_CHUNK / 2) : 0;
+        const bool splitP = FwdHCanSplitStage1(singleHeadCore_, chunk);
+        const uint32_t rows = splitP ? FWD_H_CHUNK / 2 : chunk.validTokens;
+        const uint32_t rowOffset = splitP ? aiv_ * (FWD_H_CHUNK / 2) : 0;
         AscendC::GlobalTensor<bfloat16_t> u;
         u.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(args_.u));
         u.SetL2CacheHint(AscendC::CacheMode::CACHE_MODE_DISABLE);
@@ -1282,8 +1293,11 @@ private:
                 if (chunkId > 0) {
                     AscendC::CrossCoreWaitFlag<0x4, PIPE_V>(FwdHAivLocalFlag(FWD_H_RIGHT_FREE_FLAG, 0));
                 }
-                if (chunk.validTokens == FWD_H_CHUNK) {
+                if (FwdHCanSplitStage1(singleHeadCore_, chunk)) {
                     ConsumeSplitStage1Head(unit, chunk, head, gateSlot);
+                } else if (chunk.validTokens == FWD_H_CHUNK) {
+                    DispatchStage1<true>(unit, chunk, head, gateSlot, true, true, false);
+                    AscendC::CrossCoreSetFlag<0x4, PIPE_MTE3>(FwdHAivLocalFlag(FWD_H_RIGHT_READY_FLAG, 0));
                 } else {
                     // A lone head has four reserved right slots; use slot 1 for
                     // the partial tail so it cannot overlap the preceding full
@@ -1298,11 +1312,11 @@ private:
                 // this chunk is a partial tail.
                 if (chunkId > 0) {
                     const FwdHChunkSpan prev = FwdHBuildChunk(unit.sequence, chunkId - 1);
-                    if (prev.validTokens == FWD_H_CHUNK) {
+                    if (FwdHCanSplitStage1(singleHeadCore_, prev)) {
                         AscendC::CrossCoreWaitFlag<0x4, PIPE_V>(FwdHAivLocalFlag(FWD_H_RIGHT_FREE_FLAG, 0));
                     }
                 }
-                if (chunk.validTokens == FWD_H_CHUNK) {
+                if (FwdHCanSplitStage1(singleHeadCore_, chunk)) {
                     PrefetchSplitStage1Inputs(unit, chunk, head, gateSlot);
                     AcquireStage1LocalSlot(head);
                     ConsumeSplitStage1Head(unit, chunk, head, gateSlot);
@@ -1387,7 +1401,7 @@ private:
         }
         if (splitState && aiv_ == 1) {
             const FwdHChunkSpan last = FwdHBuildChunk(unit.sequence, unit.sequence.chunkCount - 1);
-            if (last.validTokens == FWD_H_CHUNK) {
+            if (FwdHCanSplitStage1(singleHeadCore_, last)) {
                 // localHeads=0 cannot drain the extra RIGHT_FREE1 credit.
                 AscendC::CrossCoreWaitFlag<0x4, PIPE_V>(FwdHAivLocalFlag(FWD_H_RIGHT_FREE_FLAG, 0));
             }
@@ -1408,6 +1422,7 @@ private:
     FwdHKernelArgs args_{};
     uint32_t coreIdx_ = 0;
     uint32_t coreNum_ = 1;
+    bool singleHeadCore_ = false;
     uint32_t aiv_ = 0;
     // allocator 从 dynamicStartUB 分配 GetRuntimeUBSize()，保留 split-core AIV 的
     // 高端 8 KiB VF 栈，不假设运行时 UB 起始地址为 0。

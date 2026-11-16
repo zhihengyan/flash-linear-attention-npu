@@ -195,6 +195,13 @@ __aicore__ inline FwdHChunkSpan FwdHBuildChunk(const FwdHSequenceSpan &sequence,
     return span;
 }
 
+// Split Stage1 only if this core owns exactly one head task. This keeps
+// multi-round cores on the one-writer path while retaining the prefill split.
+__aicore__ inline bool FwdHCanSplitStage1(bool singleHeadCore, const FwdHChunkSpan &chunk)
+{
+    return singleHeadCore && chunk.validTokens == FWD_H_CHUNK;
+}
+
 template <FwdHGateMode GATE_MODE>
 __aicore__ inline FwdHWorkUnit FwdHResolveWorkUnit(const FwdHKernelArgs &args, uint32_t workUnitId,
                                                    FwdHSequenceCursor &cursor)

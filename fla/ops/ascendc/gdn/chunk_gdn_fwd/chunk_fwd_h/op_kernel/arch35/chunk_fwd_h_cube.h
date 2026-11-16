@@ -46,6 +46,7 @@ public:
     {
         const FwdHCoreHeadRange range =
             FwdHResolveCoreHeadRange(args_.tiling, coreIdx_, coreNum_);
+        singleHeadCore_ = range.end == range.begin + 1;
         const uint32_t headsPerSequence = static_cast<uint32_t>(args_.tiling.vNumHead);
         uint32_t cachedSequence = FwdHSequenceCount(args_.tiling);
         FwdHSequenceSpan sequenceSpan{};
@@ -430,7 +431,7 @@ private:
             AscendC::CrossCoreWaitFlag<0x4, PIPE_FIX>(
                 FwdHAicPeerFlag(FWD_H_D_FREE_FLAG, DataSlot(head), head.aiv));
         }
-        const bool splitP = splitState && chunk.validTokens == FWD_H_CHUNK;
+        const bool splitP = splitState && FwdHCanSplitStage1(singleHeadCore_, chunk);
         if (splitP && !chunk.first) {
             // Previous split D occupied AIV1 slot 0. Consume its free credit
             // before writing this chunk's second half of P to that slot.
@@ -619,7 +620,7 @@ private:
         AscendC::SetFlag<AscendC::HardEvent::MTE1_MTE2>(HRightReadyEvent(hSlot));
         AscendC::CrossCoreSetFlag<0x4, PIPE_MTE1>(
             FwdHAicPeerFlag(FWD_H_RIGHT_FREE_FLAG, head.localSlot, head.aiv));
-        if (splitState && chunk.validTokens == FWD_H_CHUNK) {
+        if (splitState && FwdHCanSplitStage1(singleHeadCore_, chunk)) {
             AscendC::CrossCoreSetFlag<0x4, PIPE_MTE1>(FwdHAicPeerFlag(FWD_H_RIGHT_FREE_FLAG, 0, 1));
         }
         AscendC::SetFlag<AscendC::HardEvent::MTE1_M>(L0AReadyEvent(pipelineSlot));
@@ -652,11 +653,11 @@ private:
             AscendC::CrossCoreWaitFlag<0x4, PIPE_FIX>(
                 FwdHAicPeerFlag(FWD_H_P_FREE_FLAG, DataSlot(head), head.aiv));
         }
-        if (splitState && chunk.validTokens == FWD_H_CHUNK) {
+        if (splitState && FwdHCanSplitStage1(singleHeadCore_, chunk)) {
             // P split across both AIV slots; both consumers must release P.
             AscendC::CrossCoreWaitFlag<0x4, PIPE_FIX>(FwdHAicPeerFlag(FWD_H_P_FREE_FLAG, 0, 1));
         } else if (splitState && !chunk.first) {
-            // Tail P targets only AIV0, so its Stage2 must consume prior D_FREE1.
+            // Unsplit P targets only AIV0, so Stage2 must consume prior D_FREE1.
             AscendC::CrossCoreWaitFlag<0x4, PIPE_FIX>(FwdHAicPeerFlag(FWD_H_D_FREE_FLAG, 0, 1));
         }
         AscendC::WaitFlag<AscendC::HardEvent::M_FIX>(FixDoneEvent(pipelineSlot));
@@ -757,7 +758,7 @@ private:
                 tailHead.roundHead = 1;
                 LoadRight(chunk, tailHead, 0, false);
             } else {
-                LoadRight(chunk, head, 0, splitState);
+                LoadRight(chunk, head, 0, splitState && FwdHCanSplitStage1(singleHeadCore_, chunk));
             }
             if (!chunk.last) {
                 const FwdHChunkSpan next = FwdHBuildChunk(unit.sequence, chunkId + 1);
@@ -867,6 +868,7 @@ private:
     FwdHKernelArgs args_{};
     uint32_t coreIdx_ = 0;
     uint32_t coreNum_ = 1;
+    bool singleHeadCore_ = false;
     bool hasCubeWork_ = false;
 };
 
