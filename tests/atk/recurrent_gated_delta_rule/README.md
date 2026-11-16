@@ -81,3 +81,28 @@ YAML 的 SOC 元信息覆盖 `ascend910b`、`ascend910_93` 和 `ascend950`。精
   kernel 报告 `No error detected`。
 - 性能：`atk_recurrent_gated_delta_rule_perf.json` 的 1 条用例成功执行，
   ATK profiler 平均设备时间为 `18.4066 us`；本轮无性能基线或性能目标变更。
+
+## A5 HK=16、HV=48 分核验证
+
+性能 JSON 新增 RGDR-G070：B=1、T=2、K=V=128、HK=16、HV=48，BF16 Q/K/V 和 beta、FP32 State 和 g，连续布局。`gen_vsplit_cases.py` 生成单独的 `atk_recurrent_gated_delta_rule_vsplit.json`，11 条覆盖 T=1/5/6/8、State/g/beta 八种 dtype、非连续布局、融合开关、二维索引、accepted token 和 prefix。生成及测试命令（在隔离环境运行）：
+
+```bash
+python3 tests/atk/recurrent_gated_delta_rule/gen_vsplit_cases.py
+cd tests/atk/recurrent_gated_delta_rule
+atk node --name npu_dut --backend npu --devices 1 --output_path /tmp/rgdr_vsplit \
+  node --name cpu_golden --backend cpu --output_path /tmp/rgdr_vsplit \
+  task -c atk_recurrent_gated_delta_rule_vsplit.json --task accuracy --bm_device cpu \
+  -p executor_recurrent_gated_delta_rule.py --gm_init_flag 512 -sp -to 2000
+```
+
+算术特化候选在 Ascend 950DT 上通过目标用例、上述 11 条回归及 G070/G088/G089 输出信号检查。实验 wheel 三轮交错测量中，基线 `base-1116` 的 60 次目标 Kernel Task Duration 中位数为 8.1035 µs，候选为 7.165 µs，下降约 11.58%；发布构建的完整回归和性能结果待补充。
+
+### 小幅值输出的补充检查
+
+ATK 的 `mixed_tolerance_bm` 在本环境使用单 CPU 标杆，BF16 的绝对容差可使 G088（id 187）和 G089（id 188）中输出全零或取反仍通过逐点比较，尽管完整 State 仍单独比较。因此额外运行如下输出信号检查，不修改 ATK 规则或输入范围：
+
+```bash
+python3 tests/atk/recurrent_gated_delta_rule/test_output_signal.py --device 1
+```
+
+该检查覆盖目标 G070 和 G088/G089，要求 NPU out 相对于 CPU 参考的归一化 RMS 误差小于 0.10；同一检查还用全零和符号反转结果作为负例，要求二者被拒。基线和本候选对应三例测得的归一化 RMS 误差分别为 0.000034548、0.003536561、0.000000000；两个负例分别为 1 和 2。此检查补充而非替代原精度和 State 比较。

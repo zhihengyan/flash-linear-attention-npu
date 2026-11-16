@@ -8,7 +8,7 @@
 保留两个 host ABI。该迁移不改变融合实现的计算、任务划分、地址规划和同步协议。
 host 统一按融合契约校验 dtype 与属性，不再设置版本选择字段或隐藏属性。A2/A3 与 A5
 分别编译 arch22 和 arch35，各架构内部的两个 host ABI 进入同一实现。
-CPU 标杆独立实现递推及开关预处理，比较 out 和完整 State；保持原输入值域及 ATK 原生双标杆标准。
+CPU 标杆独立实现递推及开关预处理，比较 out 和完整 State；保持原输入值域。A5 使用 ATK mixed_tolerance_bm 单 CPU 标杆，并额外验证指定小幅值用例的输出信号。
 性能采用 msprof `Task Duration(us)`，本次没有额外性能提升目标。
 
 ## 2. A2/A3 Stage 0–N 完整详设
@@ -87,3 +87,11 @@ A5 使用静态 UB Tensor，显式 mutex 管理 MTE2/Vector/MTE3 所有权，不
 
 A5 回归使用 223 条 ATK 矩阵，并使用 issue 679 的 36 个模型 shape 检查性能；最终
 验收数据必须来自合并后的统一算子，不能沿用 standalone V2 的历史记录。
+
+### A5 目标 GVA 形状的 V 行分核
+
+对于 AIV 数不少于 64、B=1、HK=16、HV=48，host 使用 64 个 AIV；其余形状沿用原分核。每组四核处理共享同一 Q/K head 的三个 value head：lane0 处理 head0 的 [0,96)，lane1 依次处理 head0 的 [96,128) 和 head1 的 [0,64)，lane2 依次处理 head1 的 [64,128) 和 head2 的 [0,32)，lane3 处理 head2 的 [32,128)。每个 head 的 V 行完整覆盖且互不重叠；每段在独立 UB bank 内按原 token 次序递推，State GM 地址加 `rowStart * stateStride2`，并保留 State 的真实 stride。此映射下 batch=0、head=headTask、qkHead=blockIdx/4；其他形状仍使用通用映射。若扩充分核条件，必须同步检查该映射和边界。
+
+Q/K、gate 和 beta 按原路径搬运，V 按分片只搬入所需行，保留 GM 与 UB 的 token 间距；不满足搬运间隔范围时回退全量拷贝。输出 DMA 的 UB 源步长按 32 字节块、GM 目的步长按字节计，分片边界均与 BF16 32 字节块对齐。VF 的每两行输出依次转为 BF16 并合并为一次存储，不改变 State 的递推顺序。分核路径首个有效任务使用尚未被 Vector 使用的 State bank，无需初始 V→MTE2 握手；后续任务按原协议在前次最后消费后发出并等待事件。State 的 MTE2→V、V→MTE3 和输入输出 buffer 依赖继续使用原 mutex。空序列不消费事件，非分核路径沿用初始握手。
+
+目标用例 B=1、T=2、HK=16、HV=48、K=V=128，BF16 Q/K/V 和 beta、FP32 State 和 g。Ascend 950DT 上实验候选三轮交错测量：base-1116 的 60 个目标 Kernel Task Duration 样本中位数为 8.1035 µs，候选为 7.165 µs，下降约 11.58%；最终版本的验证结果见 ATK README 和本地实验记录。

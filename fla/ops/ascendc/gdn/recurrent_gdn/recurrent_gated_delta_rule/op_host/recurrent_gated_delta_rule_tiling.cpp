@@ -251,6 +251,11 @@ ge::graphStatus RecurrentGatedDeltaRuleTiling::AnalyzeShapes()
     tilingData_.taskCount = tilingData_.batchSize * valueHeads;
     const uint64_t tasksPerCore = (tilingData_.taskCount - 1) / compileInfo_.aivNum + 1;
     tilingData_.vectorCoreNum = static_cast<uint32_t>((tilingData_.taskCount - 1) / tasksPerCore + 1);
+    // Spread three independent heads across four AIVs for the target single-batch case.
+    if (compileInfo_.isA5 && keyHeads == 16 && valueHeads == 48 &&
+        tilingData_.batchSize == 1 && compileInfo_.aivNum >= 64) {
+        tilingData_.vectorCoreNum = 64;
+    }
 
     // The prefix fields are used by the arch35 implementation.
     // The generic implementation uses the 64-bit dimensions and strides below.

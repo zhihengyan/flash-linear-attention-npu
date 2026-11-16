@@ -38,7 +38,8 @@ template <typename inType, typename outType, typename stateType, typename gType,
 __simd_vf__ inline void
 RecurrentGatedDeltaRuleVf(__ubuf__ stateType *stateOut, __ubuf__ stateType *stateIn, __ubuf__ inType *keyRaw,
                           __ubuf__ inType *queryRaw, __ubuf__ inType *valueRaw, __ubuf__ gType *gRaw,
-                          __ubuf__ betaType *betaRaw, __ubuf__ outType *output, float scale, float aLog, float dtBias)
+                          __ubuf__ betaType *betaRaw, __ubuf__ outType *output, float scale, float aLog, float dtBias,
+                          uint16_t stateRows)
 {
     MaskReg maskFp32 = CreateMask<float, MaskPattern::ALL>();
     MaskReg maskB16 = CreateMask<half, MaskPattern::ALL>();
@@ -184,7 +185,7 @@ RecurrentGatedDeltaRuleVf(__ubuf__ stateType *stateOut, __ubuf__ stateType *stat
     Mul(updateKey0, key0, beta, maskFp32);
     Mul(updateKey1, key1, beta, maskFp32);
 
-    for (row = 0; row < REQUIRED_DIM_128; row += 2) {
+    for (row = 0; row < stateRows; row += 2) {
         rowOffset = static_cast<uint32_t>(row) * REQUIRED_DIM_128;
         if constexpr (!std::is_same<stateType, float>::value) {
             LoadAlign<stateType, LoadDist::DIST_NORM>(statePacked, stateIn + rowOffset);
@@ -246,10 +247,9 @@ RecurrentGatedDeltaRuleVf(__ubuf__ stateType *stateOut, __ubuf__ stateType *stat
             StoreUnAlign(outputAddr, outSum, outputStore, 1);
             StoreUnAlign(outputAddr, outSumNext, outputStore, 1);
         } else {
+            Cast<outType, float, FP32_TO_B16_ONE>(outputPacked, outSumNext, maskFirst);
             Cast<outType, float, FP32_TO_B16_ZERO>(outputPacked, outSum, maskFirst);
-            StoreUnAlign(outputAddr, outputPacked, outputStore, 1);
-            Cast<outType, float, FP32_TO_B16_ZERO>(outputPacked, outSumNext, maskFirst);
-            StoreUnAlign(outputAddr, outputPacked, outputStore, 1);
+            StoreUnAlign(outputAddr, outputPacked, outputStore, 2);
         }
     }
     StoreUnAlignPost(outputAddr, outputStore, 0);
@@ -313,35 +313,87 @@ public:
             }
             PipeBarrier<PIPE_ALL>();
         }
-        SetFlag<HardEvent::V_MTE2>(EVENT_ID0);
+        // The first split-head task has no previous V consumer to protect.
+        // Preserve the original initial handshake for the general path.
+        if (GetBlockNum() <= static_cast<uint64_t>(B_) * NV_) {
+            SetFlag<HardEvent::V_MTE2>(EVENT_ID0);
+        }
     }
 
     __aicore__ inline void Process()
     {
-        const uint64_t taskNum = static_cast<uint64_t>(B_) * NV_;
+        const uint64_t headTaskNum = static_cast<uint64_t>(B_) * NV_;
         const uint64_t coreNum = GetBlockNum();
+        const bool splitHeads = coreNum > headTaskNum;
+        const uint64_t taskNum = splitHeads ? coreNum * 2 : headTaskNum;
         uint32_t currentBank = 0;
+        bool firstValidTask = true;
         seqValid_ = false;
         uint32_t tileIndex = 0;
         for (uint64_t taskIdx = blockIdx_; taskIdx < taskNum; taskIdx += coreNum) {
-            const uint64_t batch = taskIdx / NV_;
-            const uint64_t head = taskIdx % NV_;
+            const uint32_t lane = blockIdx_ % 4;
+            const uint32_t pass = taskIdx / coreNum;
+            if (splitHeads && pass != 0 && (lane == 0 || lane == 3)) {
+                continue;
+            }
+            uint64_t headTask = taskIdx;
+            uint32_t rowStart = 0;
+            uint32_t stateRows = REQUIRED_DIM_128;
+            if (splitHeads) {
+                const uint32_t headBase = (blockIdx_ / 4) * 3;
+                if (lane == 0) {
+                    headTask = headBase;
+                    stateRows = 96;
+                } else if (lane == 1) {
+                    headTask = headBase + pass;
+                    rowStart = pass == 0 ? 96 : 0;
+                    stateRows = pass == 0 ? 32 : 64;
+                } else if (lane == 2) {
+                    headTask = headBase + 1 + pass;
+                    rowStart = pass == 0 ? 64 : 0;
+                    stateRows = pass == 0 ? 64 : 32;
+                } else {
+                    headTask = headBase + 2;
+                    rowStart = 32;
+                    stateRows = 96;
+                }
+            }
+            // The only host path with splitHeads has B=1, HK=16, HV=48.
+            // Each group of four blocks owns exactly three value heads, all
+            // mapped to the same q/k head. Keep this coupled to host tiling.
+            uint64_t batch;
+            uint64_t head;
+            uint64_t qkHead;
+            if (splitHeads) {
+                batch = 0;
+                head = headTask;
+                qkHead = blockIdx_ / 4;
+            } else {
+                batch = headTask / NV_;
+                head = headTask % NV_;
+                qkHead = head / (NV_ / NK_);
+            }
             UpdateSeq(batch);
             if (seqStart_ == seqEnd_) {
                 continue;
             }
             const uint64_t stateSlot = ResolveInitialStateSlot(batch, seqStart_);
-            const uint64_t qkHead = head / (NV_ / NK_);
-            const uint64_t stateOffset = stateInStride0_ * stateSlot + stateInStride1_ * head;
+            const uint64_t stateOffset = stateInStride0_ * stateSlot + stateInStride1_ * head + stateInStride2_ * rowStart;
             constexpr uint32_t stateElements = REQUIRED_DIM_128 * REQUIRED_DIM_128;
             const int64_t taskTokens = seqEnd_ - seqStart_;
-            const bool hasNextTask = taskIdx + coreNum < taskNum;
+            const bool hasNextTask = taskIdx + coreNum < taskNum &&
+                                     (!splitHeads || (lane != 0 && lane != 3));
             currentBank = (currentBank + 1U) % STATE_BANKS_3;
             LocalTensor<stateType> stateInput = stateBanks_[currentBank].template ReinterpretCast<stateType>();
-            WaitFlag<HardEvent::V_MTE2>(EVENT_ID0);
+            // Only later split-head tasks have a preceding V consumer. Empty
+            // sequences leave firstValidTask set and never consume an event.
+            if (!splitHeads || !firstValidTask) {
+                WaitFlag<HardEvent::V_MTE2>(EVENT_ID0);
+            }
+            firstValidTask = false;
             Mutex::Lock<PIPE_MTE2>(STATE_MUTEX[currentBank]);
             const DataCopyExtParams stateInParams{
-                REQUIRED_DIM_128, REQUIRED_DIM_128 * sizeof(stateType),
+                static_cast<uint16_t>(stateRows), REQUIRED_DIM_128 * sizeof(stateType),
                 static_cast<uint32_t>((stateInStride2_ - REQUIRED_DIM_128) * sizeof(stateType)), 0, 0};
             const DataCopyPadExtParams<stateType> stateInPad{false, 0, 0, static_cast<stateType>(0)};
             DataCopyPad(stateInput, initStateGm_[stateOffset], stateInParams, stateInPad);
@@ -356,7 +408,7 @@ public:
                 const int64_t end = start + TOKEN_TILE_4 < seqEnd_ ? start + TOKEN_TILE_4 : seqEnd_;
                 const uint16_t rows = static_cast<uint16_t>(end - start);
                 const uint32_t tileBuffer = tileIndex & 1U;
-                CopyInputTile(tileBuffer, start, end, qkHead, head);
+                CopyInputTile(tileBuffer, start, end, qkHead, head, rowStart, stateRows);
 
                 Mutex::Lock<PIPE_V>(INPUT_MUTEX[tileBuffer]);
                 Mutex::Lock<PIPE_V>(OUTPUT_MUTEX[tileBuffer]);
@@ -365,17 +417,17 @@ public:
                     const uint64_t outputSlot = LoadStateSlot(batch, seqStart_, seqIndex);
                     const uint32_t nextBank = (currentBank + 1U) % STATE_BANKS_3;
                     Mutex::Lock<PIPE_V>(STATE_MUTEX[nextBank]);
-                    ComputeOne<USE_GATE_IN_KERNEL>(tileBuffer, token, currentBank, nextBank, aLog, dtBias);
+                    ComputeOne<USE_GATE_IN_KERNEL>(tileBuffer, token, currentBank, nextBank, aLog, dtBias, rowStart, stateRows);
                     Mutex::Unlock<PIPE_V>(STATE_MUTEX[nextBank]);
                     if (taskTokens > 1 && hasNextTask && seqIndex - seqStart_ == taskTokens - 2) {
                         SetFlag<HardEvent::V_MTE2>(EVENT_ID0);
                     }
 
-                    const uint64_t stateOutOffset = stateOutStride0_ * outputSlot + stateOutStride1_ * head;
+                    const uint64_t stateOutOffset = stateOutStride0_ * outputSlot + stateOutStride1_ * head + stateOutStride2_ * rowStart;
                     LocalTensor<stateType> stateOut = stateBanks_[nextBank].template ReinterpretCast<stateType>();
                     Mutex::Lock<PIPE_MTE3>(STATE_MUTEX[nextBank]);
                     const DataCopyExtParams stateOutParams{
-                        REQUIRED_DIM_128, REQUIRED_DIM_128 * sizeof(stateType), 0,
+                        static_cast<uint16_t>(stateRows), REQUIRED_DIM_128 * sizeof(stateType), 0,
                         static_cast<uint32_t>((stateOutStride2_ - REQUIRED_DIM_128) * sizeof(stateType)), 0};
                     DataCopyPad(finalStateGm_[stateOutOffset], stateOut, stateOutParams);
                     Mutex::Unlock<PIPE_MTE3>(STATE_MUTEX[nextBank]);
@@ -385,11 +437,12 @@ public:
                 Mutex::Unlock<PIPE_V>(INPUT_MUTEX[tileBuffer]);
                 Mutex::Unlock<PIPE_V>(OUTPUT_MUTEX[tileBuffer]);
 
-                const uint64_t attnOffset = (static_cast<uint64_t>(start) * NV_ + head) * REQUIRED_DIM_128;
-                DataCopyExtParams attnParams{rows, REQUIRED_DIM_128 * sizeof(outType), 0,
-                                             static_cast<uint32_t>((NV_ - 1) * REQUIRED_DIM_128 * sizeof(outType)), 0};
+                const uint64_t attnOffset = (static_cast<uint64_t>(start) * NV_ + head) * REQUIRED_DIM_128 + rowStart;
+                DataCopyExtParams attnParams{rows, static_cast<uint32_t>(stateRows * sizeof(outType)),
+                                             static_cast<uint32_t>((REQUIRED_DIM_128 - stateRows) * sizeof(outType) / DATA_BLOCK_BYTES_32),
+                                             static_cast<uint32_t>((NV_ * REQUIRED_DIM_128 - stateRows) * sizeof(outType)), 0};
                 Mutex::Lock<PIPE_MTE3>(OUTPUT_MUTEX[tileBuffer]);
-                DataCopyPad(attnOutGm_[attnOffset], attnTileOut_[tileBuffer], attnParams);
+                DataCopyPad(attnOutGm_[attnOffset], attnTileOut_[tileBuffer][rowStart], attnParams);
                 Mutex::Unlock<PIPE_MTE3>(OUTPUT_MUTEX[tileBuffer]);
             }
         }
@@ -466,7 +519,7 @@ private:
     }
 
     __aicore__ inline void CopyInputTile(uint32_t buffer, int64_t start, int64_t end, uint64_t qkHead,
-                                         uint64_t valueHead)
+                                         uint64_t valueHead, uint32_t rowStart, uint32_t stateRows)
     {
         const uint16_t rows = static_cast<uint16_t>(end - start);
         const uint64_t qOffset = static_cast<uint64_t>(start) * queryTokenStride_ + qkHead * queryHeadStride_;
@@ -494,7 +547,18 @@ private:
         Mutex::Lock<PIPE_MTE2>(INPUT_MUTEX[buffer]);
         DataCopyPad(qTile_[buffer], queryGm_[qOffset], queryCopyParams, qkvPad);
         DataCopyPad(kTile_[buffer], keyGm_[kOffset], keyCopyParams, qkvPad);
-        DataCopyPad(vTile_[buffer], valueGm_[vOffset], valueCopyParams, qkvPad);
+        // Copy only the V rows consumed by this partition. Both the source and
+        // destination retain the full token stride, while every local row start
+        // and copied block is 32-byte aligned for 16-bit inputs.
+        const uint64_t slicedGap = (valueTokenStride_ - stateRows) * sizeof(inType);
+        if (stateRows != REQUIRED_DIM_128 && slicedGap <= 0xFFFFFFFFULL) {
+            const DataCopyExtParams valueSliceParams{
+                rows, static_cast<uint32_t>(stateRows * sizeof(inType)), static_cast<uint32_t>(slicedGap),
+                static_cast<uint32_t>((REQUIRED_DIM_128 - stateRows) * sizeof(inType) / DATA_BLOCK_BYTES_32), 0};
+            DataCopyPad(vTile_[buffer][rowStart], valueGm_[vOffset + rowStart], valueSliceParams, qkvPad);
+        } else {
+            DataCopyPad(vTile_[buffer], valueGm_[vOffset], valueCopyParams, qkvPad);
+        }
         if (hasGama_) { DataCopyPad(gTile_[buffer], gGm_[scalarOffset], params, pad); }
         DataCopyPad(betaTile_[buffer], betaGm_[scalarOffset], betaParams, betaPad);
         Mutex::Unlock<PIPE_MTE2>(INPUT_MUTEX[buffer]);
@@ -502,7 +566,7 @@ private:
 
     template <bool RAW_GATE>
     __aicore__ inline void ComputeOne(uint32_t buffer, uint16_t token, uint32_t srcBank, uint32_t dstBank, float aLog,
-                                      float dtBias)
+                                      float dtBias, uint32_t rowStart, uint32_t stateRows)
     {
         constexpr uint32_t gStride = DATA_BLOCK_BYTES_32 / sizeof(gType);
         constexpr uint32_t betaStride = DATA_BLOCK_BYTES_32 / sizeof(betaType);
@@ -512,10 +576,11 @@ private:
                                   USE_BETA_SIGMOID, ALLOW_NEG_EIGVAL>(
             stateOutputAddr, stateInputAddr, (__ubuf__ inType *)kTile_[buffer][token * REQUIRED_DIM_128].GetPhyAddr(),
             (__ubuf__ inType *)qTile_[buffer][token * REQUIRED_DIM_128].GetPhyAddr(),
-            (__ubuf__ inType *)vTile_[buffer][token * REQUIRED_DIM_128].GetPhyAddr(),
+            (__ubuf__ inType *)vTile_[buffer][token * REQUIRED_DIM_128 + rowStart].GetPhyAddr(),
             (__ubuf__ gType *)gTile_[buffer][token * gStride].GetPhyAddr(),
             (__ubuf__ betaType *)betaTile_[buffer][token * betaStride].GetPhyAddr(),
-            (__ubuf__ outType *)attnTileOut_[buffer][token * REQUIRED_DIM_128].GetPhyAddr(), scale_, aLog, dtBias);
+            (__ubuf__ outType *)attnTileOut_[buffer][token * REQUIRED_DIM_128 + rowStart].GetPhyAddr(), scale_, aLog, dtBias,
+            static_cast<uint16_t>(stateRows));
     }
 
 private:
