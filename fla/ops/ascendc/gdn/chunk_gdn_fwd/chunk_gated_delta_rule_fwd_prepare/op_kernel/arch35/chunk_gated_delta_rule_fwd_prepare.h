@@ -1051,9 +1051,11 @@ public:
                 DecodeTask(cur.base, cur.nThis, t, directChunk, directHv);
                 TimerBegin(AscendTimer::AIC_S2_WAIT_S1, t);
                 if (useQkL2norm == 0 && directChunk.M == chunkSize) {
-                    // The ready flag protects the NegL/K L1 alias. Wait on
-                    // the same MTE2 pipe that performs the direct K upload.
-                    CrossCoreWaitFlag<0x4, PIPE_MTE2>(CubeWaitFlagForTask(t));
+                    // The ready flag protects the NegL/K L1 alias. Normal
+                    // builds wait on the MTE2 pipe that performs the direct K
+                    // upload; timer builds pin the wait to PIPE_S so the scalar
+                    // timestamp lands on the real release edge (see common.h).
+                    PREPARE_CC_WAIT(0x4, PIPE_MTE2, CubeWaitFlagForTask(t));
                     TimerEnd(AscendTimer::AIC_S2_WAIT_S1, t);
                     TimerBegin(AscendTimer::AIC_S1_DIRECT_K_COPY, t);
                     const int64_t offK = OffsetBHTD(directChunk.batch, directHv / HRatio,

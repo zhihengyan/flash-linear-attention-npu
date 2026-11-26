@@ -167,6 +167,24 @@ constexpr uint16_t kFlagNegLFreeBase = 8;
 #ifndef PREPARE_EARLY_NEGL_FREE
 #define PREPARE_EARLY_NEGL_FREE 0
 #endif
+#ifndef ENABLE_TIMER
+#define ENABLE_TIMER 0
+#endif
+
+// Cross-core wait pipe selection. Normal builds keep each wait's original pipe
+// so the business pipeline is untouched. ENABLE_TIMER=1 diagnostic builds pin
+// every cross-core wait to PIPE_S: GetSystemCycle is a scalar read, and a wait
+// that only blocks MTE1/V lets the scalar run ahead, so an AIC Tik/Tok is issued
+// before the AIV stage it actually depends on (S2 then shows up before S1 on a
+// merged C/V timeline). PIPE_S stops only the scalar at the flag, landing the
+// timestamp on the real release edge without draining MTE1/MTE2/FIX (the
+// PIPE_ALL variant keeps the right order but cost ~23% on Prepare).
+// SetFlag keeps its producer pipe; only the wait side is pinned for timing.
+#if ENABLE_TIMER
+#define PREPARE_CC_WAIT(mode, pipe, id) AscendC::CrossCoreWaitFlag<mode, PIPE_S>(id)
+#else
+#define PREPARE_CC_WAIT(mode, pipe, id) AscendC::CrossCoreWaitFlag<mode, pipe>(id)
+#endif
 // Stage6→Stage7 reuses Stage3 ids 4..7 (AIC sees AIV1 as 20,21,22,23).
 // Those are consumed after Stage4. Ids 0..3 still carry the Stage2 kkt
 // notify on PIPE_FIX; a PIPE_MTE1 Wait(0) can steal that leftover and
@@ -223,7 +241,7 @@ __aicore__ inline void NotifyAicStage1Done(int64_t taskIdx)
 
 __aicore__ inline void WaitAivStage1Done(int64_t taskIdx)
 {
-    AscendC::CrossCoreWaitFlag<0x4, PIPE_MTE1>(CubeWaitFlagForTask(taskIdx));
+    PREPARE_CC_WAIT(0x4, PIPE_MTE1, CubeWaitFlagForTask(taskIdx));
 }
 
 // Same ids as Stage1 (0,1,2,3). AIC already Waited this id for k' ready,
@@ -236,7 +254,7 @@ __aicore__ inline void NotifyAivKktDone(int64_t taskIdx)
 
 __aicore__ inline void WaitCubeKktDone(int64_t taskIdx)
 {
-    AscendC::CrossCoreWaitFlag<0x4, PIPE_V>(static_cast<uint16_t>(taskIdx));
+    PREPARE_CC_WAIT(0x4, PIPE_V, static_cast<uint16_t>(taskIdx));
 }
 
 // Stage3 L1 ready → Stage4. AIV Sets raw taskIdx+4; AIC Waits +16 on AIV1.
@@ -247,7 +265,7 @@ __aicore__ inline void NotifyAicStage3Done(int64_t taskIdx)
 
 __aicore__ inline void WaitAivStage3Done(int64_t taskIdx)
 {
-    AscendC::CrossCoreWaitFlag<0x4, PIPE_MTE1>(CubeWaitFlagForTask(taskIdx + kFlagS3DoneBase));
+    PREPARE_CC_WAIT(0x4, PIPE_MTE1, CubeWaitFlagForTask(taskIdx + kFlagS3DoneBase));
 }
 
 // Stage4 NegL alias free. Default: after Y dump. Diagnostic early-free:
@@ -259,7 +277,7 @@ __aicore__ inline void NotifyAivNegLFree(int64_t taskIdx)
 
 __aicore__ inline void WaitAicNegLFree(int64_t taskIdx)
 {
-    AscendC::CrossCoreWaitFlag<0x4>(static_cast<uint16_t>(taskIdx + kFlagNegLFreeBase));
+    PREPARE_CC_WAIT(0x4, PIPE_ALL, static_cast<uint16_t>(taskIdx + kFlagNegLFreeBase));
 }
 
 // Stage6 L1 vb/kbg ready → Stage7. Reuse Stage3 ids 4..7 (consumed
@@ -272,7 +290,7 @@ __aicore__ inline void NotifyAicStage6Done(int64_t taskIdx)
 
 __aicore__ inline void WaitAivStage6Done(int64_t taskIdx)
 {
-    AscendC::CrossCoreWaitFlag<0x4, PIPE_MTE1>(CubeWaitFlagForTask(taskIdx + kFlagS6DoneBase));
+    PREPARE_CC_WAIT(0x4, PIPE_MTE1, CubeWaitFlagForTask(taskIdx + kFlagS6DoneBase));
 }
 
 __aicore__ inline void NotifyAivStage7Done()
@@ -282,7 +300,7 @@ __aicore__ inline void NotifyAivStage7Done()
 
 __aicore__ inline void WaitAicStage7Done()
 {
-    AscendC::CrossCoreWaitFlag<0x2>(kFlagS7Done);
+    PREPARE_CC_WAIT(0x2, PIPE_ALL, kFlagS7Done);
 }
 
 
