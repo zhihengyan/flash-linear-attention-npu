@@ -6,8 +6,9 @@
  * Memory map: design/chunk_gated_delta_rule_fwd_prepare_ascendc-design.md.
  *
  * Pack: TG = 3 if G=3 else 4. AIV0 tasks 0,2; AIV1 1,3. kkt once per HK (OwnsHk).
- * L1: Y [0,64); k' aliases NegL [64,128). Pack N+1 Stage1 waits pack N Stage4
- * before the k' L1 write so Stage5/6/7 of N can overlap next Stage1.
+ * L1: Y [0,64); k' aliases NegL [64,128). Pack N+1 Stage1 waits pack N's
+ * NegL-free notification before the k' L1 write. The default notifies after
+ * Stage4_Dump; PREPARE_EARLY_NEGL_FREE=1 moves it to the NegL L0B-load anchor.
  * Do not gate Stage1 on Stage7: that kills the overlap and regresses G=1.
  */
 
@@ -19,6 +20,7 @@
 #include "chunk_gated_delta_rule_fwd_prepare_vf.h"
 #include "chunk_gated_delta_rule_fwd_prepare_datacopy.h"
 #include "chunk_gated_delta_rule_fwd_prepare_matmul.h"
+#include "AscendTimerV2_device.hpp"
 
 namespace ChunkGatedDeltaRuleFwdPrepare {
 using namespace AscendC;
@@ -36,8 +38,16 @@ public:
                                 GM_ADDR workspace, const Td &td)
     {
         LoadTiling(td);
+        TIMER_BLOCK(timerPackSeq = 0);
         InitOnChip();
         GM_ADDR userWs = GetUserWorkspace(workspace);
+        GM_ADDR timerAddr = nullptr;
+#if PREPARE_TIMER_DIAGNOSTIC
+        if (userWs != nullptr) {
+            timerAddr = userWs + numCore * kWsPerCoreBytes;
+        }
+#endif
+        TIMER_BLOCK(timer.Init(timerAddr));
         const uint32_t wsBase = static_cast<uint32_t>(coreIdx) * kWsPerCoreBytes;
         if (userWs != nullptr) {
             gmWsY.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(userWs + wsBase),
@@ -82,6 +92,45 @@ public:
             gmBetaEff.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(betaEff));
             hasBetaOut = 1;
         }
+    }
+
+    __aicore__ inline int64_t TimerPackSeq() const
+    {
+#if ENABLE_TIMER
+        return timerPackSeq;
+#else
+        return 0;
+#endif
+    }
+
+    __aicore__ inline int TimerIter(int64_t taskIdx) const
+    {
+        return static_cast<int>(TimerPackSeq() * TasksPerPack() + taskIdx);
+    }
+
+    __aicore__ inline void TimerBegin(AscendTimer::DynamicTimingType type, int64_t taskIdx)
+    {
+        TIMER_BLOCK(timer.TikNoBarrier(type, TimerIter(taskIdx)));
+    }
+
+    __aicore__ inline void TimerEnd(AscendTimer::DynamicTimingType type, int64_t taskIdx)
+    {
+        TIMER_BLOCK(timer.template TokNoBarrier<Overwrite>(type, TimerIter(taskIdx)));
+    }
+
+    __aicore__ inline void TimerPoint(AscendTimer::DynamicTimingType type, int64_t taskIdx)
+    {
+        TimerBegin(type, taskIdx);
+        TimerEnd(type, taskIdx);
+    }
+
+    __aicore__ inline void TimerSetDynamicIters(int64_t count)
+    {
+#if ENABLE_TIMER
+        for (int type = 0; type < AscendTimer::DYNAMIC_TYPE_COUNT; ++type) {
+            TIMER_BLOCK(timer.setDynamicActualIter(static_cast<AscendTimer::DynamicTimingType>(type), count));
+        }
+#endif
     }
 
     // Explicit on-chip map. Offsets match design Stage 0-3.
@@ -267,6 +316,7 @@ public:
         if (auxReady != 0) {
             return;
         }
+        TimerBegin(AscendTimer::AIV_S0, 0);
         FillVcsIdentity(ubIVcs, ubVcsIdx);
         // Leaf zeros first so both AIVs copy in parallel. ubS0Zero is then
         // free for AIV0 to paint I. AIV1 can leave for Stage1 while AIV0
@@ -292,17 +342,18 @@ public:
             WaitFlag<HardEvent::MTE3_V>(kHeUb0);
         }
         auxReady = 1;
+        TimerEnd(AscendTimer::AIV_S0, 0);
     }
 
     // ========================= Stage 1 =========================
     // Per-task g' (cumsum) and β_eff. Owner HK: L2Norm k then q when
     // useQkL2norm, else k as-is (no q load). Store hat/rstd only on the
-    // L2Norm path. k' ND→L1 NZ C0=16, NotifyAicStage1Done so Cube kkt can
-    // overlap Q/gate. k' aliases NegL: Wait pack N Stage4 before the L1
-    // write so Stage1 can overlap pack N Stage5/7 (V3 G=1 schedule).
-    // Sibling HV skip K/Q and still wait Stage4 to consume the flag.
+    // L2Norm path. k' aliases NegL: wait for the prior pack's NegL-free
+    // notification before the L1 write. The default notification follows
+    // Stage4_Dump; the diagnostic early-free variant uses the L0B-load anchor.
+    // Sibling HV skip K/Q and still wait NegL-free to consume the flag.
     // Tail (M<BT) zero-fills this tile before copy-in; aligned tiles skip
-    // Duplicate. Event order is Pad → k' L1 (Wait Stage4) → Notify → q/gate.
+    // Duplicate. Event order is Pad → k' L1 (Wait NegL-free) → Notify → q/gate.
     __aicore__ inline void Stage1_PadTailIfNeeded(const ChunkRange &chunk, int64_t hv, int64_t taskIdx)
     {
         const int32_t db = PingPongSlot(taskIdx);
@@ -325,17 +376,24 @@ public:
         WaitFlag<HardEvent::V_MTE2>(kHeUb1);
     }
 
+    __aicore__ inline void Stage1_WaitNegLFree(int64_t taskIdx)
+    {
+        TimerBegin(AscendTimer::AIV_S1_WAIT_NEGL_FREE, taskIdx);
+        WaitAicNegLFree(taskIdx);
+        TimerEnd(AscendTimer::AIV_S1_WAIT_NEGL_FREE, taskIdx);
+    }
+
     __aicore__ inline void Stage1_UploadK(const ChunkRange &chunk, int64_t hv, int64_t taskIdx)
     {
         if (!OwnsHk(hv)) {
-            WaitAicStage4Done(taskIdx);
+            Stage1_WaitNegLFree(taskIdx);
             return;
         }
         // When K is an unmodified full tile, AIC can copy the input directly
         // from GM into its NZ L1 slot. Preserve the prior-pack release and
         // the existing intra-block ready credit before AIC touches that slot.
         if (useQkL2norm == 0 && chunk.M == chunkSize) {
-            WaitAicStage4Done(taskIdx);
+            Stage1_WaitNegLFree(taskIdx);
             NotifyAicStage1Done(taskIdx);
             return;
         }
@@ -354,12 +412,15 @@ public:
             L2NormK128VF<InDtype>(ubK[db], ubKHat[db], ubKRstd[db], static_cast<uint32_t>(nValid), kGdnL2NormEps);
             SetFlag<HardEvent::V_MTE3>(kHeUb0);
             WaitFlag<HardEvent::V_MTE3>(kHeUb0);
-            WaitAicStage4Done(taskIdx);
+            Stage1_WaitNegLFree(taskIdx);
+            TimerBegin(AscendTimer::AIV_S1_UPLOAD_K, taskIdx);
             UploadBf16NdToL1(l1K, ubKHat[db], static_cast<uint32_t>(K));
             NotifyAicStage1Done(taskIdx);
+            TimerEnd(AscendTimer::AIV_S1_UPLOAD_K, taskIdx);
             DataCopy(gmKHat[offQk], ubKHat[db], nElem);
             CopyUbToGmElems(gmKRstd[offRstd], ubKRstd[db], static_cast<uint32_t>(nValid));
 
+            TimerBegin(AscendTimer::AIV_S1_Q_NORM, taskIdx);
             DataCopy(ubQ[db], gmQ[offQk], nElem);
             SetFlag<HardEvent::MTE2_V>(kHeUb0);
             WaitFlag<HardEvent::MTE2_V>(kHeUb0);
@@ -368,17 +429,21 @@ public:
             WaitFlag<HardEvent::V_MTE3>(kHeUb0);
             DataCopy(gmQHat[offQk], ubQHat[db], nElem);
             CopyUbToGmElems(gmQRstd[offRstd], ubQRstd[db], static_cast<uint32_t>(nValid));
+            TimerEnd(AscendTimer::AIV_S1_Q_NORM, taskIdx);
         } else {
             SetFlag<HardEvent::MTE2_MTE3>(kHeUb0);
             WaitFlag<HardEvent::MTE2_MTE3>(kHeUb0);
-            WaitAicStage4Done(taskIdx);
+            Stage1_WaitNegLFree(taskIdx);
+            TimerBegin(AscendTimer::AIV_S1_UPLOAD_K, taskIdx);
             UploadBf16NdToL1(l1K, ubK[db], static_cast<uint32_t>(K));
             NotifyAicStage1Done(taskIdx);
+            TimerEnd(AscendTimer::AIV_S1_UPLOAD_K, taskIdx);
         }
     }
 
     __aicore__ inline void Stage1_GateAndBeta(const ChunkRange &chunk, int64_t hv, int64_t taskIdx)
     {
+        TimerBegin(AscendTimer::AIV_S1_GATE_BETA, taskIdx);
         const int32_t db = PingPongSlot(taskIdx);
         const int32_t nValid = static_cast<int32_t>(chunk.M);
         const int64_t offG = OffsetBHT(chunk.batch, hv, chunk.tokenStart, HV, T);
@@ -450,10 +515,12 @@ public:
             WaitFlag<HardEvent::V_MTE3>(kHeUb0);
             CopyUbToGmElems(gmBetaEff[offG], ubBfp, static_cast<uint32_t>(nValid));
         }
+        TimerEnd(AscendTimer::AIV_S1_GATE_BETA, taskIdx);
     }
 
     __aicore__ inline void Stage1_OneTask(const ChunkRange &chunk, int64_t hv, int64_t taskIdx)
     {
+        TimerBegin(AscendTimer::AIV_S1_TASK, taskIdx);
         const int32_t db = PingPongSlot(taskIdx);
         if (db == 0) {
             SetFlag<HardEvent::MTE3_MTE2>(kHeUb0);
@@ -462,6 +529,7 @@ public:
         Stage1_PadTailIfNeeded(chunk, hv, taskIdx);
         Stage1_UploadK(chunk, hv, taskIdx);
         Stage1_GateAndBeta(chunk, hv, taskIdx);
+        TimerEnd(AscendTimer::AIV_S1_TASK, taskIdx);
     }
 
     // Stage2 helper: dualDstCtl splits M or N across the two AIVs; it does
@@ -512,6 +580,7 @@ public:
     // notified from ProcessAic.
     __aicore__ inline void Stage2_AicOne(int64_t taskIdx, int64_t nThis)
     {
+        TimerBegin(AscendTimer::AIC_S2_KKT, taskIdx);
         const int32_t bt = static_cast<int32_t>(chunkSize);
         const int32_t kk = static_cast<int32_t>(K);
         const uint8_t bank = static_cast<uint8_t>(taskIdx & 1);
@@ -528,6 +597,7 @@ public:
         if (HRatio <= 1) {
             NotifyAivKktDone(taskIdx);
         }
+        TimerEnd(AscendTimer::AIC_S2_KKT, taskIdx);
     }
 
     // ========================= Stage 3 =========================
@@ -536,6 +606,7 @@ public:
     // After kkt: L = kkt ⊙ G, pack leaves (must see -L), -L UB→L1, VCS on V.
     __aicore__ inline void Stage3_PrepareGate(int64_t taskIdx)
     {
+        TimerBegin(AscendTimer::AIV_S3_PREPARE_GATE, taskIdx);
         const int32_t db = PingPongSlot(taskIdx);
         if (useExp2 != 0) {
             GateLowerLVF<true>(ubGPrime[db], ubBetaEff[db], ubLFull[db]);
@@ -543,11 +614,15 @@ public:
             GateLowerLVF<false>(ubGPrime[db], ubBetaEff[db], ubLFull[db]);
         }
         DataCopy(ubResVcs[db], ubIVcs, static_cast<int32_t>(kVcsPackedElems32));
+        TimerEnd(AscendTimer::AIV_S3_PREPARE_GATE, taskIdx);
     }
 
     __aicore__ inline void Stage3_AivOne(int64_t hv, int64_t taskIdx)
     {
+        TimerBegin(AscendTimer::AIV_S3, taskIdx);
+        TimerBegin(AscendTimer::AIV_S3_WAIT_KKT, taskIdx);
         WaitCubeKktDone(taskIdx);
+        TimerEnd(AscendTimer::AIV_S3_WAIT_KKT, taskIdx);
         const int32_t db = PingPongSlot(taskIdx);
         const int32_t kktDb = PingPongSlot(OwnerTaskIdx(hv, taskIdx));
         MulKktGateVF(ubKkt[kktDb], ubLFull[db]);
@@ -562,6 +637,7 @@ public:
         WaitFlag<HardEvent::V_MTE3>(kHeUb0);
         UploadDiagLeavesToL1(l1LeafRight[taskIdx], l1LeafLeft[taskIdx], ubResVcs[db]);
         NotifyAicStage3Done(taskIdx);
+        TimerEnd(AscendTimer::AIV_S3, taskIdx);
     }
 
     // ========================= Stage 4 =========================
@@ -574,8 +650,10 @@ public:
     // each task Fixpipes into its own gmWsY slot.
     __aicore__ inline void Stage4_PrefillI(int64_t nThis)
     {
+        TimerBegin(AscendTimer::AIC_S4_PREFILL_I, 0);
         const int32_t bt = static_cast<int32_t>(chunkSize);
         if (nThis <= 0) {
+            TimerEnd(AscendTimer::AIC_S4_PREFILL_I, 0);
             return;
         }
         WaitFlag<HardEvent::M_MTE1>(0);
@@ -590,10 +668,12 @@ public:
             SetFlag<HardEvent::FIX_M>(bank);
         }
         SetFlag<HardEvent::M_MTE1>(0);
+        TimerEnd(AscendTimer::AIC_S4_PREFILL_I, 0);
     }
 
     __aicore__ inline void Stage4_AccIssue(int64_t taskIdx)
     {
+        TimerBegin(AscendTimer::AIC_S4_ACC, taskIdx);
         const uint8_t bank = static_cast<uint8_t>(taskIdx & 1);
         WaitFlag<HardEvent::M_MTE1>(bank);
         // The A load retains all 64 M rows; the B load selects only the
@@ -606,17 +686,28 @@ public:
         LoadData2DParamsV2 loadB;
         FillLoad2D(loadB, 2, 4, 4, 2, true);
         loadB.mStartPosition = 2;
+        TimerBegin(AscendTimer::AIC_S4_NEGL_TO_L0B, taskIdx);
         LoadData(l0BfP[bank], l1NegL[taskIdx], loadB);
         SetFlag<HardEvent::MTE1_M>(bank);
         WaitFlag<HardEvent::MTE1_M>(bank);
+        TimerEnd(AscendTimer::AIC_S4_NEGL_TO_L0B, taskIdx);
+        // NegL has its last L1 read in the L0B load above. Diagnostic builds
+        // may release the alias here to test whether this actually advances
+        // the next pack; the default keeps the original Stage4_Dump release.
+#if PREPARE_EARLY_NEGL_FREE
+        NotifyAivNegLFree(taskIdx);
+        TimerPoint(AscendTimer::AIC_S4_FREE_SET, taskIdx);
+#endif
         MmadL0ABToL0C<float>(l0AfP[bank], l0BfP[bank], l0CTask[taskIdx],
                               kChunk64, kVcs32, kVcs32, false, bank);
         SetFlag<HardEvent::M_FIX>(bank);
         SetFlag<HardEvent::M_MTE1>(bank);
+        TimerEnd(AscendTimer::AIC_S4_ACC, taskIdx);
     }
 
     __aicore__ inline void Stage4_Dump(int64_t taskIdx)
     {
+        TimerBegin(AscendTimer::AIC_S4_Y_DUMP, taskIdx);
         const uint8_t bank = static_cast<uint8_t>(taskIdx & 1);
         WaitFlag<HardEvent::M_FIX>(bank);
         // L0C holds M=64,N=32. isChannelSplit produces the first four
@@ -634,8 +725,12 @@ public:
         WaitFlag<HardEvent::FIX_MTE2>(bank);
         DataCopy(l1Y[taskIdx], gmWsY[WsYOffset(taskIdx)],
                  DataCopyParams(1, kChunk64 * kVcs32 / 8, 0, 0));
-        NotifyAivStage4Done(taskIdx);
+#if !PREPARE_EARLY_NEGL_FREE
+        NotifyAivNegLFree(taskIdx);
+        TimerPoint(AscendTimer::AIC_S4_FREE_SET, taskIdx);
+#endif
         SetFlag<HardEvent::MTE2_MTE1>(taskIdx);
+        TimerEnd(AscendTimer::AIC_S4_Y_DUMP, taskIdx);
     }
 
     // ========================= Stage 5 =========================
@@ -647,6 +742,7 @@ public:
     // Tail or outputA=0: L0C→L1 NZ directly (padding rows stay in L0C).
     __aicore__ inline void Stage5_Compute(int64_t taskIdx)
     {
+        TimerBegin(AscendTimer::AIC_S5_COMPUTE, taskIdx);
         const uint8_t bank = static_cast<uint8_t>(taskIdx & 1);
         WaitFlag<HardEvent::M_MTE1>(bank);
         SolveHalfKMatmulToL0C<false, true>(l1I, l1LeafLeft[taskIdx], l0Af[bank], l0Bf[bank],
@@ -656,6 +752,7 @@ public:
                                             l0CTask[taskIdx], false, bank);
         SetFlag<HardEvent::M_FIX>(bank);
         SetFlag<HardEvent::M_MTE1>(bank);
+        TimerEnd(AscendTimer::AIC_S5_COMPUTE, taskIdx);
     }
 
     __aicore__ inline void DumpAL0cToL1(int64_t taskIdx, uint32_t n)
@@ -673,6 +770,7 @@ public:
 
     __aicore__ inline void Stage5_Dump(const ChunkRange &chunk, int64_t hv, int64_t taskIdx)
     {
+        TimerBegin(AscendTimer::AIC_S5_DUMP, taskIdx);
         const uint8_t bank = static_cast<uint8_t>(taskIdx & 1);
         const uint32_t n = static_cast<uint32_t>(chunkSize);
         const uint32_t m = static_cast<uint32_t>(chunk.M);
@@ -694,6 +792,7 @@ public:
             SetFlag<HardEvent::FIX_MTE1>(taskIdx);
         }
         SetFlag<HardEvent::FIX_M>(bank);
+        TimerEnd(AscendTimer::AIC_S5_DUMP, taskIdx);
     }
 
     // ========================= Stage 6 =========================
@@ -702,6 +801,7 @@ public:
     // Tail zero-fills UB then copies M rows.
     __aicore__ inline void Stage6_AivOne(const ChunkRange &chunk, int64_t hv, int64_t taskIdx)
     {
+        TimerBegin(AscendTimer::AIV_S6, taskIdx);
         const int64_t hk = hv / HRatio;
         const int64_t offK = OffsetBHTD(chunk.batch, hk, chunk.tokenStart, HK, T, K);
         const int64_t offV = OffsetBHTD(chunk.batch, hv, chunk.tokenStart, HV, T, V);
@@ -741,6 +841,7 @@ public:
         SetFlag<HardEvent::V_MTE3>(kHeUb1);
         WaitFlag<HardEvent::V_MTE3>(kHeUb1);
         UploadBf16NdToL1(l1Kbg[taskIdx], ubKnd, static_cast<uint32_t>(K));
+        TimerEnd(AscendTimer::AIV_S6, taskIdx);
     }
 
     // ========================= Stage 7 =========================
@@ -748,6 +849,7 @@ public:
     // results in the owning AIV's UB; the next pack drains them to GM.
     __aicore__ inline void Stage7_AicOne(const ChunkRange &chunk, int64_t hv, int64_t taskIdx)
     {
+        TimerBegin(AscendTimer::AIC_S7, taskIdx);
         const uint32_t rows = static_cast<uint32_t>(chunk.M);
         const uint32_t nK = static_cast<uint32_t>(K);
         const uint32_t nV = static_cast<uint32_t>(V);
@@ -805,6 +907,7 @@ public:
             Fixpipe<InDtype, float, CFG_ROW_MAJOR_UB>(ubS7U[db], l0CS7[1], wuFixpipeParams);
             SetFlag<HardEvent::FIX_M>(1);
         }
+        TimerEnd(AscendTimer::AIC_S7, taskIdx);
     }
 
     __aicore__ inline void DecodeTask(int64_t base, int64_t nThis, int64_t taskIdx, ChunkRange &chunk, int64_t &hv)
@@ -837,9 +940,13 @@ public:
         return next.nThis < 2 || PackHasTail(prev) || PackHasTail(next);
     }
 
-    __aicore__ inline void DrainPackWuToGm(int64_t base, int64_t nThis)
+    __aicore__ inline void DrainPackWuToGm(int64_t base, int64_t nThis, int64_t drainPackSeq)
     {
         for (int64_t t = subBlock; t < nThis; t += 2) {
+#if ENABLE_TIMER
+            const int timerIter = static_cast<int>(drainPackSeq * TasksPerPack() + t);
+#endif
+            TIMER_BLOCK(timer.TikNoBarrier(AscendTimer::AIV_WU_DRAIN, timerIter));
             ChunkRange chunk;
             int64_t hv;
             DecodeTask(base, nThis, t, chunk, hv);
@@ -849,6 +956,7 @@ public:
                 CopyUbToGmElems(gmU[OffsetBHTD(chunk.batch, hv, chunk.tokenStart, HV, T, V)],
                                 ubS7U[PingPongSlot(t)], static_cast<uint32_t>(chunk.M * V));
             }
+            TIMER_BLOCK(timer.template TokNoBarrier<Overwrite>(AscendTimer::AIV_WU_DRAIN, timerIter));
         }
     }
 
@@ -858,6 +966,12 @@ public:
 
         const int64_t packSize = TasksPerPack();
         const int64_t nPacks = CeilDiv(totalChunks, packSize);
+        const int64_t localPacks = coreIdx < nPacks ? CeilDiv(nPacks - coreIdx, numCore) : 0;
+        TimerSetDynamicIters(localPacks * packSize);
+        // Final Stage7 wait uses the slot after the last pack. W/U drain is
+        // recorded against the pack that owns the data, including the tail.
+        TIMER_BLOCK(timer.setDynamicActualIter(AscendTimer::AIV_S7_WAIT, (localPacks + 1) * packSize));
+        TIMER_BLOCK(timerPackSeq = 0);
         for (int64_t pack = coreIdx; pack < nPacks; pack += numCore) {
             const PackWalk cur = MakePackWalk(pack, packSize);
             PackWalk prev{};
@@ -866,7 +980,9 @@ public:
             }
             if (pack != coreIdx) {
                 if (NeedsStage7Wait(prev, cur)) {
+                    TimerBegin(AscendTimer::AIV_S7_WAIT, 0);
                     WaitAicStage7Done();
+                    TimerEnd(AscendTimer::AIV_S7_WAIT, 0);
                 }
             }
             for (int64_t t = subBlock; t < cur.nThis; t += 2) {
@@ -884,7 +1000,7 @@ public:
                 Stage3_AivOne(PackWorkId(cur.base, cur.nThis, t) % HV, t);
             }
             if (pack != coreIdx) {
-                DrainPackWuToGm(prev.base, prev.nThis);
+                DrainPackWuToGm(prev.base, prev.nThis, TimerPackSeq() - 1);
             }
             SetFlag<HardEvent::MTE3_MTE2>(kHeUb0);
             WaitFlag<HardEvent::MTE3_MTE2>(kHeUb0);
@@ -896,12 +1012,15 @@ public:
                 Stage6_AivOne(chunk, hv, t);
                 NotifyAicStage6Done(t);
             }
+            TIMER_BLOCK(timerPackSeq += 1);
         }
         if (coreIdx < nPacks) {
             const int64_t pack = coreIdx + (nPacks - 1 - coreIdx) / numCore * numCore;
             const PackWalk last = MakePackWalk(pack, packSize);
+            TimerBegin(AscendTimer::AIV_S7_WAIT, 0);
             WaitAicStage7Done();
-            DrainPackWuToGm(last.base, last.nThis);
+            TimerEnd(AscendTimer::AIV_S7_WAIT, 0);
+            DrainPackWuToGm(last.base, last.nThis, localPacks - 1);
         }
     }
 
@@ -914,9 +1033,12 @@ public:
         SetFlag<HardEvent::FIX_MTE1>(0);
         const int64_t packSize = TasksPerPack();
         for (int64_t t = 0; t < packSize; ++t) {
-            NotifyAivStage4Done(t);
+            NotifyAivNegLFree(t);
         }
         const int64_t nPacks = CeilDiv(totalChunks, packSize);
+        const int64_t localPacks = coreIdx < nPacks ? CeilDiv(nPacks - coreIdx, numCore) : 0;
+        TimerSetDynamicIters(localPacks * packSize);
+        TIMER_BLOCK(timerPackSeq = 0);
         for (int64_t pack = coreIdx; pack < nPacks; pack += numCore) {
             const PackWalk cur = MakePackWalk(pack, packSize);
             WaitFlag<HardEvent::FIX_MTE1>(0);
@@ -927,10 +1049,13 @@ public:
                 ChunkRange directChunk;
                 int64_t directHv;
                 DecodeTask(cur.base, cur.nThis, t, directChunk, directHv);
+                TimerBegin(AscendTimer::AIC_S2_WAIT_S1, t);
                 if (useQkL2norm == 0 && directChunk.M == chunkSize) {
                     // The ready flag protects the NegL/K L1 alias. Wait on
                     // the same MTE2 pipe that performs the direct K upload.
                     CrossCoreWaitFlag<0x4, PIPE_MTE2>(CubeWaitFlagForTask(t));
+                    TimerEnd(AscendTimer::AIC_S2_WAIT_S1, t);
+                    TimerBegin(AscendTimer::AIC_S1_DIRECT_K_COPY, t);
                     const int64_t offK = OffsetBHTD(directChunk.batch, directHv / HRatio,
                                                    directChunk.tokenStart, HK, T, K);
                     CopyGmNdToL1Nz<InDtype>(l1KHat[t], gmK[offK],
@@ -938,8 +1063,10 @@ public:
                                              static_cast<uint32_t>(K));
                     SetFlag<HardEvent::MTE2_MTE1>(t);
                     WaitFlag<HardEvent::MTE2_MTE1>(t);
+                    TimerEnd(AscendTimer::AIC_S1_DIRECT_K_COPY, t);
                 } else {
                     WaitAivStage1Done(t);
+                    TimerEnd(AscendTimer::AIC_S2_WAIT_S1, t);
                 }
                 Stage2_AicOne(t, cur.nThis);
                 if (HRatio > 1) {
@@ -948,10 +1075,14 @@ public:
             }
             Stage4_PrefillI(cur.nThis);
             if (cur.nThis > 0) {
+                TimerBegin(AscendTimer::AIC_S3_WAIT, 0);
                 WaitAivStage3Done(0);
+                TimerEnd(AscendTimer::AIC_S3_WAIT, 0);
                 Stage4_AccIssue(0);
                 for (int64_t t = 1; t < cur.nThis; ++t) {
+                    TimerBegin(AscendTimer::AIC_S3_WAIT, t);
                     WaitAivStage3Done(t);
+                    TimerEnd(AscendTimer::AIC_S3_WAIT, t);
                     Stage4_AccIssue(t);
                     Stage4_Dump(t - 1);
                 }
@@ -959,7 +1090,9 @@ public:
             }
             if (cur.nThis > 0) {
                 for (int64_t t = 0; t < cur.nThis; ++t) {
+                    TimerBegin(AscendTimer::AIC_S5_WAIT_Y, t);
                     WaitFlag<HardEvent::MTE2_MTE1>(t);
+                    TimerEnd(AscendTimer::AIC_S5_WAIT_Y, t);
                     Stage5_Compute(t);
                     ChunkRange chunk;
                     int64_t hv;
@@ -968,15 +1101,19 @@ public:
                 }
             }
             for (int64_t t = 0; t < cur.nThis; ++t) {
+                TimerBegin(AscendTimer::AIC_S6_WAIT, t);
                 WaitAivStage6Done(t);
+                TimerEnd(AscendTimer::AIC_S6_WAIT, t);
                 ChunkRange chunk;
                 int64_t hv;
                 DecodeTask(cur.base, cur.nThis, t, chunk, hv);
+                TimerBegin(AscendTimer::AIC_S7_WAIT_A, t);
                 if (outputA != 0 && chunk.M == chunkSize) {
                     WaitFlag<HardEvent::MTE2_MTE1>(t);
                 } else {
                     WaitFlag<HardEvent::FIX_MTE1>(t);
                 }
+                TimerEnd(AscendTimer::AIC_S7_WAIT_A, t);
                 Stage7_AicOne(chunk, hv, t);
             }
             const int64_t nextPack = pack + numCore;
@@ -989,17 +1126,23 @@ public:
                 NotifyAivStage7Done();
             }
             SetFlag<HardEvent::FIX_MTE1>(0);
+            TIMER_BLOCK(timerPackSeq += 1);
         }
     }
 
     __aicore__ inline void Process()
     {
+        TIMER_BLOCK(timer.TikNoBarrier());
         if ASCEND_IS_AIV {
             ProcessAiv();
         }
         if ASCEND_IS_AIC {
             ProcessAic();
         }
+        // No new barrier: this is each core's instruction-stream endpoint, not
+        // a claim that all previously issued asynchronous work has drained.
+        TIMER_BLOCK(timer.template TokNoBarrier<Overwrite>(AscendTimer::KERNEL_TIMING_IDX));
+        TIMER_BLOCK(timer.Publish());
     }
 
 private:
@@ -1055,6 +1198,10 @@ private:
     LocalTensor<float> l0CTask[4];
 
     int64_t hasBetaOut;
+#if ENABLE_TIMER
+    AscendTimerDevice timer;
+    int64_t timerPackSeq;
+#endif
 };
 
 } // namespace ChunkGatedDeltaRuleFwdPrepare

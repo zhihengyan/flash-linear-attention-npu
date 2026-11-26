@@ -9,6 +9,11 @@
 #include "tiling/platform/platform_ascendc.h"
 #include "tiling_base/tiling_templates_registry.h"
 #include "arch22/chunk_gated_delta_rule_fwd_prepare_tiling_arch22.h"
+#include "AscendTimerV2.hpp"
+
+#ifndef PREPARE_TIMER_DIAGNOSTIC
+#define PREPARE_TIMER_DIAGNOSTIC 0
+#endif
 
 namespace optiling {
 
@@ -257,6 +262,12 @@ static ge::graphStatus Tiling4ChunkGatedDeltaRuleFwdPrepare(gert::TilingContext 
     }
     // Per-core user WS: gmWsY 4×16 KiB. Must match kWsPerCoreBytes.
     ws[0] = sysWorkspaceSize + static_cast<size_t>(coreNum) * 64 * 1024;
+#if PREPARE_TIMER_DIAGNOSTIC
+    // Diagnostic timer lives at the end of user workspace. The raw ACLNN
+    // launcher owns and reads this tail; the public Stable API is unchanged.
+    ws[0] += static_cast<size_t>(AscendTimer::N_TIMING_COUNTER +
+                                 AscendTimer::DYNAMIC_ITER_TOTAL_SIZE) * sizeof(int64_t);
+#endif
     OP_LOGD(context->GetNodeName(),"workspace = [%zu]", ws[0]);
     return ge::GRAPH_SUCCESS;
 }

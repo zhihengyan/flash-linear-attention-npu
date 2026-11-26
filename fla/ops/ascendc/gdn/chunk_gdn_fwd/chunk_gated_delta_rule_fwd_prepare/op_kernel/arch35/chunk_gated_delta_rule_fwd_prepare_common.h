@@ -161,9 +161,12 @@ constexpr uint16_t kAiv1IntraFlagOff = 16;
 // Separate from Stage1/2/3 ids 0..3 so AIC's Stage4 Wait cannot steal the
 // Stage2→Stage3 notify.
 constexpr uint16_t kFlagS3DoneBase = 4;
-// Pack N Stage4 dumped Y / freed NegL → pack N+1 Stage1 may write k'.
-// Ids 8..11 (AIV1 24..27). Same ids V3 used as kFlagS4DumpBase.
-constexpr uint16_t kFlagS4DumpBase = 8;
+// Pack N Stage4 loaded NegL into L0B / freed the alias → pack N+1 Stage1 may write k'.
+// Ids 8..11 (AIV1 24..27). Same ids V3 used as NegL-free flags.
+constexpr uint16_t kFlagNegLFreeBase = 8;
+#ifndef PREPARE_EARLY_NEGL_FREE
+#define PREPARE_EARLY_NEGL_FREE 0
+#endif
 // Stage6→Stage7 reuses Stage3 ids 4..7 (AIC sees AIV1 as 20,21,22,23).
 // Those are consumed after Stage4. Ids 0..3 still carry the Stage2 kkt
 // notify on PIPE_FIX; a PIPE_MTE1 Wait(0) can steal that leftover and
@@ -247,15 +250,16 @@ __aicore__ inline void WaitAivStage3Done(int64_t taskIdx)
     AscendC::CrossCoreWaitFlag<0x4, PIPE_MTE1>(CubeWaitFlagForTask(taskIdx + kFlagS3DoneBase));
 }
 
-// Stage4 Y on L1 / NegL free. Pack N+1 Stage1 waits this before k' L1 write.
-__aicore__ inline void NotifyAivStage4Done(int64_t taskIdx)
+// Stage4 NegL alias free. Default: after Y dump. Diagnostic early-free:
+// after the NegL L0B load. Pack N+1 Stage1 waits this before the k' L1 write.
+__aicore__ inline void NotifyAivNegLFree(int64_t taskIdx)
 {
-    AscendC::CrossCoreSetFlag<0x4, PIPE_FIX>(CubeWaitFlagForTask(taskIdx + kFlagS4DumpBase));
+    AscendC::CrossCoreSetFlag<0x4, PIPE_FIX>(CubeWaitFlagForTask(taskIdx + kFlagNegLFreeBase));
 }
 
-__aicore__ inline void WaitAicStage4Done(int64_t taskIdx)
+__aicore__ inline void WaitAicNegLFree(int64_t taskIdx)
 {
-    AscendC::CrossCoreWaitFlag<0x4>(static_cast<uint16_t>(taskIdx + kFlagS4DumpBase));
+    AscendC::CrossCoreWaitFlag<0x4>(static_cast<uint16_t>(taskIdx + kFlagNegLFreeBase));
 }
 
 // Stage6 L1 vb/kbg ready → Stage7. Reuse Stage3 ids 4..7 (consumed
@@ -465,8 +469,9 @@ __aicore__ inline int64_t WsYOffset(int64_t taskIdx)
 
 // Y owns [0, 64). k' aliases NegL at [64, 128): 64x128 bf16 == 64x64 fp32 NZ.
 // Intra-pack: Stage2 consumes k', Stage3 overwrites the same slots with -L.
-// Cross-pack: pack N Stage5 reads Y while pack N+1 Stage1 writes k' (NegL
-// already consumed in Stage4). Gate is Wait Stage4, not Stage5.
+// Cross-pack: pack N Stage5 reads Y while pack N+1 Stage1 writes k'. The
+// default alias release follows Stage4_Dump; the diagnostic variant can release
+// after the NegL L0B load because later MMAD/Y steps do not read that L1 slot.
 constexpr uint32_t kL1Y0 = 0;
 constexpr uint32_t kL1NegL0 = 64 * kPrepareKb;
 constexpr uint32_t kL1KHat0 = kL1NegL0;

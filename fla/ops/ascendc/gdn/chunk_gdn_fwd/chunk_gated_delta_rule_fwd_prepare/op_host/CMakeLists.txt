@@ -20,6 +20,23 @@ add_ops_compile_options(
             -I${CMAKE_CURRENT_SOURCE_DIR}/../op_kernel/arch35
 )
 
+# Diagnostic-only timer build. Normal builds keep the original workspace and
+# remove all timer instructions. Example: PREPARE_TIMER_DIAGNOSTIC=1 bash build.sh ...
+if("$ENV{PREPARE_TIMER_DIAGNOSTIC}" STREQUAL "1")
+    set(PREPARE_TIMER_DEFINITIONS PREPARE_TIMER_DIAGNOSTIC=1 ENABLE_TIMER=1)
+else()
+    set(PREPARE_TIMER_DEFINITIONS PREPARE_TIMER_DIAGNOSTIC=0 ENABLE_TIMER=0)
+endif()
+if("$ENV{PREPARE_EARLY_NEGL_FREE}" STREQUAL "1")
+    list(APPEND PREPARE_TIMER_DEFINITIONS PREPARE_EARLY_NEGL_FREE=1)
+else()
+    list(APPEND PREPARE_TIMER_DEFINITIONS PREPARE_EARLY_NEGL_FREE=0)
+endif()
+add_ops_compile_options(
+    OP_NAME ChunkGatedDeltaRuleFwdPrepare
+    COMPILE_DEFINITIONS ${PREPARE_TIMER_DEFINITIONS}
+)
+
 if("${ASCEND_COMPUTE_UNIT}" STREQUAL "ascend950")
     add_ops_compile_options(
         OP_NAME ChunkGatedDeltaRuleFwdPrepare
